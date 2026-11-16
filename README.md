@@ -20,6 +20,10 @@ other way round:
 my-easy-software is a framework for building small personal apps this way, as easily as
 starting a web project: create an app, preview it, deploy it to your own machine or server.
 
+You do not need to be a developer. Setup is guided by an AI agent that explains each step in
+plain words, installs what is needed with your permission, and keeps your apps private to your
+own devices unless you choose to share them.
+
 ## Status
 
 Early design. Nothing here is usable yet.

@@ -109,10 +109,33 @@ Every `mes` command can be driven by a coding agent without blocking on a prompt
 - Agents offer to install missing tools; they install only after the user says yes, and only
   from official package sources.
 
-**Tailscale.** If it is missing when an app is initialised, the user is told that private access
-uses Tailscale, that it is free for personal use and takes about two minutes, and is offered the
-install. The agent installs and starts it; the user only creates or signs in to the account.
-Declining leaves the app in local-only mode on that machine.
+**Tailscale.** If it is missing when an app is initialised, the user sees an explanation written
+for someone who is not a developer, then the offer to install:
+
+> **Keeping your apps private.** Your apps should only open on your own devices. Tailscale is
+> what makes that possible: it links your computer, phone and server into a private network
+> that only you can enter. Without it, nobody else can reach your apps, and neither can your
+> phone. It is free for personal use and takes about two minutes. I can install it for you;
+> you only need to create an account. Install it now?
+
+The agent installs and starts it; the user only creates or signs in to the account. Declining
+leaves the app in local-only mode on that machine, and the message says so.
+
+## Written for people who are not developers
+
+Anyone should be able to set up and use an app with an AI agent's help, without knowing what a
+port, a key or a server is.
+
+- Every question, warning and error says three things in plain words: what is happening, why it
+  matters to the user, and what to do next. Technical detail is available on request, never
+  required.
+- Safety steps say what they protect ("this keeps your data on your own devices"), not only what
+  they install.
+- Choices come with a recommended default and what each option means for the user.
+- Nothing that affects safety is skipped silently. If the user declines a safety step, they are
+  told what will and will not work.
+- No step asks the user to edit a file or type a command themselves, except typing their own
+  passwords.
 
 ## Docs and skills for agents
 
