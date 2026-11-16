@@ -65,7 +65,7 @@ def test_sync_writes_the_lock(root):
     assert lock["v"] == 1 and lock["project"] == "pp" and [a["package"] for a in lock["apps"]] == ["pp_a", "pp_b"]
     assert all(a["in_project"] for a in lock["apps"]) and lock["apps"][0]["program"] == "pp-a"
     assert stat.S_IMODE((root / manifest.LOCK_FILE).stat().st_mode) == 0o644
-    assert out["problems"] == [] and [j for j in out["jobs"]] == ["pp-a.sync", "pp-b.tidy"] or out["jobs"]
+    assert out["problems"] == [] and out["warnings"] == []
     assert manifest.load(root).lock_used
 
 
