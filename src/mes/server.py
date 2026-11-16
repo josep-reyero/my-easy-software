@@ -34,6 +34,7 @@ Public API
 ``PlanInput``  everything a plan needs (project, layout, tools, keys, signers, web units).
 ``build_plan(...) -> PlanInput``; ``render_script(plan) -> str``; ``render_remove(...) -> str``
 ``gate_command(plan, level) -> str``  the forced command of one key level.
+``per_app(project) -> list[dict]``  each app's jobs with their network hosts, memory and time limits.
 ``run_check(project_name, *, server_root, units_dir, project_dir, probe) -> checklist``
 ``register(subparsers)``
 """
@@ -258,7 +259,7 @@ def build_plan(project_dir: str | os.PathLike[str] | None, name: str, *, server_
                              hint="For example: --allow-host my-server.example-tailnet.ts.net")
     layout = paths.server_layout(project.name, units.sandbox_path(server_root))
     chosen = {**DEFAULT_TOOLS, **{k: v for k, v in (tools or {}).items() if v}}
-    if project.ui is None and not (tools or {}).get("easy_ui"):
+    if not project.has_dashboards and not (tools or {}).get("easy_ui"):
         chosen["easy_ui"] = None
     checked: dict[str, str | None] = {}
     for key, value in chosen.items():
@@ -278,7 +279,7 @@ def build_plan(project_dir: str | os.PathLike[str] | None, name: str, *, server_
     from mes.deploy import units_fingerprint
 
     plan.fingerprint = units_fingerprint(project, layout, checked["mes"], checked["easy_ui"])
-    if project.ui is not None and checked["easy_ui"]:
+    if project.has_dashboards and checked["easy_ui"]:
         plan.web_units, notes = _web_units(project, root_dir, layout, checked["easy_ui"], list(allow_hosts))
         plan.notes += notes
     if not plan.keys:
@@ -293,6 +294,31 @@ def build_plan(project_dir: str | os.PathLike[str] | None, name: str, *, server_
 
 
 # --------------------------------------------------------------------------- root script
+
+
+def per_app(project: manifest_mod.Project) -> list[dict[str, Any]]:
+    """What each installed app is allowed: its jobs' network hosts, memory and time limits."""
+    out = []
+    for spec in project.apps.values():
+        jobs = [j for j in project.jobs.values() if j.app == spec.name]
+        hosts = list(dict.fromkeys(h for j in jobs for h in j.network))
+        out.append({"app": spec.name, "title": spec.title, "location": spec.location,
+                    "network": hosts, "jobs": [{"id": j.id, "network": list(j.network), "memory": j.memory,
+                                                "timeout": j.timeout, "writes": list(j.writes)} for j in jobs]})
+    return out
+
+
+def _per_app_lines(project: manifest_mod.Project) -> list[str]:
+    lines = []
+    for a in per_app(project):
+        net = ", ".join(a["network"]) if a["network"] else "no internet"
+        lines.append(f"{a['app']} ({a['location']}): {net}")
+        for j in a["jobs"]:
+            lines.append(f"  {j['id']}: memory {j['memory']}, time limit {j['timeout']}, internet: "
+                         + (", ".join(j["network"]) if j["network"] else "none"))
+        if not a["jobs"]:
+            lines.append("  (no jobs)")
+    return lines
 
 
 def _q(value: str) -> str:
@@ -491,6 +517,10 @@ def render_script(plan: PlanInput) -> str:
         f"#     and the keys that may sign deploys ({len(plan.signers)}).",
         f"#  5. Writes the project's {len(all_units)} system units into {plan.units_dir} and switches on its",
         "#     schedules and sockets.",
+        "#",
+        "# What each app of the project may do in its jobs (network, memory, time):",
+        *[f"#   {line}" for line in _per_app_lines(plan.project)],
+        "#",
         "# It touches nothing else on this server. Running it again is safe: it brings everything back",
         "# to this plan. Undo it with the script from: mes server remove " + p,
         "#",
@@ -571,7 +601,9 @@ def render_script(plan: PlanInput) -> str:
     for name, text in all_units.items():
         out += _put(f"{plan.units_dir}/{name}", "0644", "root:root", text, delim)
     out += [
-        "# Units of this project that are no longer in the plan are switched off and removed.",
+        "# Units of this project that are no longer in the plan are switched off and removed; this includes",
+        "# units in the old form (mes-<project>.job.<job>.*, mes-<project>.net.<job>.service) from before jobs",
+        "# were named <app>.<job>.",
         f"KEEP={_q(keep)}",
         f"for f in {_q(plan.units_dir)}/mes-{p}.*; do",
         '  [ -e "$f" ] || continue',
@@ -859,6 +891,7 @@ def _plan_text(plan: PlanInput, script: str, out: str | None) -> dict[str, Any]:
         "accounts": [plan.layout.account, plan.layout.web_account],
         "folder": str(plan.layout.base),
         "units": sorted({**plan.units, **plan.web_units}),
+        "apps": per_app(plan.project),
         "keys": [{"level": lvl, "type": kind} for lvl, kind, _ in plan.keys],
         "signers": len(plan.signers),
         "tools": plan.tools,
@@ -895,7 +928,8 @@ def _cmd_plan(args: argparse.Namespace) -> Any:
         return {**result, "sha256": hashlib.sha256(script.encode()).hexdigest()}
     if not args.out:
         return script
-    lines = [f'The root script for "{plan.project.name}" is in {args.out}. Nothing was changed on any computer.']
+    lines = [f'The root script for "{plan.project.name}" is in {args.out}. Nothing was changed on any computer.',
+             "What each app may do in its jobs:", *[f"  {line}" for line in _per_app_lines(plan.project)]]
     lines += [f"{i}. {s['step']}" + (f": {s['command']}" if s.get("command") else "") for i, s in
               enumerate(result["next_steps"], 1)]
     lines += [f"Please note: {n}" for n in plan.notes]

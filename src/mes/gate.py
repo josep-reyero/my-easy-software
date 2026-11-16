@@ -14,13 +14,18 @@ The client sends one JSON array of strings as its SSH command::
 
 SSH puts that text in ``SSH_ORIGINAL_COMMAND``. The gate:
 
-1. Accepts only a JSON array of strings: ``[app, command, *args]`` for an app of the project, or
+1. Accepts only a JSON array of strings: ``[app, command, *args]`` for an app of the project,
+   ``[project, short-or-app-name, command, *args]`` (rewritten to the first form),
+   ``[project, "describe" | "guide" | "apps"]`` (the project command's read built-ins, only
+   ``--json`` may follow), ``[project, word, ...]`` for a project with one app (passed to it), or
    ``["mes", <operation>, ...]`` for the gate's own deploy operations. No shell, no shell
    parsing; at most 64 items, each at most 4096 bytes, no NUL bytes. Anything else: exit 2.
 2. Finds the project in the server layout (``--server-root``; the gate must run as the account
    that owns the project's ``code`` folder) or in the owner's list, never in the request. The
-   app must be one of the project's ``[apps]``; its program is ``<project>/.venv/bin/<cli>``.
-   ``project.toml`` and the program must be changeable only by the gate's account (or root).
+   app must be one of the project's installed apps; its program is
+   ``<project>/.venv/bin/<program>``. ``project.toml``, ``apps.lock.json``, every ``app.toml``
+   and the program must be changeable only by the gate's account (or root). An app command
+   always runs the app's own program, never the project command.
 3. Asks the installed app for its commands and their kinds, fresh on every request.
 4. Levels: ``read`` runs read commands; ``write`` also write commands; ``deploy`` also the
    ``mes`` operations (``deploy``, ``rollback``, ``releases``, ``status``; see ``mes.deploy``).
@@ -54,6 +59,7 @@ Public API
 ``Outcome(exit_code, stdout, stderr)``, ``Finished(...)``.
 ``GateProject``  where the request's project lives (``locate(project, server_root)``).
 ``parse_request(text) -> list[str]``
+``resolve_request(where, request) -> (request, project, program, builtin)``
 ``clean_env(allow, where=None) -> dict``
 ``run_limited(argv, *, env, timeout, max_output, max_stderr, stdin=None, cwd="/") -> Finished``
 ``ask_commands(program, app, *, timeout, env=None) -> dict[str, str]``
@@ -117,6 +123,7 @@ MAX_PARALLEL = 4
 SLOTS_DIR = "slots"
 MES_WORD = "mes"
 MES_OPERATIONS = ("deploy", "rollback", "releases", "status")
+PROJECT_BUILTINS = ("describe", "guide", "apps")
 
 _COMMAND_RE = re.compile(r"[a-z][a-z0-9-]{0,40}")
 _KEEP_ENV_PERSONAL = (
@@ -167,6 +174,7 @@ class GateProject:
     def env(self) -> dict[str, str]:
         out = {
             "MES_PROJECT": self.name,
+            "MES_PROJECT_DIR": str(self.folder),
             "MES_DATA_DIR": str(self.data),
             "MES_STATE_DIR": str(self.state),
             "MES_STORE_DIR": str(self.store),
@@ -200,20 +208,60 @@ def locate(project: str, server_root: str | os.PathLike[str] | None) -> GateProj
     return GateProject(project, layout.current_project, layout.data, layout.state, layout.store, layout)
 
 
-def _project_and_program(where: GateProject, app: str) -> tuple[manifest_mod.Project, Path]:
+def _load_checked(where: GateProject) -> manifest_mod.Project:
     if where.server and not (where.folder / manifest_mod.MANIFEST_FILE).is_file():
         raise NotFound(f'Nothing has been deployed for "{where.name}" yet, so there is nothing to run.',
                        hint="Deploy it first with: mes deploy <server>")
     registry.check_project_file(where.folder, public=True)
+    registry.check_lock_file(where.folder, public=True)
     project = manifest_mod.load(where.folder)
     if project.name != where.name:
         raise Refused(f'The folder set up for "{where.name}" holds a different project, so nothing was run.',
                       hint="Ask the owner to check the project's setup.", code="wrong_project")
+    registry.check_app_files(project, public=True)
+    return project
+
+
+def _project_and_program(where: GateProject, app: str) -> tuple[manifest_mod.Project, Path]:
+    project = _load_checked(where)
     if app not in project.apps:
         raise NotFound(f'The project "{where.name}" has no app called "{app}", so nothing was run.',
                        hint=f"Its apps are: {', '.join(project.apps)}.")
-    program = registry.check_program(registry.program_path(where.folder, project.apps[app].cli), app=app)
+    program = registry.check_program(registry.program_path(where.folder, project.apps[app].program), app=app)
     return project, program
+
+
+def resolve_request(where: GateProject, request: list[str]) -> tuple[list[str], manifest_mod.Project, Path, bool]:
+    """``(request, project, program, builtin)``. A request that starts with the project's name is
+    rewritten to the app form; ``[project, describe|guide|apps]`` runs the project command."""
+    if request[0] != where.name:
+        project, program = _project_and_program(where, request[0])
+        return request, project, program, False
+    project = _load_checked(where)
+    word = request[1]
+    if word in PROJECT_BUILTINS:
+        if any(a != "--json" for a in request[2:]):
+            raise _bad_request(f'"{where.name} {word}" takes nothing else through the gate (only --json).',
+                               hint=f'Send ["{where.name}", "{word}", "--json"].')
+        program = registry.check_program(registry.program_path(where.folder, where.name), app=where.name)
+        return request, project, program, True
+    spec = project.app_for_word(word)
+    if spec is not None:
+        rewritten = [spec.name, *request[2:]]
+    elif len(project.apps) == 1:
+        rewritten = [next(iter(project.apps)), *request[1:]]
+    else:
+        shorts = [a.short for a in project.apps.values()]
+        raise UsageError(
+            f'{where.name} has several apps, so "{_short(word)}" does not say which one is meant.',
+            hint=f"Start with the app's short name: {', '.join(shorts)}. For example: "
+            f'["{where.name}", "{shorts[0]}", "{_short(word)}"].',
+            code="bad_request",
+        )
+    rewritten = parse_request(json.dumps(rewritten))
+    program = registry.check_program(registry.program_path(where.folder, project.apps[rewritten[0]].program),
+                                     app=rewritten[0])
+    return rewritten, project, program, False
 
 
 # --------------------------------------------------------------------------- request
@@ -491,7 +539,7 @@ def ask_commands(program: str | Path, app: str, *, timeout: float = DESCRIBE_TIM
         wrong = Refused(
             f'The program registered for "{app}" says it is {_short(info.get("app"))!r}. Running it could touch '
             "the wrong app's data, so the gate refuses.",
-            hint="Ask the owner to check the project's [apps] in project.toml.",
+            hint="Ask the owner to check the app's app.toml and run: mes apps sync",
             code="wrong_app",
         )
         wrong.actual_app = info.get("app")  # type: ignore[attr-defined]
@@ -641,13 +689,14 @@ def child_main(project: str, server_root: str, level: str, stdin: BinaryIO, stdo
             request = parse_request(json.dumps(req.get("request")))
             if request[0] == MES_WORD:
                 raise _bad_request("mes operations are not run here.")
-            _, program = _project_and_program(where, request[0])
+            request, _, program, builtin = resolve_request(where, request)
             env = clean_env(level, where)
-            kinds = ask_commands(program, request[0], env=clean_env("read", where))
-            if request[1] not in kinds:
-                raise NotFound(f'The app "{request[0]}" has no command called "{request[1]}", so nothing was run.',
-                               hint=f'See its commands with: ["{request[0]}", "describe", "--json"]')
-            _check_kind(request[1], kinds[request[1]], level)
+            if not builtin:
+                kinds = ask_commands(program, request[0], env=clean_env("read", where))
+                if request[1] not in kinds:
+                    raise NotFound(f'The app "{request[0]}" has no command called "{request[1]}", so nothing was run.',
+                                   hint=f'See its commands with: ["{request[0]}", "describe", "--json"]')
+                _check_kind(request[1], kinds[request[1]], level)
             return answer(run_limited([str(program), *request[1:]], env=env, timeout=timeout,
                                       max_output=max_output, cwd=str(where.folder)))
         if req.get("kind") in ("sync", "publish") and level == "deploy":
@@ -790,15 +839,22 @@ def _handle_request(raw: str | None, allow: str, *, project: str, server_root: A
             with contextlib.suppress(OSError):
                 _log(where, record)
             return Outcome(0, (protocol.to_json(result) + "\n").encode("utf-8"), b"")
-        _, program = _project_and_program(where, app)
-        kinds = ask_commands(program, app, env=clean_env("read", where))
-        if command not in kinds:
-            raise NotFound(
-                f'The app "{app}" has no command called "{command}", so nothing was run.',
-                hint=f'See its commands with: ["{app}", "describe", "--json"]',
-            )
-        record["kind"] = kinds[command]
-        _check_kind(command, kinds[command], allow)
+        request, _, program, builtin = resolve_request(where, request)
+        if request[0] != app:
+            record["requested"] = _short(app)
+        app, command = request[0], request[1]
+        record.update(app=app, command=command, args=len(request) - 2)
+        if builtin:
+            record["kind"] = "read"  # the project command's built-ins only read
+        else:
+            kinds = ask_commands(program, app, env=clean_env("read", where))
+            if command not in kinds:
+                raise NotFound(
+                    f'The app "{app}" has no command called "{command}", so nothing was run.',
+                    hint=f'See its commands with: ["{app}", "describe", "--json"]',
+                )
+            record["kind"] = kinds[command]
+            _check_kind(command, kinds[command], allow)
     except MesError as e:
         record.update(decision="refused", reason=e.code)
         with contextlib.suppress(OSError):

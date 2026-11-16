@@ -1,13 +1,14 @@
 """``mes dev``: run a project on this computer and show its dashboards, with one link.
 
-1. Checks ``project.toml``; the project needs a ``[ui]`` section.
-2. When the project already has data, builds the dashboard data (``easy-ui data build``);
-   otherwise the preview uses the made-up data in ``ui/fixtures/``.
+1. Runs ``mes apps sync`` (finds every app and writes ``apps.lock.json``, which the dashboards
+   read), then checks the project; it needs dashboards (``[ui]``, ``ui/dashboards/`` or an app's).
+2. When the project already has its shared database (``<project>.sqlite``), builds the dashboard
+   data (``easy-ui data build``); otherwise the preview uses the made-up data in ``ui/fixtures/``.
 3. Starts ``easy-ui preview`` (only reachable from this computer, no password, nothing
    published) and prints the one link it gives.
-4. Watches the files: a change to ``project.toml`` is checked again and reported; a change to the
-   project's data file rebuilds the dashboard data; dashboard files are reloaded by the preview
-   itself. Stops with Ctrl-C (or after ``--stop-after`` seconds) and stops the preview too.
+4. Watches the files: a change to ``project.toml`` or an ``app.toml`` runs ``mes apps sync`` again
+   and reports the result; a change to the shared database rebuilds the dashboard data; dashboard
+   and sections files are reloaded by the preview itself. Stops with Ctrl-C (or after ``--stop-after`` seconds) and stops the preview too.
 
 With ``--json``, stdout holds exactly one JSON object, printed when the link is ready:
 ``{"project", "url", "data", "watching"}``. Later events go to stderr as plain lines.
@@ -53,12 +54,27 @@ def _mtimes(files: list[Path]) -> dict[Path, float]:
     return out
 
 
-def _watched(root: Path) -> list[Path]:
+def _watched(root: Path, project: manifest_mod.Project | None = None) -> list[Path]:
     files = [root / manifest_mod.MANIFEST_FILE]
-    folder = root / "ui" / "dashboards"
-    if folder.is_dir():
-        files += sorted(folder.glob("*.yaml")) + sorted(folder.glob("*.yml"))
-    return files
+    for sub in ("dashboards", "sections"):
+        folder = root / "ui" / sub
+        if folder.is_dir():
+            files += sorted(folder.glob("*.yaml")) + sorted(folder.glob("*.yml"))
+    for spec in (project.apps.values() if project else ()):
+        if spec.folder is None:
+            continue
+        files.append(spec.folder / manifest_mod.APP_FILE)
+        folder = spec.folder / "dashboards"
+        if folder.is_dir():
+            files += sorted(folder.glob("*.yaml"))
+    return list(dict.fromkeys(files))
+
+
+def _rel(p: Path, root: Path) -> str:
+    try:
+        return str(p.relative_to(root))
+    except ValueError:
+        return str(p)
 
 
 def _say(err: TextIO, text: str) -> None:
@@ -77,19 +93,23 @@ def _build_data(root: Path) -> str | None:
 
 def run_dev(project_dir: str | None = None, *, port: int | None = None, stop_after: float | None = None,
             json_mode: bool = False, out: TextIO | None = None, err: TextIO | None = None) -> int:
-    from mes.jobs import load_project
+    from mes import apps
+    from mes.jobs import project_root
 
     out = out or sys.stdout
     err = err or sys.stderr
-    root, project = load_project(project_dir)
-    if project.ui is None:
+    root = project_root(project_dir)
+    apps.sync(root)
+    project = manifest_mod.load(root)
+    if not project.has_dashboards:
         raise UsageError(
-            f'The project "{project.name}" has no [ui] section in project.toml, so it has no dashboards to show.',
-            hint='Add for example:\n[ui]\ndata = "' + project.name + '.sqlite"\ntables = ["daily"]\n'
-            "and a dashboard in ui/dashboards/ (see: mes guide dashboards).",
+            f'The project "{project.name}" has no dashboards: no [ui] section in project.toml, nothing in '
+            "ui/dashboards/ and no app ships one.",
+            hint='Add for example:\n[ui]\ndashboards = ["overview"]\nand a dashboard in ui/dashboards/overview.yaml '
+            "(see: mes guide dashboards).",
         )
     easy_ui = siblings.require("easy-ui", "Showing the dashboards")
-    data_file = paths.project_data_dir(project.name) / project.ui.data if project.ui.data else None
+    data_file: Path | None = paths.project_data_dir(project.name) / project.db_file
     has_data = bool(data_file and data_file.is_file())
     if has_data:
         problem = _build_data(root)
@@ -148,14 +168,14 @@ def run_dev(project_dir: str | None = None, *, port: int | None = None, stop_aft
         url = found["url"]
         info = {"project": project.name, "url": url,
                 "data": "the project's own data" if has_data else "the made-up sample data in ui/fixtures/",
-                "watching": [str(p.relative_to(root)) for p in _watched(root)]}
+                "watching": [_rel(p, root) for p in _watched(root, project)]}
         if json_mode:
             out.write(json.dumps(info) + "\n")
         else:
             out.write(f"Open this link in a browser on this computer: {url}\n"
                       f"It shows {info['data']} and updates when you save a file. Stop with Ctrl-C.\n")
         out.flush()
-        seen = _mtimes(_watched(root))
+        seen = _mtimes(_watched(root, project))
         data_seen = _mtimes([data_file]) if data_file else {}
         started = time.monotonic()
         while not stop.is_set():
@@ -165,16 +185,17 @@ def run_dev(project_dir: str | None = None, *, port: int | None = None, stop_aft
                 _say(err, "The dashboard preview stopped by itself.")
                 return proc.returncode or 1
             stop.wait(POLL)
-            now = _mtimes(_watched(root))
+            now = _mtimes(_watched(root, project))
             for f, t in now.items():
                 if seen.get(f) == t:
                     continue
-                name = f.relative_to(root)
-                if f.name == manifest_mod.MANIFEST_FILE:
+                name = _rel(f, root)
+                if f.name in (manifest_mod.MANIFEST_FILE, manifest_mod.APP_FILE):
                     try:
-                        manifest_mod.load(f)
-                        _say(err, f"{name} changed and is still correct. If you changed [ui], stop and start "
-                             "mes dev again to use the new settings.")
+                        apps.sync(root)
+                        project = manifest_mod.load(root)
+                        _say(err, f"{name} changed and is still correct (the list of apps was written again). If you "
+                             "changed [ui] or the apps, stop and start mes dev again to use the new settings.")
                     except MesError as e:
                         _say(err, f"{name} changed and now has a problem: {e.message} {e.hint or ''}")
                 else:

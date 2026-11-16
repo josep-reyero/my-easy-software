@@ -1,0 +1,17 @@
+# The dashboard of the app "{{app}}". Check it with: easy-ui validate
+spec: easy-ui/v1
+title: {{app_title_yaml}}
+description: Every item, newest first.
+
+queries:
+  items:
+    sql: |
+      SELECT time, text FROM {{prefix}}items ORDER BY line DESC LIMIT 100
+
+layout:
+  - - type: table
+      title: Items
+      query: items
+      columns:
+        - {column: time, label: Saved}
+        - {column: text, label: Item}

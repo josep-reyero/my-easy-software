@@ -1,7 +1,7 @@
 # {{title}}: instructions for AI agents
 
-This project (`{{name}}`) is built on my-easy-software. Its app's command-line tool is the way to
-read and change its data. `{{name}} guide` prints this file.
+This project (`{{name}}`) is built on my-easy-software. Its command, `{{name}}`, reaches every app of
+the project. `{{name}} guide` prints this file followed by each app's own guide.
 
 ## Rule one
 
@@ -13,20 +13,12 @@ something to do.
 
 Run every command with `--json` (before or after the command): stdout then holds only JSON data.
 
-- `{{name}} --json describe`: the app, its commands with their kind and arguments, and its jobs.
-- `{{name}} --json guide`: this file.
-- `{{name}} --json schema`: the tables and fields of the data.
-- `{{name}} --json sources`: where the data comes from.
+- `{{name}} --json describe`: every app, its commands with their kind and arguments, and the jobs.
+- `{{name}} --json guide`: this file and each app's guide.
+- `{{name}} --json apps`: the apps of this project.
+- `{{name}} <app> <command>`: a command of one app, for example `{{name}} {{short}} notes --json`.
 
 Inside the project folder, prefix the commands with `uv run` (for example `uv run {{name}} --json describe`).
-
-## Commands
-
-| Command | Kind | What it does |
-|---|---|---|
-| `notes [--last N]` | read | Show the newest notes, newest first |
-| `add "<text>"` | write | Save a new note |
-| `rebuild` | write | Rebuild the notes-per-day table; this is what the `rebuild` job runs |
 
 Kinds: `read` only looks, `write` changes data, `admin` changes how the project is set up. A
 session started with `MES_ALLOW=read` can only run read commands; anything else stops with
@@ -36,40 +28,25 @@ exit code 4 before it runs. Ask the user before running a write or admin command
 
 - Success: the JSON data on stdout, exit code 0.
 - Error: with `--json`, `{"error": {"code": "...", "message": "...", "hint": "..."}}` on stdout
-  and a non-zero exit code (without `--json`, a plain message on stderr). Tell the user the
-  message and the hint in plain words.
-- Exit codes: 0 ok, 1 error, 2 the command line was not understood, 3 not found, 4 not allowed
-  (the session's level is too low), 5 refused for safety, 6 needs the person (a `needs_input` or
-  `needs_human` answer: show the question or the action to the user, then run its `rerun`
+  and a non-zero exit code. Tell the user the message and the hint in plain words.
+- Exit codes: 0 ok, 1 error, 2 the command line was not understood, 3 not found, 4 not allowed,
+  5 refused for safety, 6 needs the person (show the question or action, then run its `rerun`
   command), 75 temporary failure (try again later).
 
 ## Data
 
-- Data lives on this computer, outside this folder: one SQLite file, `{{name}}.sqlite`, in
-  `~/.local/share/mes/{{name}}/` (`MES_DATA_HOME` moves the base; on a server it is
-  `/var/lib/mes/{{name}}/data/`). Never put data, tokens, passwords or personal details in this
-  folder: the code may be public.
-- Table `notes` is the raw data and the source of truth: rows are only added, never changed.
-- Table `daily` is derived: the `rebuild` job builds it from `notes`, so it can always be rebuilt.
-
-## Jobs and dashboards
-
-- Jobs are declared in `project.toml`. `mes --json jobs list` shows them; `mes --json jobs run rebuild`
-  runs one now. See `mes guide jobs`.
-- `ui/dashboards/main.yaml` is the main dashboard: named read-only queries over the tables listed
-  under `[ui]` in `project.toml`, and fixed components. `mes dev` shows it in a browser on this
-  computer; `ui/fixtures/sample.sqlite` holds made-up data for it until there is real data. See
-  `mes guide dashboards`.
-
-## On a server
-
-- `mes server plan {{name}}` writes the script that sets the project up on a Linux server (run once
-  with sudo by the person), `mes deploy <server>` installs a signed release. See `mes guide deploy`.
-- Agents on other computers reach the app through the gate: `ssh mes-{{name}}@<server> '["{{name}}", "notes", "--json"]'`.
-  Only `read` commands run (or `write` with a write key); `admin` never does. See `mes guide gate`.
+- Everything lives on this computer, outside this folder: `~/.local/share/mes/{{name}}/` (on a
+  server `/var/lib/mes/{{name}}/data/`). Never put data, tokens, passwords or personal details in
+  this folder: the code may be public.
+- One shared database, `{{name}}.sqlite`, for every app. Shared tables (`[tables]` in
+  `project.toml`) are read through their view, for example `daily`; every row has a `source`
+  column naming the app that wrote it. `mes db schema` shows them. See `mes guide share-data`.
 
 ## Changing this project
 
-- Add commands in `src/{{module}}/cli.py` with `@app.command("name", kind="read")`. Return the data;
-  never print it. See `mes guide commands`.
-- Keep this file up to date when commands change.
+- Add an app: `mes new-app <name>` (see `mes guide add-app`).
+- Jobs are declared in each app's `app.toml`; `mes jobs list` shows them all. See `mes guide jobs`.
+- Dashboards: `ui/dashboards/*.yaml` (the project's), plus what the apps ship or contribute.
+  `mes dev` shows them on this computer. See `mes guide dashboards`.
+- On a server: `mes server plan {{name}}`, then `mes deploy <server>` (see `mes guide deploy`).
+  Agents elsewhere reach it through the gate: `ssh mes-{{name}}@<server> '["{{name}}", "{{short}}", "notes", "--json"]'`.

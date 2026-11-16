@@ -1,21 +1,19 @@
 # Made by my-easy-software (mes). Do not edit: run 'mes server plan' again and the script it writes instead.
 # mes-project: demo
 # mes-unit: job
-# mes-job: sync
-# network: only api.example.com, auth.example.com (their addresses are looked up again before each run)
+# mes-job: demo-app.export
+# network: none
 
 [Unit]
-Description=mes job sync of project demo
-Requires=mes-demo.net.sync.service
-After=mes-demo.net.sync.service
-OnSuccess=mes-demo.job.build.service
+Description=mes job demo-app.export of project demo
 
 [Service]
 Type=oneshot
 User=mes-demo
 Group=mes-demo
-ExecStart="/var/lib/mes/demo/code/current/project/.venv/bin/demo" "--json" "sync" "--days" "3"
-ExecStopPost=+"/usr/local/bin/mes" "jobs" "record" "--project" "demo" "--server-root" "/var/lib/mes" "sync"
+ExecStartPre="/usr/local/bin/mes" "db" "sync" "--quiet" "--project-dir" "/var/lib/mes/demo/code/current/project"
+ExecStart="/var/lib/mes/demo/code/current/project/.venv/bin/demo-app" "--json" "export"
+ExecStopPost=+"/usr/local/bin/mes" "jobs" "record" "--project" "demo" "--server-root" "/var/lib/mes" "demo-app.export"
 WorkingDirectory=/var/lib/mes/demo/code/current/project
 Environment="MES_PROJECT=demo"
 Environment="MES_DATA_DIR=/var/lib/mes/demo/data"
@@ -24,12 +22,13 @@ Environment="MES_STORE_DIR=/var/lib/mes/demo/store"
 Environment="HOME=/var/lib/mes/demo/state"
 Environment="LANG=C.UTF-8"
 Environment="PYTHONDONTWRITEBYTECODE=1"
+Environment="MES_PROJECT_DIR=/var/lib/mes/demo/code/current/project"
 Environment="MES_ALLOW=write"
-Environment="MES_JOB=sync"
+Environment="MES_JOB=demo-app.export"
 Slice=mes.slice
-MemoryMax=512M
+MemoryMax=256M
 MemorySwapMax=0
-TimeoutStartSec=1200
+TimeoutStartSec=900
 UMask=0077
 NoNewPrivileges=yes
 CapabilityBoundingSet=
@@ -60,5 +59,6 @@ LimitCORE=0
 TasksMax=256
 ReadWritePaths=/var/lib/mes/demo/data /var/lib/mes/demo/store /var/lib/mes/demo/state
 InaccessiblePaths=-/var/lib/mes/demo/etc/webhook.key
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
 IPAddressDeny=any

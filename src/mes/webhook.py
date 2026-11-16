@@ -7,14 +7,14 @@ How it fits together on a server (all rendered by ``mes server plan``, see ``mes
   the person) can pass requests to it. mes never runs that proxy.
 - The first request starts ``mes webhook serve --project <p> --server-root <root>`` as
   ``mes-<p>``, with no network of its own and only ``state/triggers`` writable. It checks the
-  signature and, when it is right, rewrites ``state/triggers/<job>``. It stops by itself after
+  signature and, when it is right, rewrites ``state/triggers/<job id>``. It stops by itself after
   ``IDLE_EXIT_SEC`` seconds without requests.
-- ``mes-<p>.job.<job>.path`` notices the change and starts the job's own sandboxed unit. The
+- ``mes-<p>.job.<app>.<job>.path`` notices the change and starts the job's own sandboxed unit. The
   receiver therefore never runs project code and never needs any privilege.
 
 The request a sender makes::
 
-    POST /hooks/<job> HTTP/1.1
+    POST /hooks/<job id> HTTP/1.1
     Content-Length: <n>
     X-Mes-Timestamp: <unix seconds>
     X-Mes-Signature: sha256=<hex of HMAC-SHA256(secret, "<timestamp>." + body)>
@@ -123,7 +123,7 @@ def verify(secret: bytes, timestamp: Any, signature: Any, body: bytes, now: floa
 
 
 def job_problem(project: manifest_mod.Project, job: Any) -> str | None:
-    if not isinstance(job, str) or not manifest_mod.JOB_NAME_RE.fullmatch(job):
+    if not isinstance(job, str) or not manifest_mod.JOB_ID_RE.fullmatch(job):
         return "bad_job"
     if job not in project.jobs:
         return "unknown_job"

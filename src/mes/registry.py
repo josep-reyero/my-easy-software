@@ -10,7 +10,8 @@ needs no list. On a personal machine the list lives next to the per-machine conf
 
 Only the owner changes it, with ``mes projects add|remove``. ``mes gate --project <name>`` reads it
 on every request and never takes a path from the caller. The apps the gate may run are the
-project's ``[apps]``; each one's program is ``<folder>/.venv/bin/<cli>``.
+project's installed apps (``[project] apps``); each one's program is
+``<folder>/.venv/bin/<program>``.
 
 Public API
 ----------
@@ -21,7 +22,10 @@ Public API
     file does not exist; ``ConfigError`` when it is broken; ``Refused`` when other users could
     change it.
 ``lookup(name, *, public=False) -> Path``  the folder of one project (``NotFound`` when absent).
-``program_path(folder, cli) -> Path``  ``<folder>/.venv/bin/<cli>``.
+``program_path(folder, program) -> Path``  ``<folder>/.venv/bin/<program>``.
+``check_project_file(folder, *, public)``, ``check_lock_file(folder, *, public)``,
+``check_app_files(project, *, public)``  project.toml, apps.lock.json and every app.toml must be
+    changeable only by this account (or root).
 ``check_program(path, *, app=None) -> Path``  the path must be absolute, a regular
     file, executable, and pass ``trust_problem`` (as must the interpreter on its ``#!``
     line, with group-writable folders tolerated). ``app`` given: messages show no paths.
@@ -306,15 +310,43 @@ def check_project_file(folder: Path, *, public: bool) -> Path:
     return p
 
 
+def _check_settings_file(p: Path, what: str, *, public: bool) -> None:
+    problem = trust_problem(p, public=public)
+    if problem:
+        raise Refused(
+            f"{what} could be changed by someone else: {problem}. Someone could then change which programs the "
+            "gate runs, so mes refuses.",
+            hint="Ask the owner to make the project folder private to their account.",
+            code="untrusted_file",
+        )
+
+
+def check_lock_file(folder: Path, *, public: bool) -> None:
+    """``apps.lock.json`` (when there is one) must be changeable only by this account."""
+    p = folder / manifest_mod.LOCK_FILE
+    if os.path.lexists(p):
+        _check_settings_file(p, "The project's list of installed apps", public=public)
+
+
+def check_app_files(project: manifest_mod.Project, *, public: bool) -> None:
+    """Every app's ``app.toml`` must be changeable only by this account (or root)."""
+    for spec in project.apps.values():
+        if spec.folder is not None:
+            _check_settings_file(spec.folder / manifest_mod.APP_FILE, f"The settings file of the app {spec.name}",
+                                 public=public)
+
+
 def add(folder: str | Path, *, timeout: float = 20.0) -> dict[str, Any]:
     from mes.gate import ask_commands  # the gate's own safe way of asking an app what it is
 
     root = Path(os.path.abspath(Path(folder).expanduser()))
-    project = manifest_mod.load(root)
     check_project_file(root, public=False)
+    check_lock_file(root, public=False)
+    project = manifest_mod.load(root)
+    check_app_files(project, public=False)
     found: dict[str, dict[str, list[str]]] = {}
     for spec in project.apps.values():
-        program = program_path(root, spec.cli)
+        program = program_path(root, spec.program)
         check_program(program)
         try:
             commands = ask_commands(program, spec.name, timeout=timeout)
@@ -322,7 +354,7 @@ def add(folder: str | Path, *, timeout: float = 20.0) -> dict[str, Any]:
             if e.code != "wrong_app":
                 raise
             raise Refused(
-                f'The program {spec.cli} does not say it is the app "{spec.name}", so the project was not added. '
+                f'The program {spec.program} does not say it is the app "{spec.name}", so the project was not added. '
                 "Nothing changed.",
                 hint=f'Check App("...") in the app\'s code: it must be App("{spec.name}").',
                 code="wrong_app",
@@ -376,8 +408,9 @@ def list_projects() -> list[dict[str, Any]]:
         try:
             project = manifest_mod.load(folder)
             check_project_file(Path(folder), public=False)
+            check_app_files(project, public=False)
             for spec in project.apps.values():
-                check_program(program_path(folder, spec.cli))
+                check_program(program_path(folder, spec.program))
         except MesError as e:
             usable, problem = False, e.message
         out.append({"project": name, "folder": folder, "usable": usable, "problem": problem})

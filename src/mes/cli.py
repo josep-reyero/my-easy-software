@@ -5,9 +5,9 @@ own commands through a ``register(subparsers)`` function. The modules are
 imported one by one; a module that is not installed is skipped, so ``mes``
 keeps working with whatever parts are present.
 
-Contract for a feature module (``mes.scaffold``, ``mes.dev``, ``mes.setup``, ``mes.jobs``,
-``mes.server``, ``mes.deploy``, ``mes.gate``, ``mes.expose``, ``mes.webhook``, ``mes.backup``,
-``mes.guide``)
+Contract for a feature module (``mes.scaffold``, ``mes.dev``, ``mes.setup``, ``mes.apps``,
+``mes.db``, ``mes.jobs``, ``mes.server``, ``mes.deploy``, ``mes.gate``, ``mes.expose``,
+``mes.webhook``, ``mes.backup``, ``mes.guide``)
 ---------------------------------------------------------------------------
 - Define ``register(subparsers)``. ``subparsers`` is the top-level
   ``add_subparsers(dest="command")`` action; call ``subparsers.add_parser(...)``.
@@ -46,7 +46,7 @@ from mes.app import ArgumentParser, parse_json_aware
 from mes.errors import MesError, NotAvailableYet, UsageError
 
 COMMAND_MODULES = (
-    "mes.scaffold", "mes.dev", "mes.setup", "mes.jobs", "mes.server", "mes.deploy", "mes.gate",
+    "mes.scaffold", "mes.dev", "mes.setup", "mes.apps", "mes.db", "mes.jobs", "mes.server", "mes.deploy", "mes.gate",
     "mes.expose", "mes.webhook", "mes.backup", "mes.guide",
 )
 

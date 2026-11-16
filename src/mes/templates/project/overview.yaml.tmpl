@@ -1,11 +1,9 @@
-# The main dashboard of this project, for the dashboard server my-easy-ui (the
-# easy-ui command). A dashboard is a page made of named, read-only queries and
-# fixed components: no JavaScript, HTML or CSS. See every component and format
-# with: easy-ui components. Check this file with: easy-ui validate
+# The overview dashboard of this project, for the dashboard server my-easy-ui (the easy-ui
+# command). A dashboard is a page made of named, read-only queries and fixed components: no
+# JavaScript, HTML or CSS. See every component with: easy-ui components. Check it with: easy-ui validate
 #
-# The queries read a table called "daily" (one row per day: day, notes). The
-# dashboards read a copy of the tables listed under [ui] in project.toml, made by:
-# easy-ui data build
+# The queries read the shared view "daily" (one row per day and app: source, day, notes). Apps can
+# add their own sections to this dashboard; they go where the "anchor: apps" line is (or at the end).
 spec: easy-ui/v1
 title: {{title_yaml}}
 description: Notes added per day.
@@ -23,12 +21,13 @@ params:
 queries:
   total:
     sql: |
-      SELECT sum(notes) AS notes FROM daily
+      SELECT coalesce(sum(notes), 0) AS notes FROM daily
       WHERE day > date('now', '-' || :days || ' days')
   daily:
     sql: |
-      SELECT day, notes AS "Notes" FROM daily
+      SELECT day, sum(notes) AS "Notes" FROM daily
       WHERE day > date('now', '-' || :days || ' days')
+      GROUP BY day
       ORDER BY day DESC
 
 layout:
@@ -38,6 +37,7 @@ layout:
       query: total
       value: notes
       format: integer
+  - anchor: apps
   - - type: bar
       title: Notes per day
       query: daily

@@ -5,7 +5,9 @@ On this computer (the client)
 1. Packs the project: only files tracked by git (``git ls-files``), as they are in the folder,
    under ``project/``; plus the git-tracked files of each local path dependency named in
    ``[tool.uv.sources]`` (only sibling folders, ``../<name>``, such as ``../my-easy-software``),
-   under ``<name>/``, so the same relative paths work on the server. ``MES-RELEASE.json``
+   under ``<name>/``, so the same relative paths work on the server (a path dependency inside the
+   project, such as ``vendor/<app>``, is already part of the project's files). ``apps.lock.json``
+   holds this computer's paths and is never packed: the server writes its own. ``MES-RELEASE.json``
    records the project, version, time, commit and whether there were uncommitted changes.
    Links, missing ``uv.lock`` and folders outside the project are refused.
 2. Signs the archive with ``ssh-keygen -Y sign -n mes-deploy`` (an OpenSSH signature, Ed25519
@@ -24,8 +26,9 @@ On the server (inside the gate, as the project's account)
 3. Unpacks with the hardened extractor of ``mes.archive`` into a new ``code/releases/<n>/``.
 4. Refuses an archive for another project, one older than the newest release, or one already
    installed.
-5. Runs ``uv sync --frozen`` in its own sandbox, then asks every app to describe itself and
-   checks the jobs' commands.
+5. Runs ``uv sync --frozen`` in its own sandbox, then ``mes apps sync`` for the new release: finds
+   every app, asks each to describe itself, checks the jobs' commands and writes the release's
+   own ``apps.lock.json``.
 6. Switches ``code/current`` to the new release atomically, publishes the dashboards
    (``easy-ui publish``), and switches back if publishing fails.
 7. Keeps the newest ``KEEP_RELEASES`` releases (never the current or the previous one).
@@ -155,11 +158,16 @@ def _path_dependencies(root: Path) -> list[tuple[str, Path]]:
                 continue
             raw = str(s["path"])
             parts = Path(raw).parts
+            inside = not os.path.isabs(raw) and parts and ".." not in parts and \
+                (root / raw).resolve().is_relative_to(root.resolve())
+            if inside:
+                continue  # a folder of the project itself (for example vendor/<app>): already packed
             if os.path.isabs(raw) or len(parts) != 2 or parts[0] != ".." or not _DEP_NAME_RE.match(parts[1]) \
                     or parts[1] in ("project", RELEASE_FILE):
                 raise Refused(
                     f'pyproject.toml takes "{package}" from the folder {raw!r}. mes can only send local dependencies '
-                    "that sit right next to the project (../<folder>), so the same path works on the server.",
+                    "that sit inside the project or right next to it (../<folder>), so the same path works on the "
+                    "server.",
                     hint="Move that folder next to the project folder (and use path = \"../<folder>\"), or depend on "
                     "a published version instead.",
                     code="dependency_path",
@@ -174,6 +182,10 @@ def _path_dependencies(root: Path) -> list[tuple[str, Path]]:
 
 def collect(root: Path, project: manifest_mod.Project) -> tuple[list[tuple[str, Path | bytes]], dict[str, Any]]:
     files, notes, dirty, commit = _tracked(root, "The project")
+    if any(n == manifest_mod.LOCK_FILE for n, _ in files):
+        files = [(n, p) for n, p in files if n != manifest_mod.LOCK_FILE]
+        notes.append(f"{manifest_mod.LOCK_FILE} is tracked by git, but it holds this computer's paths, so it was not "
+                     "sent (the server writes its own). Remove it from git and add it to .gitignore.")
     names = {n for n, _ in files}
     for needed in (manifest_mod.MANIFEST_FILE, "pyproject.toml", "uv.lock"):
         if needed not in names:
@@ -355,7 +367,8 @@ def run_deploy(host: str, *, project_dir: str | None, key: str | None, dry_run: 
             {"step": "on the server", "what": [
                 "verify the signature against the project's allowed signers, before unpacking anything",
                 "unpack with the hardened extractor into a new release folder",
-                "uv sync --frozen in a sandbox, then check that every app describes itself and the jobs' commands",
+                "uv sync --frozen in a sandbox, then mes apps sync: every app describes itself, the jobs' commands "
+                "are checked and the release's own apps.lock.json is written",
                 "switch 'current' to the new release in one step",
                 "publish the dashboards (switch back if that fails)",
                 f"keep the newest {KEEP_RELEASES} releases",
@@ -635,7 +648,7 @@ def _check_release(layout: paths.ServerLayout, folder: Path, sha: str) -> dict[s
     if not isinstance(created, int):
         raise Refused("The release description has no creation time.", hint="Deploy with 'mes deploy'.",
                       code="bad_release")
-    project = manifest_mod.load(folder / paths.RELEASE_PROJECT_DIR)
+    project = manifest_mod.load_file(folder / paths.RELEASE_PROJECT_DIR)
     if project.name != layout.project:
         raise Refused(f"The archive's project.toml is for \"{project.name}\", not \"{layout.project}\".",
                       hint="Deploy the right project.", code="wrong_project")
@@ -765,7 +778,7 @@ def receive(where: Any, signature: str, stdin: BinaryIO | None, *,
 
 
 def _publish(layout: paths.ServerLayout, project: manifest_mod.Project, run_child) -> dict[str, Any]:
-    if project.ui is None:
+    if not project.has_dashboards:
         return {"published": False, "why": "the project has no dashboards"}
     try:
         return run_child({"kind": "publish"})
@@ -877,8 +890,7 @@ def _tool_env(where: Any) -> dict[str, str]:
 def child_step(where: Any, req: dict[str, Any], *, timeout: float) -> dict[str, Any]:
     """A deploy step that runs project code or downloads packages: called inside the deploy
     sandbox (``mes gate child --level deploy``), or by the gate itself where there is none."""
-    from mes import jobs
-    from mes.gate import ask_commands, clean_env, run_limited
+    from mes.gate import clean_env, run_limited
 
     layout: paths.ServerLayout = where.layout
     config = read_server_config(layout)
@@ -902,17 +914,21 @@ def child_step(where: Any, req: dict[str, Any], *, timeout: float) -> dict[str, 
                            hint="Check that uv.lock is up to date (uv lock) and that the server can reach the "
                            "package index.", code="sync_failed",
                            detail=done.stderr.decode("utf-8", "replace")[-2000:] or None, detail_label="What uv said:")
-        project = manifest_mod.load(folder)
-        commands: dict[str, dict[str, str]] = {}
-        for spec in project.apps.values():
-            program = folder / ".venv" / "bin" / spec.cli
-            if not program.is_file():
-                raise MesError(f'The app "{spec.name}" has no program "{spec.cli}" after installing, so the release '
-                               "was not switched on.", hint=f'Name the script "{spec.cli}" in [project.scripts] of '
-                               "pyproject.toml.", code="app_missing")
-            commands[spec.name] = ask_commands(program, spec.name, env=clean_env("read", where))
-        return {"synced": True, "release": number, "apps": sorted(commands),
-                "problems": jobs.job_problems(project, commands)}
+        from mes import apps
+
+        def runner(argv: list[str], *, env: dict[str, str], timeout: float, cwd: str) -> tuple[int, bytes, bytes]:
+            run_env = {**clean_env("read", where), "MES_PROJECT_DIR": str(folder)}
+            done = run_limited(argv, env=run_env, timeout=min(timeout, 60.0), max_output=1024 * 1024, cwd=cwd)
+            return (124 if done.timed_out else done.returncode), done.stdout, done.stderr
+
+        try:
+            synced = apps.sync(folder, runner=runner, strict=False)
+        except MesError as e:
+            raise MesError(f"The new release's apps could not be checked, so it was not switched on: {e.message}",
+                           hint=e.hint, code=e.code if e.code != "error" else "app_missing", detail=e.detail,
+                           detail_label=e.detail_label) from None
+        return {"synced": True, "release": number, "apps": sorted(a["name"] for a in synced["apps"]),
+                "problems": list(synced["problems"])}
     if kind == "publish":
         easy_ui = config.get("easy_ui")
         if not easy_ui:

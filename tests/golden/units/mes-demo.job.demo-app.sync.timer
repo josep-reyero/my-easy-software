@@ -1,16 +1,16 @@
 # Made by my-easy-software (mes). Do not edit: run 'mes server plan' again and the script it writes instead.
 # mes-project: demo
 # mes-unit: timer
-# mes-job: sync
+# mes-job: demo-app.sync
 
 [Unit]
-Description=Schedule of mes job sync of project demo
+Description=Schedule of mes job demo-app.sync of project demo
 
 [Timer]
 OnCalendar=*-*-* 06:00:00
 Persistent=true
 RandomizedDelaySec=120
-Unit=mes-demo.job.sync.service
+Unit=mes-demo.job.demo-app.sync.service
 
 [Install]
 WantedBy=timers.target

@@ -1,0 +1,14 @@
+# Made by my-easy-software (mes). Do not edit: run 'mes server plan' again and the script it writes instead.
+# mes-project: demo
+# mes-unit: webhook-trigger
+# mes-job: demo-app.hook
+
+[Unit]
+Description=Start mes job demo-app.hook of project demo when its signed webhook arrives
+
+[Path]
+PathModified=/var/lib/mes/demo/state/triggers/demo-app.hook
+Unit=mes-demo.job.demo-app.hook.service
+
+[Install]
+WantedBy=paths.target

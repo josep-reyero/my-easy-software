@@ -1,17 +1,17 @@
 # Made by my-easy-software (mes). Do not edit: run 'mes server plan' again and the script it writes instead.
 # mes-project: demo
 # mes-unit: net
-# mes-job: sync
+# mes-job: demo-app.sync
 # Runs as root just before each start of the job: it looks up the job's hosts and lets the
 # job reach only those addresses (and the DNS servers). It reads nothing from the project.
 
 [Unit]
-Description=Allow the network hosts of mes job sync of project demo
-Before=mes-demo.job.sync.service
+Description=Allow the network hosts of mes job demo-app.sync of project demo
+Before=mes-demo.job.demo-app.sync.service
 
 [Service]
 Type=oneshot
-ExecStart="/usr/local/bin/mes" "jobs" "allow-network" "--unit" "mes-demo.job.sync.service" "--" "api.example.com" "auth.example.com"
+ExecStart="/usr/local/bin/mes" "jobs" "allow-network" "--unit" "mes-demo.job.demo-app.sync.service" "--" "api.example.com" "auth.example.com"
 WorkingDirectory=/
 Environment="LANG=C.UTF-8"
 TimeoutStartSec=60

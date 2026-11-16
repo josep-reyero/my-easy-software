@@ -1,18 +1,18 @@
 # Made by my-easy-software (mes). Do not edit: run 'mes server plan' again and the script it writes instead.
 # mes-project: demo
 # mes-unit: job
-# mes-job: report
+# mes-job: demo-tool.report
 # network: none
 
 [Unit]
-Description=mes job report of project demo
+Description=mes job demo-tool.report of project demo
 
 [Service]
 Type=oneshot
 User=mes-demo
 Group=mes-demo
 ExecStart="/var/lib/mes/demo/code/current/project/.venv/bin/demo-tool" "--json" "report"
-ExecStopPost=+"/usr/local/bin/mes" "jobs" "record" "--project" "demo" "--server-root" "/var/lib/mes" "report"
+ExecStopPost=+"/usr/local/bin/mes" "jobs" "record" "--project" "demo" "--server-root" "/var/lib/mes" "demo-tool.report"
 WorkingDirectory=/var/lib/mes/demo/code/current/project
 Environment="MES_PROJECT=demo"
 Environment="MES_DATA_DIR=/var/lib/mes/demo/data"
@@ -21,8 +21,9 @@ Environment="MES_STORE_DIR=/var/lib/mes/demo/store"
 Environment="HOME=/var/lib/mes/demo/state"
 Environment="LANG=C.UTF-8"
 Environment="PYTHONDONTWRITEBYTECODE=1"
+Environment="MES_PROJECT_DIR=/var/lib/mes/demo/code/current/project"
 Environment="MES_ALLOW=write"
-Environment="MES_JOB=report"
+Environment="MES_JOB=demo-tool.report"
 Slice=mes.slice
 MemoryMax=256M
 MemorySwapMax=0

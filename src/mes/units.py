@@ -4,14 +4,17 @@ Every unit runs under the project's own account (``User=mes-<project>``), never 
 as root, so the sandbox settings are really enforced. ``mes server plan`` puts these files into
 the root script a person reads and runs once with sudo; mes itself never installs them.
 
-Unit names use dots, which project and job names cannot contain, so two projects can never
-produce the same name (``mes-fit.job.data-sync`` and ``mes-fit-data.job.sync`` differ):
+Unit names use dots, which project, app and job names cannot contain, so two projects can never
+produce the same name (``mes-fit.job.fit-a.sync`` and ``mes-fit-a.job.sync...`` differ). A job is
+named by its id, ``<app>.<job>``:
 
-- ``mes-<p>.job.<job>.service``  one run of a job (``Type=oneshot``, sandboxed).
-- ``mes-<p>.job.<job>.timer``    for a job with ``schedule``.
-- ``mes-<p>.job.<job>.path``     for a job with ``webhook = true``: starts it when the webhook
-  receiver touches ``state/triggers/<job>``.
-- ``mes-<p>.net.<job>.service``  for a job that lists network hosts: runs just before each
+- ``mes-<p>.job.<app>.<job>.service``  one run of a job (``Type=oneshot``, sandboxed). A job that
+  may write data first runs ``mes db sync`` (``ExecStartPre``) so the shared database matches
+  ``project.toml``.
+- ``mes-<p>.job.<app>.<job>.timer``    for a job with ``schedule``.
+- ``mes-<p>.job.<app>.<job>.path``     for a job with ``webhook = true``: starts it when the webhook
+  receiver touches ``state/triggers/<app>.<job>``.
+- ``mes-<p>.net.<app>.<job>.service``  for a job that lists network hosts: runs just before each
   start of the job, looks the hosts up again and sets the job's ``IPAddressAllow=`` (the job
   itself has ``IPAddressDeny=any``). It runs as root because only root may change another
   unit's settings; it takes nothing from the project's files (the hosts are written into this
@@ -42,7 +45,7 @@ Public API
 ``UNIT_PREFIX``, ``SLICE``, ``RANDOM_DELAY_SEC``, ``JOB_ALLOW_LEVEL`` (``"write"``),
 ``MARKER_PROJECT``, ``MARKER_JOB``, ``MARKER_KIND``, ``HEADER``, ``UNIT_NAME_RE``,
 ``JOB_UNIT_RE``, ``RUN_LOG_FILE``.
-``job_unit(project, job, suffix="service")``, ``net_unit(project, job)``,
+``job_unit(project, job_id, suffix="service")``, ``net_unit(project, job_id)``,
 ``ui_refresh_unit(project)``, ``webhook_units(project) -> (socket, service)``,
 ``webhook_socket_path(project) -> str``, ``gate_units(project, level) -> (socket, template)``,
 ``gate_socket_path(project, level) -> str``.
@@ -69,7 +72,7 @@ from collections.abc import Sequence
 from pathlib import PurePosixPath
 
 from mes.errors import Refused
-from mes.manifest import HOST_RE, JOB_NAME_RE, PROJECT_NAME_RE, Job, Project
+from mes.manifest import HOST_RE, JOB_ID_RE, PROJECT_NAME_RE, Job, Project
 
 UNIT_PREFIX = "mes"
 SLICE = "mes.slice"
@@ -82,11 +85,13 @@ MARKER_JOB = "# mes-job: "
 MARKER_KIND = "# mes-unit: "
 HEADER = ("# Made by my-easy-software (mes). Do not edit: run 'mes server plan' again and the script it "
           "writes instead.")
-UNIT_NAME_RE = re.compile(r"^mes-[a-z][a-z0-9-]{1,30}\.(?:job\.[a-z][a-z0-9-]{0,30}\.(?:service|timer|path)|"
-                          r"net\.[a-z][a-z0-9-]{0,30}\.service|ui-refresh\.service|webhook\.(?:socket|service)|"
+_JOB_ID = r"[a-z][a-z0-9-]{1,30}\.[a-z][a-z0-9-]{0,30}"
+UNIT_NAME_RE = re.compile(rf"^mes-[a-z][a-z0-9-]{{1,30}}\.(?:job\.{_JOB_ID}\.(?:service|timer|path)|"
+                          rf"net\.{_JOB_ID}\.service|ui-refresh\.service|webhook\.(?:socket|service)|"
                           r"gate-(?:read|write|deploy)(?:\.socket|@\.service))\Z")
 GATE_LEVELS = ("read", "write", "deploy")
-JOB_UNIT_RE = re.compile(r"^mes-(?P<project>[a-z][a-z0-9-]{1,30})\.job\.(?P<job>[a-z][a-z0-9-]{0,30})\.service\Z")
+JOB_UNIT_RE = re.compile(r"^mes-(?P<project>[a-z][a-z0-9-]{1,30})\.job\.(?P<app>[a-z][a-z0-9-]{1,30})\."
+                         r"(?P<job>[a-z][a-z0-9-]{0,30})\.service\Z")
 
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f\u0085  ]")
 _SAFE_PATH_RE = re.compile(r"/[A-Za-z0-9._/@+=,~-]*")
@@ -163,9 +168,9 @@ def _check_project(name: str) -> str:
 
 
 def _check_job(job: str) -> str:
-    if not isinstance(job, str) or not JOB_NAME_RE.fullmatch(job):
-        raise _refuse("the job name", job, "it is not a simple name.",
-                      "Job names use lowercase letters, digits and dashes, starting with a letter.")
+    if not isinstance(job, str) or not JOB_ID_RE.fullmatch(job):
+        raise _refuse("the job id", job, "it is not <app>.<job> with simple names.",
+                      "App and job names use lowercase letters, digits and dashes, starting with a letter.")
     return job
 
 
@@ -349,12 +354,12 @@ def _project_env(project: Project, layout) -> list[str]:
 
 def _program(project: Project, layout, app: str) -> str:
     spec = project.app(app)
-    return sandbox_path(f"{sandbox_path(layout.current_project)}/.venv/bin/{spec.cli}")
+    return sandbox_path(f"{sandbox_path(layout.current_project)}/.venv/bin/{spec.program}")
 
 
 def render_job_service(project: Project, job: Job, *, layout, mes: str) -> str:
     p = _check_project(project.name)
-    name = _check_job(job.name)
+    name = _check_job(job.id)
     hosts = check_hosts(job.network)
     writes = _writes(job)
     timeout = _timeout_seconds(job)
@@ -362,8 +367,10 @@ def render_job_service(project: Project, job: Job, *, layout, mes: str) -> str:
     root = sandbox_path(layout.root)
     start = exec_line([_program(project, layout, job.app), "--json", *job.argv])
     record = exec_line([mes, "jobs", "record", "--project", p, "--server-root", root, name])
-    after_success = [job_unit(p, d.name) for d in project.dependents(job.name)]
-    if project.ui is not None and job.name in project.ui.refresh_after:
+    current = sandbox_path(layout.current_project)
+    pre = exec_line([mes, "db", "sync", "--quiet", "--project-dir", current]) if "data" in writes else None
+    after_success = [job_unit(p, d.id) for d in project.dependents(job.id)]
+    if project.ui is not None and job.id in project.ui.refresh_after:
         after_success.append(ui_refresh_unit(p))
 
     net_comment = (f"network: only {', '.join(hosts)} (their addresses are looked up again before each run)"
@@ -380,10 +387,12 @@ def render_job_service(project: Project, job: Job, *, layout, mes: str) -> str:
         "Type=oneshot",
         f"User={layout.account}",
         f"Group={layout.account}",
+        *([f"ExecStartPre={pre}"] if pre else []),
         f"ExecStart={start}",
         f"ExecStopPost=+{record}",
         f"WorkingDirectory={line_path(layout.current_project)}",
         *_project_env(project, layout),
+        f"Environment={env_assignment('MES_PROJECT_DIR', current)}",
         f"Environment={env_assignment('MES_ALLOW', JOB_ALLOW_LEVEL)}",
         f"Environment={env_assignment('MES_JOB', name)}",
         f"Slice={SLICE}",
@@ -408,7 +417,7 @@ def render_job_service(project: Project, job: Job, *, layout, mes: str) -> str:
 
 def render_job_timer(project: Project, job: Job) -> str:
     p = _check_project(project.name)
-    name = _check_job(job.name)
+    name = _check_job(job.id)
     if job.trigger != "schedule" or job.schedule is None:
         raise ValueError(f"job {name!r} has no schedule")
     lines = _header(p, "timer", name) + [
@@ -431,7 +440,7 @@ def render_job_timer(project: Project, job: Job) -> str:
 
 def render_job_path(project: Project, job: Job, *, layout) -> str:
     p = _check_project(project.name)
-    name = _check_job(job.name)
+    name = _check_job(job.id)
     trigger = sandbox_path(f"{sandbox_path(layout.triggers)}/{name}")
     lines = _header(p, "webhook-trigger", name) + [
         "",
@@ -451,7 +460,7 @@ def render_job_path(project: Project, job: Job, *, layout) -> str:
 
 def render_net_service(project: Project, job: Job, *, mes: str) -> str:
     p = _check_project(project.name)
-    name = _check_job(job.name)
+    name = _check_job(job.id)
     hosts = check_hosts(job.network)
     if not hosts:
         raise ValueError(f"job {name!r} lists no hosts")
@@ -669,13 +678,13 @@ def render_project(project: Project, *, layout, mes: str, easy_ui: str | None = 
     files: dict[str, str] = {}
     files.update(render_gate(project, layout=layout, mes=mes))
     for job in project.jobs.values():
-        files[job_unit(project.name, job.name)] = render_job_service(project, job, layout=layout, mes=mes)
+        files[job_unit(project.name, job.id)] = render_job_service(project, job, layout=layout, mes=mes)
         if job.trigger == "schedule":
-            files[job_unit(project.name, job.name, "timer")] = render_job_timer(project, job)
+            files[job_unit(project.name, job.id, "timer")] = render_job_timer(project, job)
         if job.trigger == "webhook":
-            files[job_unit(project.name, job.name, "path")] = render_job_path(project, job, layout=layout)
+            files[job_unit(project.name, job.id, "path")] = render_job_path(project, job, layout=layout)
         if job.network:
-            files[net_unit(project.name, job.name)] = render_net_service(project, job, mes=mes)
+            files[net_unit(project.name, job.id)] = render_net_service(project, job, mes=mes)
     if project.ui is not None and project.ui.refresh_after and easy_ui is not None:
         files[ui_refresh_unit(project.name)] = render_ui_refresh(project, layout=layout, easy_ui=easy_ui)
     if any(j.trigger == "webhook" for j in project.jobs.values()):

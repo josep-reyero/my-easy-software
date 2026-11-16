@@ -1,35 +1,29 @@
-"""The command-line tool of this project, built on the my-easy-software App SDK.
+"""The app "{{app}}" of the project {{name}}, built on the my-easy-software App SDK.
 
 Every command has a kind: "read" (only looks), "write" (changes data) or "admin" (changes how
 the project is set up). Add --json, before or after the command, to get only JSON data on stdout.
-Start with: {{name}} --json describe
+Start with: {{name}} {{short}} --json describe   (or {{app}} --json describe)
 
-The data lives in one SQLite file on this computer, never inside this folder:
-- table "notes" is the raw data and the source of truth; rows are only ever added.
-- table "daily" (notes per day) is derived: the "rebuild" job builds it from "notes", so it can
-  always be thrown away and built again. The dashboard in ui/dashboards/main.yaml reads it.
+The data lives in the project's shared database on this computer, never inside this folder:
+- table "{{prefix}}notes" belongs to this app: the raw notes, the source of truth.
+- the shared table "daily" (notes per day) is derived: the "rebuild" command writes this app's
+  rows of it from the notes, so it can always be rebuilt. The dashboards read the view "daily".
 """
 
 from __future__ import annotations
 
-import sqlite3
-from contextlib import closing
 from datetime import datetime, timezone
 from typing import Annotated
 
 from mes import App, UsageError
 
-app = App("{{name}}")
+app = App("{{app}}")
 
-DATA_FILE = "{{name}}.sqlite"  # the same name as [ui] data in project.toml
+NOTES = "{{prefix}}notes"  # an app table: its name starts with the app's prefix
 
 
-def _connect(ctx) -> sqlite3.Connection:
-    conn = sqlite3.connect(ctx.data_dir / DATA_FILE)
-    conn.row_factory = sqlite3.Row
-    conn.execute("CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, time TEXT NOT NULL, text TEXT NOT NULL)")
-    conn.execute("CREATE TABLE IF NOT EXISTS daily (day TEXT PRIMARY KEY, notes INTEGER NOT NULL)")
-    return conn
+def _create(db) -> None:
+    db.conn.execute(f'CREATE TABLE IF NOT EXISTS "{NOTES}" (id INTEGER PRIMARY KEY, time TEXT NOT NULL, text TEXT NOT NULL)')
 
 
 @app.command("notes", kind="read")
@@ -40,10 +34,15 @@ def notes(ctx, last: Annotated[int, "how many of the newest notes to show"] = 10
             f"--last must be 1 or more, but it was {last}, so there is nothing to show.",
             hint="Leave it out to see the 10 newest notes, or use for example --last 5.",
         )
-    with closing(_connect(ctx)) as conn:
-        rows = [dict(r) for r in conn.execute("SELECT time, text FROM notes ORDER BY id DESC LIMIT ?", (last,))]
+    rows = []
+    if ctx.db_path.is_file():
+        with ctx.db(write=False) as db:
+            found = db.conn.execute("SELECT name FROM sqlite_master WHERE name = ?", (NOTES,)).fetchone()
+            if found:
+                rows = [dict(r) for r in db.conn.execute(
+                    f'SELECT time, text FROM "{NOTES}" ORDER BY id DESC LIMIT ?', (last,))]
     if not rows and not ctx.json:
-        return 'No notes yet. Add one with: {{name}} add "Bought milk"'
+        return 'No notes yet. Add one with: {{name}} {{short}} add "Bought milk"'
     return rows
 
 
@@ -54,32 +53,36 @@ def add(ctx, text: Annotated[str, "the note to save"]):
     if not text:
         raise UsageError(
             "The note is empty, so nothing was saved.",
-            hint='Give the text of the note, for example: {{name}} add "Bought milk"',
+            hint='Give the text of the note, for example: {{name}} {{short}} add "Bought milk"',
         )
     row = {"time": datetime.now(timezone.utc).isoformat(timespec="seconds"), "text": text}
-    with closing(_connect(ctx)) as conn, conn:
-        conn.execute("INSERT INTO notes (time, text) VALUES (:time, :text)", row)
+    with ctx.db() as db:
+        _create(db)
+        db.conn.execute(f'INSERT INTO "{NOTES}" (time, text) VALUES (:time, :text)', row)
     return {"saved": True, **row}
 
 
 @app.command("rebuild", kind="write")
 def rebuild(ctx):
-    """Rebuild the table of notes per day from the raw notes (the "rebuild" job)."""
-    with closing(_connect(ctx)) as conn, conn:  # one transaction: readers never see half a table
-        conn.execute("DELETE FROM daily")
-        conn.execute("INSERT INTO daily (day, notes) SELECT substr(time, 1, 10), count(*) FROM notes GROUP BY 1")
-        days, total = conn.execute("SELECT count(*), coalesce(sum(notes), 0) FROM daily").fetchone()
-    return {"table": "daily", "rows": days, "notes": total}
+    """Rebuild this app's rows of the shared table "daily" from the notes (the "rebuild" job)."""
+    with ctx.db() as db:  # one transaction: readers see the old rows or the new ones, never half
+        _create(db)
+        days = [{"day": r["day"], "notes": r["notes"]} for r in db.conn.execute(
+            f'SELECT substr(time, 1, 10) AS day, count(*) AS notes FROM "{NOTES}" GROUP BY 1')]
+        db.replace_rows("daily", days)
+    return {"table": "daily", "rows": len(days), "notes": sum(d["notes"] for d in days)}
 
 
 @app.schema
 def schema(ctx):
     return {
-        "file": DATA_FILE,
+        "file": f"{ctx.project}.sqlite",
         "tables": [
-            {"name": "notes", "layer": "raw", "fields": {"time": "UTC date and time", "text": "the note"}},
-            {"name": "daily", "layer": "derived", "built_by": "rebuild",
-             "fields": {"day": "date (YYYY-MM-DD, UTC)", "notes": "number of notes that day"}},
+            {"name": NOTES, "layer": "raw", "owner": "{{app}}",
+             "fields": {"time": "UTC date and time", "text": "the note"}},
+            {"name": "daily", "layer": "derived (shared)", "built_by": "rebuild",
+             "fields": {"source": "the app that wrote the row", "day": "date (YYYY-MM-DD, UTC)",
+                        "notes": "number of notes that day"}},
         ],
     }
 

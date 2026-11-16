@@ -1,0 +1,20 @@
+# The app "{{app}}" of the project {{name}}. See: mes guide add-app
+[app]
+name = "{{app}}"
+title = {{app_title_toml}}
+cli = "{{package}}.cli:app"   # the mes.App in cli.py; its program is "{{app}}"
+
+[data]
+tables = ["{{prefix}}items"]   # tables only this app owns (they start with "{{prefix}}")
+rebuild = "rebuild"           # rebuilds the app's tables from its own files
+# writes = ["daily"]          # shared tables of project.toml this app adds rows to (see: mes guide share-data)
+
+[jobs.rebuild]
+run = "rebuild"
+manual = true                 # only when asked: mes jobs run {{app}}.rebuild
+timeout = "5m"
+network = false
+
+[ui]
+dashboards = ["{{short}}"]          # dashboards/{{short}}.yaml in this folder
+tables = ["{{prefix}}items"]   # app tables the dashboards may read

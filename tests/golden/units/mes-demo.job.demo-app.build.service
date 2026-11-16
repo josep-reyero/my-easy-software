@@ -1,18 +1,20 @@
 # Made by my-easy-software (mes). Do not edit: run 'mes server plan' again and the script it writes instead.
 # mes-project: demo
 # mes-unit: job
-# mes-job: export
+# mes-job: demo-app.build
 # network: none
 
 [Unit]
-Description=mes job export of project demo
+Description=mes job demo-app.build of project demo
+OnSuccess=mes-demo.job.demo-tool.report.service mes-demo.ui-refresh.service
 
 [Service]
 Type=oneshot
 User=mes-demo
 Group=mes-demo
-ExecStart="/var/lib/mes/demo/code/current/project/.venv/bin/demo" "--json" "export"
-ExecStopPost=+"/usr/local/bin/mes" "jobs" "record" "--project" "demo" "--server-root" "/var/lib/mes" "export"
+ExecStartPre="/usr/local/bin/mes" "db" "sync" "--quiet" "--project-dir" "/var/lib/mes/demo/code/current/project"
+ExecStart="/var/lib/mes/demo/code/current/project/.venv/bin/demo-app" "--json" "build" "50%% done" "$$HOME"
+ExecStopPost=+"/usr/local/bin/mes" "jobs" "record" "--project" "demo" "--server-root" "/var/lib/mes" "demo-app.build"
 WorkingDirectory=/var/lib/mes/demo/code/current/project
 Environment="MES_PROJECT=demo"
 Environment="MES_DATA_DIR=/var/lib/mes/demo/data"
@@ -21,8 +23,9 @@ Environment="MES_STORE_DIR=/var/lib/mes/demo/store"
 Environment="HOME=/var/lib/mes/demo/state"
 Environment="LANG=C.UTF-8"
 Environment="PYTHONDONTWRITEBYTECODE=1"
+Environment="MES_PROJECT_DIR=/var/lib/mes/demo/code/current/project"
 Environment="MES_ALLOW=write"
-Environment="MES_JOB=export"
+Environment="MES_JOB=demo-app.build"
 Slice=mes.slice
 MemoryMax=256M
 MemorySwapMax=0
@@ -55,7 +58,7 @@ SystemCallFilter=~@privileged @resources
 SystemCallErrorNumber=EPERM
 LimitCORE=0
 TasksMax=256
-ReadWritePaths=/var/lib/mes/demo/data /var/lib/mes/demo/store /var/lib/mes/demo/state
+ReadWritePaths=/var/lib/mes/demo/data /var/lib/mes/demo/store
 InaccessiblePaths=-/var/lib/mes/demo/etc/webhook.key
 PrivateNetwork=yes
 RestrictAddressFamilies=AF_UNIX

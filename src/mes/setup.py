@@ -242,7 +242,7 @@ def dashboard_serve(project: str | None = None, socket: str | None = None, port:
                 loaded = manifest_mod.load(found)
             except MesError:
                 loaded = None
-        if loaded is not None and loaded.ui is not None:
+        if loaded is not None and loaded.has_dashboards:
             project = loaded.name
     if project is None:
         if socket is not None or port is not None:

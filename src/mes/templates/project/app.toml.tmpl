@@ -1,0 +1,20 @@
+# The app "{{app}}" of the project {{name}}. See: mes guide add-app
+[app]
+name = "{{app}}"
+title = {{app_title_toml}}
+cli = "{{package}}.cli:app"   # the mes.App in cli.py; its program is "{{app}}"
+
+[data]
+writes = ["daily"]            # shared tables of project.toml this app adds rows to
+tables = ["{{prefix}}notes"]   # tables only this app owns (they start with "{{prefix}}")
+rebuild = "rebuild"           # rebuilds everything the app wrote from its own data
+
+# Jobs: short runs of one of this app's commands that mes starts for you. Each job has exactly
+# one trigger: schedule = "...", after = "<another job>", manual = true or webhook = true.
+# Its id is "{{app}}.rebuild". See: mes guide jobs
+[jobs.rebuild]
+run = "rebuild"            # a command of this app, then its options
+manual = true              # only when someone asks: mes jobs run {{app}}.rebuild
+# schedule = "*-*-* 06:00:00"   # use this instead of manual to run it every day at 06:00 (on a server)
+timeout = "5m"             # stopped if it takes longer than 5 minutes
+network = false            # it never needs the internet

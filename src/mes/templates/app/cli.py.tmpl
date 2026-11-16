@@ -1,0 +1,66 @@
+"""The app "{{app}}" of the project {{name}}, built on the my-easy-software App SDK.
+
+Its own files are the source of truth: every item is one line of items.jsonl in this app's folder
+(ctx.app_data_dir, inside the project's data folder). The table "{{prefix}}items" in the project's
+shared database is derived from it by "rebuild", so it can always be rebuilt.
+Start with: {{name}} {{short}} --json describe
+"""
+
+from __future__ import annotations
+
+import json
+from datetime import datetime, timezone
+from typing import Annotated
+
+from mes import App, UsageError
+
+app = App("{{app}}")
+
+ITEMS = "{{prefix}}items"  # an app table: its name starts with the app's prefix
+LOG = "items.jsonl"
+
+
+def _items(ctx) -> list[dict]:
+    path = ctx.app_data_dir / LOG
+    if not path.is_file():
+        return []
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+@app.command("items", kind="read")
+def items(ctx):
+    """The saved items, newest first."""
+    return list(reversed(_items(ctx)))
+
+
+@app.command("add", kind="write")
+def add(ctx, text: Annotated[str, "the item to save"]):
+    """Save one item. The dashboards show it after the next rebuild."""
+    text = text.strip()
+    if not text:
+        raise UsageError("The item is empty, so nothing was saved.",
+                         hint='Give its text, for example: {{name}} {{short}} add "First item"')
+    item = {"time": datetime.now(timezone.utc).isoformat(timespec="seconds"), "text": text[:500]}
+    with (ctx.app_data_dir / LOG).open("a", encoding="utf-8") as f:
+        f.write(json.dumps(item, ensure_ascii=False) + "\n")
+    return {"saved": True, **item}
+
+
+@app.command("rebuild", kind="write")
+def rebuild(ctx):
+    """Rebuild the table {{prefix}}items from the saved items."""
+    rows = _items(ctx)
+    with ctx.db() as db:  # one transaction: readers see the old rows or the new ones, never half
+        db.conn.execute(f'CREATE TABLE IF NOT EXISTS "{ITEMS}" (line INTEGER PRIMARY KEY, time TEXT, text TEXT)')
+        db.conn.execute(f'DELETE FROM "{ITEMS}"')
+        db.conn.executemany(f'INSERT INTO "{ITEMS}" VALUES (?, ?, ?)',
+                            [(n, r["time"], r["text"]) for n, r in enumerate(rows, 1)])
+    return {"table": ITEMS, "rows": len(rows)}
+
+
+def main() -> None:
+    app.main()
+
+
+if __name__ == "__main__":
+    main()

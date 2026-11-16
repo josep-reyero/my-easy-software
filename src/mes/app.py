@@ -4,7 +4,7 @@ Example::
 
     from mes import App
 
-    app = App("myapp")          # reads project.toml / AGENTS.md from the project's folder
+    app = App("myproject-main")  # finds its app.toml (and AGENTS.md) and its project
 
     @app.command("summary", kind="read", help="Key numbers for the last days.")
     def summary(ctx, days: int = 7):
@@ -32,14 +32,16 @@ Public API
 ``check_allowed(kind, level=None)``
     Raises ``NotAllowed`` (exit 4) when ``kind`` is above ``level``.
 
-``App(name, *, title=None, version=None, root=None)``
-    ``name`` is the app's name (one of the ``[apps]`` of its project). ``root`` is the
-    project's folder (holding ``project.toml`` / ``AGENTS.md``). When omitted it is found by
-    walking up from the file that created the ``App``.
-    Attributes: ``name``, ``root``, ``commands`` (dict name -> ``Command``).
-    Properties: ``manifest`` (the ``Project`` or ``None``, loaded on first use),
-    ``project`` (the project's name: from project.toml, else ``MES_PROJECT``, else the app
-    name), ``title``, ``version``.
+``App(name, *, title=None, version=None, root=None, app_dir=None)``
+    ``name`` is the app's name (``[app] name`` of its ``app.toml``). The app's folder is the
+    nearest folder at or above the creating module's file that holds ``app.toml`` (stopping
+    before a folder holding ``project.toml`` or ``pyproject.toml``), or ``app_dir``. The project's
+    folder is ``root``, else ``MES_PROJECT_DIR``, else the nearest ``project.toml`` above the app
+    folder (or the creating file), else the parent of ``sys.prefix`` when it holds one. With no
+    project the App works on its own (its project is its own name).
+    Attributes: ``name``, ``root``, ``app_dir``, ``commands`` (dict name -> ``Command``).
+    Properties: ``manifest`` (the composed ``Project`` or ``None``), ``spec`` (this app's
+    ``AppSpec`` or ``None``), ``project`` (the project's name), ``short``, ``title``, ``version``.
     ``@app.command(name=None, *, kind="read", help=None)``  register a command
         (name defaults to the function name with ``_`` -> ``-``).
     ``@app.schema`` / ``@app.sources``  register a provider ``fn(ctx) -> data``
@@ -54,8 +56,11 @@ Public API
     ``ctx.app`` (the App), ``ctx.json`` (bool), ``ctx.allow`` (level),
     ``ctx.command`` (name), ``ctx.project`` (the project's name),
     ``ctx.data_dir`` / ``ctx.state_dir`` (Path, created on first access: the project's folders,
-    see ``mes.paths``; every app of a project shares them), ``ctx.config`` (the
-    ``[projects.<name>]`` table of the per-machine config), ``ctx.manifest``.
+    see ``mes.paths``; every app of a project shares them), ``ctx.app_data_dir`` (this app's own
+    folder inside the data folder, ``[data] folder``), ``ctx.db_path`` (the shared database
+    ``<data folder>/<project>.sqlite``), ``ctx.db(write=True)`` (a context manager giving a
+    ``mes.db.AppDB``: ``.conn``, ``replace_rows``, ``upsert_rows``, ``delete_rows``), ``ctx.config``
+    (the ``[projects.<name>]`` table of the per-machine config), ``ctx.manifest``.
 
 ``Command`` (dataclass): ``name``, ``kind``, ``help``, ``func``, ``params``
     (list of ``Param``); ``to_dict()``.
@@ -91,8 +96,9 @@ from typing import Annotated, Any, Literal, NoReturn, Union, get_args, get_origi
 
 from mes import paths, protocol
 from mes.errors import ManifestError, MesError, NotAllowed, UsageError
-from mes.manifest import APP_NAME_RE, MANIFEST_FILE, Project
+from mes.manifest import APP_FILE, APP_NAME_RE, MANIFEST_FILE, AppSpec, Project, ProjectFile
 from mes.manifest import load as load_manifest
+from mes.manifest import load_app_file, load_file, short_name
 
 KINDS = ("read", "write", "admin")
 RESERVED_COMMANDS = ("describe", "guide", "schema", "sources")
@@ -415,6 +421,7 @@ class Context:
         self.command = command
         self._data_dir: Path | None = None
         self._state_dir: Path | None = None
+        self._app_data_dir: Path | None = None
         self._config: dict[str, Any] | None = None
 
     @property
@@ -428,6 +435,29 @@ class Context:
         if self._state_dir is None:
             self._state_dir = paths.project_state_dir(self.app.project, create=True)
         return self._state_dir
+
+    @property
+    def app_data_dir(self) -> Path:
+        """This app's own folder in the project's data folder (``[data] folder``), made 0700."""
+        if self._app_data_dir is None:
+            folder = self.app.data_folder
+            d = self.data_dir / folder if folder else self.data_dir
+            d.mkdir(mode=0o700, parents=True, exist_ok=True)
+            self._app_data_dir = d
+        return self._app_data_dir
+
+    @property
+    def db_path(self) -> Path:
+        return self.data_dir / f"{self.app.project}.sqlite"
+
+    def db(self, write: bool = True):
+        """The project's shared database as this app sees it (see ``mes.db.AppDB``)."""
+        from mes import db
+
+        project, spec = self.app.require_project()
+        if write:
+            self.data_dir  # noqa: B018 - makes the data folder (0700) first
+        return db.open_app_db(project, spec, write=write, path=self.db_path)
 
     @property
     def config(self) -> dict[str, Any]:
@@ -447,16 +477,67 @@ class Context:
 # --------------------------------------------------------------------------- app
 
 
-def _caller_root() -> Path | None:
+def _caller_dir() -> Path | None:
     frame = inspect.currentframe()
     try:
         f = frame.f_back.f_back if frame and frame.f_back else None  # caller of App.__init__
         filename = f.f_globals.get("__file__") if f else None
     finally:
         del frame
-    if not filename:
-        return paths.project_root()
-    return paths.project_root(Path(filename).resolve().parent)
+    return Path(filename).resolve().parent if filename else None
+
+
+def find_app_dir(start: Path | None) -> Path | None:
+    """The nearest folder at or above ``start`` holding ``app.toml``, stopping before a folder that
+    holds ``project.toml`` or ``pyproject.toml``."""
+    if start is None:
+        return None
+    for d in (start, *start.parents):
+        if (d / MANIFEST_FILE).exists() or (d / "pyproject.toml").exists():
+            return None
+        if (d / APP_FILE).is_file():
+            return d
+    return None
+
+
+def _project_above(start: Path | None) -> Path | None:
+    if start is None:
+        return None
+    for d in (start, *start.parents):
+        if (d / MANIFEST_FILE).is_file():
+            return d
+    return None
+
+
+def find_project_dir(app_dir: Path | None, caller: Path | None) -> Path | None:
+    env = os.environ.get("MES_PROJECT_DIR")
+    if env:
+        p = Path(env).expanduser()
+        if not (p / MANIFEST_FILE).is_file():
+            raise ManifestError(
+                f"MES_PROJECT_DIR is set to {env[:200]!r}, but that folder has no project.toml, so the app cannot "
+                "tell which project it belongs to.",
+                hint="Point MES_PROJECT_DIR at the project's folder, or remove it.",
+            )
+        return p.resolve()
+    found = _project_above(app_dir) if app_dir is not None else None
+    if found is None and app_dir is None and caller is not None:
+        manifest = None
+        for d in (caller, *caller.parents):
+            if (d / MANIFEST_FILE).is_file():
+                manifest = d
+                break
+            if (d / "pyproject.toml").is_file():
+                break
+        found = manifest
+    if found is None:
+        prefix_parent = Path(sys.prefix).parent
+        if (prefix_parent / MANIFEST_FILE).is_file():
+            found = prefix_parent
+    return found.resolve() if found is not None else None
+
+
+_LOCK_CODES = ("apps_lock_missing", "apps_lock_stale")
 
 
 class App:
@@ -467,16 +548,31 @@ class App:
         title: str | None = None,
         version: str | None = None,
         root: str | Path | None = None,
+        app_dir: str | Path | None = None,
     ) -> None:
         if not isinstance(name, str) or not APP_NAME_RE.match(name):
             raise ValueError(
                 f"app name {name!r} must be 2-31 lowercase letters, digits or dashes, starting with a letter"
             )
         self.name = name
-        self.root = Path(root).resolve() if root is not None else _caller_root()
+        caller = _caller_dir()
+        self.app_dir = Path(app_dir).resolve() if app_dir is not None else find_app_dir(caller)
+        self._root_error: ManifestError | None = None
+        if root is not None:
+            self.root: Path | None = Path(root).resolve()
+        else:
+            try:
+                self.root = find_project_dir(self.app_dir, caller)
+            except ManifestError as e:  # reported when the project is first needed
+                self.root, self._root_error = None, e
+        # Where AGENTS.md is read from: the app's folder; for an app without one, as before.
+        self._guide_dir = self.app_dir or self.root or (paths.project_root(caller) if caller else None)
         self._title = title
         self._version = version
         self._manifest: Project | None = None
+        self._spec: AppSpec | None = None
+        self._project_file: ProjectFile | None = None
+        self._lock_error: ManifestError | None = None
         self._manifest_loaded = False
         self.commands: dict[str, Command] = {}
         self._providers: dict[str, Callable[[Context], Any]] = {}
@@ -486,49 +582,146 @@ class App:
 
     # -- metadata
 
+    def _load(self) -> None:
+        if self._manifest_loaded:
+            return
+        self._manifest_loaded = True
+        if self._root_error is not None:
+            raise self._root_error
+        if self.root is None or not (self.root / MANIFEST_FILE).is_file():
+            if self.app_dir is not None:
+                af = load_app_file(self.app_dir / APP_FILE)
+                if af.name != self.name:
+                    raise ManifestError(
+                        f'The command-line tool says it is the app "{self.name}", but its app.toml says "{af.name}". '
+                        "They must match, or data could end up in the wrong place.",
+                        hint=f'Use App("{af.name}") in the app\'s code, or change [app] name in app.toml.',
+                    )
+                self._own_file = af
+            return
+        pf = load_file(self.root)
+        self._project_file = pf
+        session = os.environ.get("MES_PROJECT")
+        if session is not None and session != pf.name:
+            raise ManifestError(
+                f'This session belongs to the project "{session[:40]}", but this app is part of "{pf.name}". '
+                "Projects cannot read each other, so it was not started.",
+                hint="Run the app in its own project's session or account.",
+                code="wrong_project",
+            )
+        try:
+            project = load_manifest(self.root)
+        except ManifestError as e:
+            if e.code not in _LOCK_CODES:
+                raise
+            # The list of installed apps is missing or out of date (for example while 'mes apps sync'
+            # asks every app to describe itself). Commands that need the project's data say so.
+            self._lock_error = e
+            project = None
+        if project is not None:
+            spec = project.apps.get(self.name)
+            if spec is None:
+                raise ManifestError(
+                    f'The command-line tool says it is the app "{self.name}", but the project "{project.name}" has no '
+                    f'such app (its apps: {", ".join(project.apps)}). They must match, or data could end up in the '
+                    "wrong folder.",
+                    hint=f"Add the app's package to [project] apps in project.toml, or use one of its app names in App(...).",
+                )
+            if self.app_dir is not None and spec.folder is not None and spec.folder.resolve() != self.app_dir:
+                raise ManifestError(
+                    f'The app "{self.name}" runs from {self.app_dir}, but the project finds it in {spec.folder}. '
+                    "Running it could change the wrong data, so it was not started.",
+                    hint="Run: mes apps sync",
+                    code="app_mismatch",
+                )
+            if self.app_dir is None:
+                self.app_dir = spec.folder
+                self._guide_dir = spec.folder
+            self._manifest, self._spec = project, spec
+            return
+        if self.app_dir is None:
+            raise self._lock_error  # type: ignore[misc]
+        af = load_app_file(self.app_dir / APP_FILE)
+        if af.name != self.name or self.app_dir.name not in pf.packages:
+            raise ManifestError(
+                f'The command-line tool says it is the app "{self.name}", but the project "{pf.name}" does not list '
+                "it. They must match, or data could end up in the wrong folder.",
+                hint="Add the app's package to [project] apps in project.toml, then run: mes apps sync",
+            )
+        self._own_file = af
+
     @property
     def manifest(self) -> Project | None:
-        if not self._manifest_loaded:
-            if self.root is not None and (self.root / MANIFEST_FILE).is_file():
-                m = load_manifest(self.root / MANIFEST_FILE)
-                if self.name not in m.apps:
-                    raise ManifestError(
-                        f'The command-line tool says it is the app "{self.name}", but project.toml of the project '
-                        f'"{m.name}" has no such app (its apps: {", ".join(m.apps)}). They must match, or data '
-                        "could end up in the wrong folder.",
-                        hint=f'Add [apps.{self.name}] to project.toml, or use one of its app names in App(...).',
-                    )
-                session = os.environ.get("MES_PROJECT")
-                if session is not None and session != m.name:
-                    raise ManifestError(
-                        f'This session belongs to the project "{session[:40]}", but this app is part of "{m.name}". '
-                        "Projects cannot read each other, so it was not started.",
-                        hint="Run the app in its own project's session or account.",
-                        code="wrong_project",
-                    )
-                self._manifest = m
-            self._manifest_loaded = True
+        self._load()
         return self._manifest
 
     @property
+    def spec(self) -> AppSpec | None:
+        self._load()
+        return self._spec
+
+    def require_project(self) -> tuple[Project, AppSpec]:
+        """The composed project and this app, or the plain reason they are not available."""
+        self._load()
+        if self._manifest is not None and self._spec is not None:
+            return self._manifest, self._spec
+        if self._lock_error is not None:
+            raise self._lock_error
+        raise ManifestError(
+            f'The app "{self.name}" is not part of a project (no project.toml was found for it), so it has no shared '
+            "database.",
+            hint="Create a project with 'mes new <name>' and add the app to it (see: mes guide apps).",
+            code="no_project",
+        )
+
+    @property
     def project(self) -> str:
-        m = self.manifest
-        if m is not None:
-            return m.name
+        self._load()
+        if self._project_file is not None:
+            return self._project_file.name
         session = os.environ.get("MES_PROJECT")
         return session if session else self.name
+
+    @property
+    def short(self) -> str:
+        return self.spec.short if self.spec else short_name(self.name, self.project)
+
+    @property
+    def data_folder(self) -> str | None:
+        """This app's folder name inside the data folder (``None`` for an app without a project)."""
+        self._load()
+        if self._spec is not None:
+            return self._spec.data.folder
+        own = getattr(self, "_own_file", None)
+        if own is not None:
+            return own.data.folder or self.short
+        return None
+
+    def _own(self) -> Any:
+        self._load()
+        return getattr(self, "_own_file", None)
 
     @property
     def title(self) -> str:
         if self._title:
             return self._title
+        if self.spec is not None:
+            return self.spec.title
+        own = self._own()
+        if own is not None:
+            return own.title
         return self.manifest.title if self.manifest else self.name
 
     @property
     def version(self) -> str:
         if self._version:
             return self._version
-        return self.manifest.version if self.manifest else "0.0.0"
+        if self.spec is not None:
+            return self.spec.version
+        own = self._own()
+        if own is not None:
+            return own.version
+        return self._project_file.version if self._project_file else "0.0.0"
 
     # -- registration
 
@@ -572,12 +765,16 @@ class App:
 
     # -- built-ins
 
+    def _my_jobs(self) -> list[Any]:
+        manifest = self.manifest
+        return [j for j in manifest.jobs.values() if j.app == self.name] if manifest else []
+
     def describe(self) -> dict[str, Any]:
         from mes import __version__
 
-        manifest = self.manifest
-        return {
+        out = {
             "app": self.name,
+            "short": self.short,
             "project": self.project,
             "title": self.title,
             "version": self.version,
@@ -587,8 +784,12 @@ class App:
             "exit_codes": {"0": "ok", "1": "error", "2": "usage", "3": "not found", "4": "not allowed",
                            "5": "refused for safety", "6": "needs a person", "75": "temporary failure, retry"},
             "commands": [c.to_dict() for c in self.commands.values()],
-            "jobs": [j.to_dict() for j in manifest.jobs.values() if j.app == self.name] if manifest else [],
+            "jobs": [j.to_dict() for j in self._my_jobs()],
         }
+        if self._lock_error is not None:
+            out["note"] = (f"{self._lock_error.message} The jobs are listed once it is written again "
+                           f"({self._lock_error.hint}).")
+        return out
 
     def describe_text(self) -> str:
         """``describe`` for people: a table of commands and what this session may run."""
@@ -600,20 +801,28 @@ class App:
                 for c in self.commands.values()]
         lines = [f"{self.title} ({self.name}), version {self.version}", f"This session may run {may}.", "",
                  protocol.format_text(rows)]
-        manifest = self.manifest
-        mine = [j for j in manifest.jobs.values() if j.app == self.name] if manifest else []
+        mine = self._my_jobs()
         if mine:
             lines += ["", "Jobs (see: mes jobs list):"]
-            lines += [f"- {j.name}: runs \"{j.run}\"" for j in mine]
+            lines += [f"- {j.id}: runs \"{j.run}\"" for j in mine]
         lines += ["", f"For the arguments of a command, run: {self.name} <command> --help "
                   f"(or {self.name} --json describe for everything as data)."]
         return "\n".join(lines)
 
+    def _agents_file(self) -> Path | None:
+        try:
+            self._load()
+        except MesError:
+            pass  # the guide still works when the project has a problem
+        folder = self._guide_dir
+        if folder is not None and (folder / "AGENTS.md").is_file():
+            return folder / "AGENTS.md"
+        return None
+
     def guide_text(self) -> str:
-        if self.root is not None:
-            agents = self.root / "AGENTS.md"
-            if agents.is_file():
-                return agents.read_text(encoding="utf-8")
+        agents = self._agents_file()
+        if agents is not None:
+            return agents.read_text(encoding="utf-8")
         lines = [
             f"# Using {self.title} ({self.name})",
             "",
@@ -635,7 +844,7 @@ class App:
     def _guide_result(self, ctx: Context) -> Any:
         text = self.guide_text()
         if ctx.json:
-            source = "AGENTS.md" if self.root is not None and (self.root / "AGENTS.md").is_file() else "generated"
+            source = "AGENTS.md" if self._agents_file() is not None else "generated"
             return {"app": self.name, "source": source, "guide": text}
         return text
 

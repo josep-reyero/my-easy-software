@@ -81,7 +81,7 @@ def _project(project_name: str, project_dir: str | None) -> manifest_mod.Project
     if project.name != project_name:
         raise UsageError(f'The project in this folder is "{project.name}", not "{project_name}", so nothing was '
                          "shared.", hint=f"Run: mes expose {project.name} ...")
-    if project.ui is None:
+    if not project.has_dashboards:
         raise Refused(f'The project "{project.name}" has no dashboards ([ui] in project.toml), so there is nothing '
                       "to share.", hint="Add dashboards first (mes guide dashboards).", code="no_dashboards")
     return project
@@ -110,7 +110,8 @@ def _people(mode: str, people: list[str]) -> list[str]:
 
 def _dashboards(project: manifest_mod.Project, chosen: list[str]) -> list[str]:
     root = project.root
-    names = list(dict.fromkeys(chosen)) or list(project.ui.dashboards)
+    listed = list(project.ui.dashboards) if project.ui else []
+    names = list(dict.fromkeys(chosen)) or listed
     if not names and root is not None:
         names = sorted(p.stem for p in (root / "ui" / "dashboards").glob("*.yaml"))
     if not names:
@@ -121,7 +122,8 @@ def _dashboards(project: manifest_mod.Project, chosen: list[str]) -> list[str]:
             raise UsageError(f"{n[:60]!r} is not a dashboard name.", hint="Use the dashboard's file name without .yaml.")
         exists = root is not None and ((root / "ui" / "dashboards" / f"{n}.yaml").is_file()
                                        or (root / "ui" / "dashboards" / f"{n}.yml").is_file())
-        if not exists and n not in project.ui.dashboards:
+        exists = exists or any(n in a.ui.dashboards for a in project.apps.values())
+        if not exists and n not in listed:
             raise NotFound(f'The project has no dashboard called "{n}", so nothing was shared.',
                            hint="See its dashboards in ui/dashboards/.")
     return names
