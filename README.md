@@ -19,6 +19,8 @@ other way round:
 
 my-easy-software is a framework for building small personal apps this way, as easily as
 starting a web project: create an app, preview it, deploy it to your own machine or server.
+Its command is called `mes` (short for my-easy-software): everything you do with the framework
+is a `mes` command, such as `mes new` or `mes deploy`.
 
 You do not need to be a developer. Setup is guided by an AI agent that explains each step in
 plain words, installs what is needed with your permission, and keeps your apps private to your
@@ -33,7 +35,7 @@ jobs and their dashboards. What works:
   `mes dev` shows it on this computer with one link (needs [my-easy-ui](https://github.com/josep-reyero/my-easy-ui)).
 - `mes server plan` writes one readable root script that sets a project up on a Linux server with
   its own two accounts, folders and sandboxed system units; you run it once with sudo, and
-  `mes server check` verifies it. mes itself never uses sudo.
+  `mes server check` verifies it. `mes` itself never uses sudo.
 - `mes deploy` sends signed releases (OpenSSH signatures, checked before anything is unpacked)
   through the server's SSH gate, with rollback.
 - Jobs on a server have no network unless they list hosts, and then reach only those hosts.
@@ -70,7 +72,7 @@ mes server plan my-notes --out plan.sh --signer ~/.ssh/mes-deploy.pub --key depl
 mes deploy my-server
 ```
 
-Without installing mes, `uv run --project ./my-easy-software mes ...` works too. Inside a
+Without installing `mes`, `uv run --project ./my-easy-software mes ...` works too. Inside a
 project, `uv run mes ...` always works. Guides for agents: `mes guide` lists them. Agent skills
 (and a Claude Code plugin manifest in `.claude-plugin/`) are in `skills/`. Instructions for
 agents working on this repository: [AGENTS.md](AGENTS.md).
