@@ -7,6 +7,32 @@
 > Until this note is removed, expect the project file format and some commands to change, and
 > treat what is described below as the previous shape.
 
+### The new shape: apps inside a project
+
+This branch builds the first of those changes ([contract](docs/apps-contract.md)). A **project** is
+what you deploy and the only security boundary (its own accounts, data folder and keys). An **app**
+is a Python package with an `app.toml`, either in the project's `apps/` folder or installed into
+its environment. In short:
+
+```
+my-notes/
+  project.toml          [project] apps = ["my_notes_main", ...], shared [tables] and [views],
+                        [settings.<app>] overrides of an app's jobs, [ui] dashboards
+  apps/my_notes_main/   app.toml (its tables, jobs and dashboards), cli.py, AGENTS.md
+  ui/dashboards/        the project's dashboards; apps can add sections to them
+  apps.lock.json        written by "mes apps sync" (never committed)
+```
+
+- One shared SQLite database per project. Shared tables are declared in `project.toml`; every
+  row says which app wrote it, and dashboards read views over them (`mes db`, `ctx.db()`).
+- Jobs belong to apps and have ids `<app>.<job>`; `after` may name another app's job.
+- One command per project: `my-notes main add "..."`, `my-notes describe`; the gate accepts
+  `["my-notes", "main", "notes", "--json"]`.
+- `mes new <name>` makes a project with one app, `mes new-app <name>` adds one, `mes apps sync`
+  writes the list of installed apps. `examples/fitlab` is a worked example with two apps.
+- The old one-file `project.toml` (`[apps.*]`, `[jobs.*]`, `[ui] data`) is refused with a plain
+  message saying what to move where (`mes guide apps`).
+
 > **Consumer apps should ship APIs that let people consume their own data.
 > People then set up their own dashboards and own their data, in an AI-native,
 > fully flexible way.**
@@ -70,9 +96,9 @@ mes setup
 
 # 3. Create a project next to the my-easy-software folder and try it
 mes new my-notes
-cd my-notes && uv sync
-uv run my-notes add "My first note"
-uv run mes jobs run rebuild
+cd my-notes && uv sync && uv run mes apps sync
+uv run my-notes main add "My first note"
+uv run mes jobs run my-notes-main.rebuild
 uv run mes dev                                     # one link to the dashboard
 
 # 4. Later: put it on your own server (see: mes guide server, mes guide deploy). Two keys: one

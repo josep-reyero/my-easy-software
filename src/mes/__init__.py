@@ -9,7 +9,8 @@ Errors (see ``mes.errors``): ``MesError``, ``UsageError``, ``NotFound``, ``NotAl
 ``Refused``, ``NeedsPerson``, ``TemporaryFailure``, ``ExitCode``.
 
 Modules: ``mes.app`` (App SDK), ``mes.protocol`` (agent protocol and output),
-``mes.manifest`` (project.toml), ``mes.paths`` (per-machine folders, config, server layout),
+``mes.manifest`` (project.toml and app.toml), ``mes.apps`` (finding apps, apps.lock.json),
+``mes.db`` (the shared database), ``mes.project`` (the project command), ``mes.paths`` (per-machine folders, config, server layout),
 ``mes.errors`` (errors and exit codes), ``mes.cli`` (the ``mes`` command), ``mes.scaffold``
 (``mes new``), ``mes.dev`` (``mes dev``), ``mes.jobs`` (jobs and the run log), ``mes.units``
 (system units), ``mes.server`` (``mes server``), ``mes.deploy`` (``mes deploy``), ``mes.archive``

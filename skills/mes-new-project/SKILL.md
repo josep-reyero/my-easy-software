@@ -1,6 +1,6 @@
 ---
 name: mes-new-project
-description: Create a new my-easy-software project (an app with its own data, jobs and a working dashboard) with "mes new". Use when the user wants to start a new personal app, tracker, logger or dashboard project, or asks how a mes project is laid out (project.toml, AGENTS.md, ui/dashboards).
+description: Create a new my-easy-software project (a project with one app in apps/, a shared database, jobs and a working dashboard) with "mes new". Use when the user wants to start a new personal app, tracker, logger or dashboard project, or asks how a mes project is laid out (project.toml, AGENTS.md, ui/dashboards).
 ---
 
 # Create a new project

@@ -36,6 +36,13 @@ Then copy `plan.sh` to the server, read it, and run `sudo bash plan.sh`. It:
 It touches nothing else, and running it again is safe. Run `mes server plan` and the script
 again whenever jobs, schedules, dashboards or keys change (`mes deploy` tells you when).
 
+Job units are named after the job id: `mes-<project>.job.<app>.<job>.service` (and `.timer`,
+`.path`, and `mes-<project>.net.<app>.<job>.service` for a job with hosts). A job that may write
+data first runs `mes db sync` (`ExecStartPre`). The plan lists, for each app, where it comes from,
+which hosts its jobs may reach and their memory and time limits, so you can see what each app is
+allowed before you run the script. Units of the old form (`mes-<project>.job.<job>.service`) are
+removed by the script like any other unit the project no longer has.
+
 Check (on the server, no sudo): `mes server check <project> [--project-dir DIR]`, a checklist of
 accounts, folders, files, tools, units and whether they are switched on.
 

@@ -13,6 +13,11 @@ It copies the project's data folder and state folder (only plain files; links ar
 listed under `skipped`) into one archive, `<project>-<UTC time>.tar.gz`, then reads the archive
 back and checks every file's size and SHA-256 against the list inside it (`verified: true`).
 
+- The project's shared database (`<project>.sqlite`) is copied with SQLite's own backup, which
+  waits for a writer to finish, so the archive never holds half of a transaction (its
+  `-journal` file is left out). A file that is not a readable database is copied as it is, with a
+  note.
+
 - If the project has a my-bucket-storage store, mes asks `mybucket snapshot` for a consistent
   copy, checks it with `mybucket verify`, and packs that copy. Without mybucket installed, mes
   refuses rather than copy a store that may be in use; `--no-store` leaves the store out (and

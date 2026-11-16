@@ -16,9 +16,9 @@ SRC = REPO / "src" / "mes"
 TOPICS = {t["name"] for t in guide.topics()}
 
 NEEDED = {"setup", "new-project", "commands", "jobs", "dashboards", "server", "deploy", "gate", "share",
-          "webhooks", "backup", "security", "troubleshoot"}
+          "webhooks", "backup", "security", "troubleshoot", "apps", "add-app", "share-data", "contribute-panel"}
 SKILLS = {"mes-setup", "mes-new-project", "mes-add-command", "mes-add-job", "mes-dashboard", "mes-deploy",
-          "mes-share", "mes-troubleshoot"}
+          "mes-share", "mes-troubleshoot", "mes-add-app", "mes-share-data", "mes-contribute-panel"}
 
 
 def test_every_needed_guide_exists_with_a_summary():

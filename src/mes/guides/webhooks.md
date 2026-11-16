@@ -4,11 +4,11 @@ How another service (a git host, a form, a phone shortcut) can start one of a pr
 
 ## In project.toml
 
-Give the job the trigger `webhook = true` (instead of `schedule`, `after` or `manual`):
+Give the job, in its app's `app.toml`, the trigger `webhook = true` (instead of `schedule`, `after` or `manual`):
 
 ```toml
 [jobs.import]
-run = "myproject import"
+run = "import"
 webhook = true
 ```
 
@@ -25,7 +25,7 @@ then thrown away; only its SHA-256 is recorded).
 - `mes-<project>.webhook.service`: started by the socket on the first request. It runs
   `mes webhook serve` as `mes-<project>`, with no network of its own, no access to the data, and
   only `state/triggers/` writable. It stops after 60 seconds without requests.
-- `mes-<project>.job.<job>.path`: starts the job when `state/triggers/<job>` changes.
+- `mes-<project>.job.<app>.<job>.path`: starts the job when `state/triggers/<app>.<job>` changes.
 - The root script writes the secret to `/var/lib/mes/<project>/etc/webhook.key` (32 random bytes,
   owned by root, readable by the project's account). The person reads it with
   `sudo cat /var/lib/mes/<project>/etc/webhook.key` and gives it to the sending service. Check it
@@ -39,7 +39,7 @@ version's documentation for forwarding to a unix socket.
 ## How a sender signs a request
 
 ```
-POST /hooks/<job>
+POST /hooks/<app>.<job>          (the job id, for example /hooks/myproject-main.import)
 X-Mes-Timestamp: <unix seconds now>
 X-Mes-Signature: sha256=<hex of HMAC-SHA256(secret, "<timestamp>." + body)>
 ```
@@ -50,7 +50,7 @@ for a secret stored as hex in `webhook.key`:
 ```sh
 ts=$(date +%s); body='{"ref":"main"}'
 sig=$(printf '%s.%s' "$ts" "$body" | openssl dgst -sha256 -mac HMAC -macopt hexkey:"$(cat webhook.key)" | sed 's/^.* //')
-curl -X POST "https://<your-server-name>/hooks/import" \
+curl -X POST "https://<your-server-name>/hooks/myproject-main.import" \
   -H "X-Mes-Timestamp: $ts" -H "X-Mes-Signature: sha256=$sig" --data "$body"
 ```
 
@@ -59,7 +59,7 @@ prints the two header lines (the file must be readable only by you).
 
 ## What the receiver refuses
 
-- anything but `POST /hooks/<job>` (405 or 404);
+- anything but `POST /hooks/<app>.<job>` (405 or 404);
 - a missing `Content-Length` or a chunked body (411), a body over 64 KiB (413), headers over
   8 KiB (400), a request that is not complete within 10 seconds (408);
 - a timestamp more than 5 minutes away from the server's clock, a wrong signature, or the exact

@@ -12,13 +12,20 @@ restrict,command="/usr/local/bin/mes gate --project notes --allow read --server-
 - A **deploy** key can also install releases (`mes deploy`), roll back and list releases.
 - `admin` commands never run through the gate, whatever the key.
 
-Sending a request: the SSH command is a JSON list of words: the app's name, the command, its
-options. There is no shell, so quotes and shell symbols mean nothing.
+Sending a request: the SSH command is a JSON list of words. There is no shell, so quotes and shell
+symbols mean nothing. Start with the project's name and the app's short name, or with the app's
+own name:
 
 ```
-ssh mes-notes@my-server '["notes", "describe", "--json"]'
-ssh mes-notes@my-server '["notes", "notes", "--last", "5", "--json"]'
+ssh mes-notes@my-server '["notes", "describe", "--json"]'             # every app and its commands
+ssh mes-notes@my-server '["notes", "main", "notes", "--last", "5", "--json"]'
+ssh mes-notes@my-server '["notes-main", "notes", "--last", "5", "--json"]'   # the same request
 ```
+
+`["<project>", "describe" | "guide" | "apps", "--json"]` describe the whole project (read keys
+may run them). A request that starts with the project's name is turned into the app form before
+it is checked and logged (the log keeps what was asked, too). With several apps, a request without
+the app's short name is refused (exit 2) with the list of short names; with one app it is passed on.
 
 What the gate does on every request: it finds the project from its key (never from the request),
 asks the installed program which commands it has and of which kind, refuses commands above the

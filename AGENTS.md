@@ -28,11 +28,16 @@ To *use* mes, start with `mes guide` instead: it prints guides that match the in
   development dependency. easy-ui (my-easy-ui) and mybucket (my-bucket-storage) are called as
   subprocesses only, through `mes.siblings`, which also lists what mes assumes about them.
 - Layout: `src/mes/` (`cli.py` the `mes` command, `app.py` the App SDK, `protocol.py` output and
-  the agent protocol, `manifest.py` project.toml, `paths.py` folders and the server layout,
+  the agent protocol, `manifest.py` project.toml and app.toml (parsing, composing, the lock),
+  `apps.py` `mes apps` (finding apps, apps.lock.json), `db.py` the shared database (`mes db`,
+  `ctx.db()`), `project.py` the project command (`mes.project:main`), `paths.py` folders and the
+  server layout,
   `jobs.py` + `units.py` jobs and system units, `server.py` `mes server`, `deploy.py` +
   `archive.py` signed deploys, `gate.py` + `registry.py` the SSH entry point, `scaffold.py` +
-  `templates/project/` `mes new`, `dev.py` `mes dev`, `expose/` sharing, `webhook.py`,
+  `templates/project/` + `templates/app/` `mes new` and `mes new-app`, `dev.py` `mes dev`, `expose/` sharing, `webhook.py`,
   `backup.py`, `setup.py` + `checks.py` + `messages.py` setup and doctor, `guides/` the
   `mes guide` texts). Agent skills are in `skills/`, the plugin manifest in `.claude-plugin/`.
-- Tests live in `tests/` and never touch the real per-machine folders (see `tests/conftest.py`).
+- Tests live in `tests/` and never touch the real per-machine folders (see `tests/conftest.py`);
+  `tests/projects.py` writes test projects with their apps. The contract of the app model is
+  `docs/apps-contract.md`; `examples/fitlab` is its worked example (`tests/test_fitlab.py`).
   Add a test with every fix.
