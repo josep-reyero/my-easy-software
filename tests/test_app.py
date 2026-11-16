@@ -397,3 +397,13 @@ def test_command_name_with_newline_is_refused(app):
         app.command("bad\n")(lambda ctx: None)
     with pytest.raises(ValueError):
         App("myapp\n", root=".")
+
+
+def test_usage_hints_use_the_name_the_project_command_reached_the_app_by(app, capsys, monkeypatch):
+    monkeypatch.setenv("MES_COMMAND_NAME", "myapp myapp")
+    assert app.command_name == "myapp myapp"
+    assert app.run(["summary", "--days", "many"]) == 2
+    assert "Run 'myapp myapp summary --help'" in capsys.readouterr().err
+    for other in ("other myapp", "myapp other", "myapp myapp; rm", "myapp"):
+        monkeypatch.setenv("MES_COMMAND_NAME", other)
+        assert app.command_name == "myapp"  # only a name that is this app's is used

@@ -17,17 +17,24 @@ Dispatch of ``<project> [args]`` (contract section 5); ``w`` is the first argume
 3. ``describe``, ``guide``, ``apps``: the built-ins (read commands; ``MES_ALLOW`` is checked first);
 4. an app's short name or full name: that app's program with the arguments minus that word;
 5. any other word, with exactly one app: that app's program with the arguments unchanged, and
-   (unless ``--json`` is given) a one-line note on stderr;
-6. otherwise: a usage error (exit 2) listing the short names.
+   a one-line note on stderr (see ``_note_once``: not with ``--json``, ``-h`` or ``--help``, and at
+   most once per terminal session);
+6. otherwise: a usage error (exit 2) listing the short names (or the app the word is close to).
+
+The app's program gets ``MES_COMMAND_NAME="<project> <short>"`` in its environment, so its usage
+lines and hints say ``fitlab walks ...``, the way the person typed it (``mes.app`` uses it for its
+program name when it names this app).
 
 The project folder is ``MES_PROJECT_DIR`` (it must hold ``project.toml``), else the parent of
 ``sys.prefix``. App programs are taken only from ``Path(sys.executable).parent``, never ``PATH``.
 
-``MES_ALLOW``: the environment is passed on unchanged and every app checks its own command kinds.
-In addition, when ``MES_ALLOW`` is set to a level below ``admin``, the project command first asks
-the app (``<program> --json describe``) for the command's kind and refuses (exit 4) before the
-command runs when the level does not allow it; an unknown or empty ``MES_ALLOW`` is refused
-before anything runs.
+``MES_ALLOW``: the environment is passed on unchanged and every app checks its own command kinds;
+that check is the boundary. In addition, as a best-effort early refusal (not a boundary), when
+``MES_ALLOW`` is set to a level below ``admin``, the project command first asks the app
+(``<program> --json describe``) for the command's kind and refuses (exit 4) before the command
+runs when the level does not allow it. When options come before the command word, it cannot tell
+an option's value from the command, so every word that names a command must be allowed. An unknown
+or empty ``MES_ALLOW`` is refused before anything runs.
 
 Public API
 ----------
@@ -39,11 +46,14 @@ Public API
 
 from __future__ import annotations
 
+import difflib
 import json
 import os
+import re
 import stat
 import subprocess
 import sys
+import tempfile
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any, NoReturn
@@ -143,6 +153,10 @@ def _describe(project: Project, bin_dir: Path, json_mode: bool) -> Any:
             "json": "Add --json (before or after the command) to get only JSON data on stdout.",
             "exit_codes": EXIT_CODES, "apps": apps,
             "jobs": [j.to_dict() for j in project.jobs.values()]}
+    if len(apps) == 1:  # one app: its commands are the project's (contract section 5)
+        for key in ("commands", "global_options"):
+            if key in apps[0]["describe"]:
+                data[key] = apps[0]["describe"][key]
     if json_mode:
         return data
     lines = [f"{project.title} ({project.name}), version {project.version}", ""]
@@ -200,18 +214,23 @@ def _apps(project: Project, json_mode: bool) -> Any:
                                   "where": r["location"]} for r in rows])
 
 
-def _command_word(args: Sequence[str]) -> str | None:
-    return next((a for a in args if not a.startswith("-")), None)
+def _command_words(args: Sequence[str]) -> list[str]:
+    """The words that may be the command: the first argument when it is not an option, else every
+    argument that is not an option (one of them may be an option's value; all are checked)."""
+    words = [a for a in args if a != "--json"]
+    if words and not words[0].startswith("-"):
+        return [words[0]]
+    return [a for a in words if not a.startswith("-")]
 
 
 def _precheck_kind(exe: Path, spec: AppSpec, args: Sequence[str]) -> None:
     """With MES_ALLOW below admin: refuse a command whose kind the level does not allow, before
-    the command itself runs."""
+    the command itself runs. Best effort only: the app's own check (mes.app) is the boundary."""
     level = allowed_level()
     if level == "admin":
         return
-    command = _command_word(args)
-    if command is None or command in ("describe", "guide"):
+    words = _command_words(args)
+    if not words or words in (["describe"], ["guide"]):
         return
     code, data, err = _ask(exe, "describe")
     if code != 0 or not isinstance(data, dict) or not isinstance(data.get("commands"), list):
@@ -219,9 +238,38 @@ def _precheck_kind(exe: Path, spec: AppSpec, args: Sequence[str]) -> None:
                        hint=f"Run it by hand to see more: {spec.program} --json describe", code="app_broken",
                        detail=err.decode("utf-8", "replace")[-1000:] or None)
     kinds = {c.get("name"): c.get("kind") for c in data["commands"] if isinstance(c, dict)}
-    kind = kinds.get(command)
-    if kind in KINDS:
-        check_allowed(kind, level)
+    for word in words:
+        kind = kinds.get(word)
+        if kind in KINDS:
+            check_allowed(kind, level)
+
+
+_COMMAND_NAME_RE = re.compile(r"^[a-z][a-z0-9-]{1,30} [a-z][a-z0-9-]{0,30}\Z")
+
+
+def _shown(words: Sequence[str]) -> str:
+    """The words a person typed, shortened for a one-line note."""
+    text = " ".join(words)
+    return text if len(text) <= 60 else text[:57] + "..."
+
+
+def _note_once(project: Project) -> bool:
+    """True the first time in this terminal session (per project and user) that the one-app note
+    is due. The mark is an empty file in the temporary folder, made with O_EXCL and never followed
+    through a link; when it cannot be made, the note is shown."""
+    try:
+        sid = os.getsid(0)
+    except OSError:
+        return True
+    mark = Path(tempfile.gettempdir()) / f"mes-note-{project.name}-{os.getuid()}-{sid}"
+    try:
+        fd = os.open(mark, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    except FileExistsError:
+        return False
+    except OSError:
+        return True
+    os.close(fd)
+    return True
 
 
 def run(argv: Sequence[str] | None = None, *, bin_dir: Path | None = None,
@@ -265,21 +313,31 @@ def run(argv: Sequence[str] | None = None, *, bin_dir: Path | None = None,
         elif len(project.apps) == 1:
             spec = next(iter(project.apps.values()))
             rest = args
-            if not json_mode:
+            if not json_mode and not any(a in ("-h", "--help") for a in words) and _note_once(project):
+                typed = _shown(words)
                 sys.stderr.write(
-                    f'Note: "{project.name} {w}" was passed to {spec.name}, the only app of this project. '
-                    f'Write "{project.name} {spec.short} {w}" so it keeps working when the project has more apps.\n')
+                    f'Note: "{project.name} {typed}" was passed to {spec.name}, the only app of this project. '
+                    f'Write "{project.name} {spec.short} {typed}" so it keeps working when the project has more '
+                    "apps.\n")
                 sys.stderr.flush()
         else:
             shorts = [a.short for a in project.apps.values()]
+            names = " or ".join([", ".join(shorts[:-1]), shorts[-1]]) if len(shorts) > 1 else shorts[0]
+            close = difflib.get_close_matches(w, shorts, n=1)
+            hint = (f'Did you mean "{project.name} {_shown([close[0], *words[1:]])}"?' if close else
+                    f"Start with one of its apps: {names}. For example, {project.name} {shorts[0]} --help lists "
+                    f"what {shorts[0]} can do.")
             raise UsageError(
-                f'{project.name} has several apps, so "{w}" does not say which one is meant.',
-                hint=f"Start with the app's short name: {', '.join(shorts)}. For example: "
-                f"{project.name} {shorts[0]} {w}.",
+                f'"{_shown([w])}" is not one of the apps of {project.name} ({", ".join(shorts)}), so nothing was run. '
+                "With more than one app, every command starts with the app's short name.",
+                hint=hint,
             )
         allowed_level()  # an empty or unknown MES_ALLOW is refused before anything runs
         exe = _program(bins, spec)
         _precheck_kind(exe, spec, rest)
+        name_as = f"{project.name} {spec.short}"
+        if _COMMAND_NAME_RE.match(name_as):
+            os.environ["MES_COMMAND_NAME"] = name_as
         sys.stdout.flush()
         sys.stderr.flush()
         execv(str(exe), [str(exe), *rest])

@@ -159,9 +159,14 @@ class Exec:
 
 
 @pytest.fixture
-def run_project(root, monkeypatch):
+def run_project(root, monkeypatch, tmp_path):
     monkeypatch.setenv("MES_PROJECT_DIR", str(root))
     monkeypatch.delenv("MES_PROJECT", raising=False)
+    monkeypatch.setenv("MES_COMMAND_NAME", "x")
+    monkeypatch.delenv("MES_COMMAND_NAME")  # restored (unset) after the test
+    notes = tmp_path / "notes"
+    notes.mkdir()
+    monkeypatch.setattr(project_cmd.tempfile, "gettempdir", lambda: str(notes))
 
     def go(*argv):
         ex = Exec()
@@ -180,7 +185,16 @@ def test_an_app_is_reached_by_its_short_or_full_name(run_project, root):
 def test_with_several_apps_a_command_alone_is_a_usage_error(run_project, capsys):
     code, calls = run_project("list")
     err = capsys.readouterr().err
-    assert code == 2 and calls == [] and "a, b" in err and "pp a list" in err
+    assert code == 2 and calls == [] and '"list" is not one of the apps of pp (a, b)' in err
+    assert "pp a --help" in err
+
+
+def test_a_word_close_to_an_app_suggests_that_app(run_project, root, capsys):
+    """trail bikes add x, with an app called rides: "bikes" is a mistyped app, not a command."""
+    (root / "project.toml").write_text('[project]\nname = "pp"\napps = ["pp_a", "pp_b"]\n')
+    code, calls = run_project("bb", "tidy")
+    err = capsys.readouterr().err
+    assert code == 2 and calls == [] and 'Did you mean "pp b tidy"?' in err
 
 
 def test_with_one_app_a_command_is_passed_on_with_a_note(run_project, root, capsys):
@@ -189,8 +203,37 @@ def test_with_one_app_a_command_is_passed_on_with_a_note(run_project, root, caps
     assert code == 0 and calls[0][1:] == ["list"]
     assert capsys.readouterr().err == ('Note: "pp list" was passed to pp-a, the only app of this project. '
                                        'Write "pp a list" so it keeps working when the project has more apps.\n')
+    code, calls = run_project("list")  # once per terminal session
+    assert code == 0 and calls[0][1:] == ["list"] and capsys.readouterr().err == ""
+
+
+def test_the_one_app_note_quotes_what_was_typed_and_skips_json_and_help(run_project, root, capsys, tmp_path):
+    (root / "project.toml").write_text('[project]\nname = "pp"\napps = ["pp_a"]\n')
     code, calls = run_project("list", "--json")
     assert code == 0 and capsys.readouterr().err == ""  # no note for machines
+    code, calls = run_project("list", "--help")
+    assert code == 0 and capsys.readouterr().err == ""  # nor when asking for help
+    code, calls = run_project("-v", "list")
+    assert code == 0 and calls[0][1:] == ["-v", "list"]
+    assert 'Write "pp a -v list"' in capsys.readouterr().err
+
+
+def test_the_app_is_told_how_it_was_reached(run_project, root, monkeypatch):
+    import os
+
+    seen = {}
+
+    def ex(path, argv):
+        seen["name"] = os.environ.get("MES_COMMAND_NAME")
+    assert project_cmd.run(["b", "tidy"], bin_dir=root / ".venv" / "bin", execv=ex) == 0
+    assert seen["name"] == "pp b"
+
+
+def test_the_kind_precheck_looks_past_options(run_project, monkeypatch, capsys):
+    """An option before the command could make an option's value look like the command word."""
+    monkeypatch.setenv("MES_ALLOW", "read")
+    code, calls = run_project("a", "--some-opt", "describe", "sync")
+    assert code == 4 and calls == []
 
 
 def test_a_read_session_cannot_start_a_write_command(run_project, monkeypatch, capsys):

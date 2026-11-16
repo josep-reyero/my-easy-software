@@ -198,6 +198,9 @@ def plain_usage_message(prog: str, message: str) -> str:
     return f"The command line was not understood: {message}."
 
 
+_COMMAND_NAME_RE = re.compile(r"^[a-z][a-z0-9-]{1,30} [a-z][a-z0-9-]{0,30}\Z")
+
+
 class ArgumentParser(argparse.ArgumentParser):
     """An ArgumentParser that raises ``UsageError`` instead of exiting."""
 
@@ -697,6 +700,20 @@ class App:
         return self.spec.short if self.spec else short_name(self.name, self.project)
 
     @property
+    def command_name(self) -> str:
+        """How the person reached this app: ``"<project> <short>"`` when the project command ran it
+        (it sets ``MES_COMMAND_NAME``) and that names this app, else the app's own program name.
+        Only used in usage lines and hints."""
+        given = os.environ.get("MES_COMMAND_NAME", "")
+        project, _sp, word = given.partition(" ")
+        try:
+            ok = bool(word) and project == self.project and word in (self.short, self.name) \
+                and bool(_COMMAND_NAME_RE.match(given))
+        except MesError:
+            ok = False
+        return given if ok else self.name
+
+    @property
     def data_folder(self) -> str | None:
         """This app's folder name inside the data folder (``None`` for an app without a project)."""
         self._load()
@@ -866,7 +883,7 @@ class App:
         except MesError:  # a broken project.toml is reported by the commands that need it
             title = self.name
         parser = ArgumentParser(
-            prog=self.name,
+            prog=self.command_name,
             description=f"{title}. Add --json before or after a command to get pure JSON data.",
         )
         parser.add_argument("--json", action="store_true", help="print only JSON data on stdout")

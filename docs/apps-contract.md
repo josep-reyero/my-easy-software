@@ -488,19 +488,31 @@ fallback). App programs are taken only from `Path(sys.executable).parent` (the e
    one word (`fitdata --json garmin sync` -> `fitdata-garmin --json sync`), by `os.execv`, so its
    output, exit code and terminal are the app's own.
 5. Otherwise, with exactly one app: run that app's program with the arguments unchanged.
-   Unless `--json` is among the arguments, first write one line to stderr:
-   `Note: "<project> <w>" was passed to <app>, the only app of this project. Write "<project> <short> <w>" so it keeps working when the project has more apps.`
+   Unless `--json`, `-h` or `--help` is among the arguments, and at most once per terminal session
+   (per project and user: an empty mark file `<tmp>/<command>-note-<project>-<uid>-<session id>`
+   made with `O_EXCL | O_NOFOLLOW`; when it cannot be made the note is shown), first write one line
+   to stderr, where `<typed>` is the arguments as typed (shortened to 60 characters):
+   `Note: "<project> <typed>" was passed to <app>, the only app of this project. Write "<project> <short> <typed>" so it keeps working when the project has more apps.`
    Nothing is ever added to stdout.
-6. Otherwise: usage error, exit 2: *"<project> has several apps, so "<w>" does not say which one
-   is meant."* / hint *"Start with the app's short name: <short1>, <short2>. For example:
-   <project> <short1> <w>."* (JSON error with `--json`).
+6. Otherwise: usage error, exit 2: *""<w>" is not one of the apps of <project> (<short1>, <short2>),
+   so nothing was run. With more than one app, every command starts with the app's short name."* /
+   hint *"Did you mean "<project> <close short> <rest>"?"* when `w` is close to a short name, else
+   *"Start with one of its apps: <short1> or <short2>. For example, <project> <short1> --help lists
+   what <short1> can do."* (JSON error with `--json`).
+
+In cases 4 and 5 the app's program gets `MES_COMMAND_NAME="<project> <short>"` in its
+environment. An app uses it only as its program name in usage lines and hints, and only when it
+matches `^[a-z][a-z0-9-]{1,30} [a-z][a-z0-9-]{0,30}\Z` and names this app (its project and its
+short or full name); otherwise it uses its own program name.
 
 A missing program: exit 3, *"The program of the app <app> is not installed in the project's
 environment."* / *"Run: uv sync"*.
 
-**`MES_ALLOW` and kinds.** The project command passes the environment unchanged; each app checks
-its own command kinds, so nothing can be reached through the project command that the app would
-refuse. The built-ins are read commands: they first check `MES_ALLOW` exactly like
+**`MES_ALLOW` and kinds.** The project command passes the environment unchanged (adding only
+`MES_COMMAND_NAME`); each app checks its own command kinds, so nothing can be reached through the
+project command that the app would refuse. That check is the boundary; mes.project's early kind
+check (with `MES_ALLOW` below admin) is best effort: when options come before the command word,
+every argument that names a command must be allowed. The built-ins are read commands: they first check `MES_ALLOW` exactly like
 `mes.app.allowed_level()` (unset = admin; empty or unknown = refuse, exit 4).
 
 **Built-ins.**
@@ -516,6 +528,9 @@ refuse. The built-ins are read commands: they first check `MES_ALLOW` exactly li
    "jobs": [{"id": "fitlab-walks.rebuild", "app": "fitlab-walks", "name": "rebuild", "run": "rebuild",
              "trigger": "manual", "...": "the rest of today's job dict"}]}
   ```
+  While the project has exactly one app, the top level also carries that app's `commands` and
+  `global_options` (copied from its describe, when present), so a reader that looks for
+  `$.commands` finds them.
   If any app's describe fails, the whole command fails (code `app_broken`, naming the app).
   `jobs` is read from the `app.toml` files with `[settings]` applied; a project command that
   cannot compose jobs (fitness, no mes) gives `"jobs": []`. Without `--json`: a readable table.
