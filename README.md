@@ -26,9 +26,37 @@ own devices unless you choose to share them.
 
 ## Status
 
-Early design. Nothing here is usable yet.
+Version 0.1: everything that works on **one computer**. You can create an app, use its
+command-line tool, run its jobs by hand, schedule them on a Linux machine with systemd, and let
+AI agents on other computers reach it through one safe SSH entry point (`mes gate`). Not
+available yet: the dashboard server and `mes dev` previews, `mes deploy`, sharing (`mes expose`),
+storage buckets, signed code and webhooks. These commands exist and say so.
 
-Planned pieces:
+## Quick start
+
+You need [uv](https://docs.astral.sh/uv/) (it installs Python and the apps). Your AI agent can do
+every step below for you; `mes` answers in plain words and, with `--json`, in data an agent can read.
+
+```sh
+# 1. Get mes (it is not published yet): download this repository, then
+uv tool install --editable ./my-easy-software      # "mes" now works in any folder
+
+# 2. Check this computer and set it up, one step at a time
+mes setup
+
+# 3. Create an app next to the my-easy-software folder and try it
+mes new my-notes
+cd my-notes && uv sync
+uv run my-notes add "My first note"
+uv run my-notes notes
+uv run mes jobs run rebuild
+```
+
+Without installing mes, `uv run --project ./my-easy-software mes ...` works too. Inside an app,
+`uv run mes ...` always works. Guides for agents: `mes guide` (setup, new-app, jobs, gate,
+security). Instructions for agents working on this repository: [AGENTS.md](AGENTS.md).
+
+Pieces:
 
 - **my-easy-software** (this repo): the framework and its `mes` command for creating, previewing
   and deploying apps.

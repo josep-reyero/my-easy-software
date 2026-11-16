@@ -1,0 +1,24 @@
+# The main dashboard of this app: a page made of named read-only queries and
+# fixed components. No JavaScript, HTML or CSS.
+#
+# NOT AVAILABLE YET: the dashboard server (my-easy-ui) is not released, so this
+# page is not shown anywhere yet. This file is a placeholder that shows the
+# shape; the exact format may change when the dashboard server is released.
+title: {{title_yaml}}
+
+queries:
+  daily:
+    description: Notes added per day, newest first.
+    # Dashboards only read derived tables. "daily" is built by the "rebuild" job.
+    sql: SELECT day, notes FROM daily ORDER BY day DESC
+
+components:
+  - type: stat
+    title: Notes in total
+    query: daily
+    value: sum(notes)
+
+  - type: table
+    title: Notes per day
+    query: daily
+    columns: [day, notes]

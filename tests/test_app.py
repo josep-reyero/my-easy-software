@@ -1,0 +1,308 @@
+import datetime as dt
+import json
+from pathlib import Path
+from typing import Annotated, Literal
+
+import pytest
+
+from mes import App, protocol
+from mes.app import allowed_level, check_allowed
+from mes.errors import NotAllowed, NotFound, Refused
+
+
+def make_app(root):
+    app = App("myapp", root=root)
+
+    @app.command("summary", kind="read", help="Key numbers for the last days.")
+    def summary(ctx, days: int = 7):
+        return {"days": days, "json": ctx.json}
+
+    @app.command(kind="read")
+    def day(ctx, date: dt.date, source: Literal["sleep", "steps"] = "steps"):
+        """One day of data."""
+        if date.year < 2000:
+            raise NotFound("There is no data for that day.", hint="Pick a day after 2000.")
+        return [{"date": date, "source": source, "value": 1}]
+
+    @app.command("add-note", kind="write", help="Add a note.")
+    def add_note(ctx, text: str, tags: list[str] | None = None, pinned: bool = False):
+        path = ctx.data_dir / "notes.txt"
+        path.write_text(text)
+        return {"saved": path, "tags": tags, "pinned": pinned}
+
+    @app.command("wipe", kind="admin", help="Remove everything.")
+    def wipe(ctx, *, confirm: Annotated[str, "type the app name"]):
+        raise Refused("Wiping is not allowed in tests.")
+
+    @app.command("ask", kind="read")
+    def ask(ctx):
+        return protocol.needs_human("login", "Sign in", "Only you can.", "myapp ask")
+
+    @app.command("crash", kind="read")
+    def crash(ctx):
+        raise RuntimeError("boom")
+
+    @app.schema
+    def schema(ctx):
+        return {"tables": {"days": ["date", "value"]}}
+
+    return app
+
+
+@pytest.fixture
+def app(tmp_path):
+    return make_app(tmp_path)
+
+
+def run_json(app, capsys, *argv):
+    code = app.run(list(argv))
+    out = capsys.readouterr().out
+    return code, json.loads(out) if out.strip() else None
+
+
+def test_option_defaults_and_values(app, capsys):
+    assert run_json(app, capsys, "--json", "summary") == (0, {"days": 7, "json": True})
+    assert run_json(app, capsys, "summary", "--days", "3", "--json") == (0, {"days": 3, "json": True})
+
+
+def test_text_output_without_json(app, capsys):
+    assert app.run(["summary"]) == 0
+    out = capsys.readouterr().out
+    assert "days: 7" in out and "json: no" in out
+    assert app.run(["day", "2026-01-02"]) == 0
+    assert "2026-01-02" in capsys.readouterr().out
+
+
+def test_positional_types_and_choices(app, capsys):
+    code, data = run_json(app, capsys, "--json", "day", "2026-01-02", "--source", "sleep")
+    assert code == 0 and data == [{"date": "2026-01-02", "source": "sleep", "value": 1}]
+    code, data = run_json(app, capsys, "--json", "day", "2026-01-02", "--source", "weight")
+    assert code == 2 and data["error"]["code"] == "usage"
+    code, data = run_json(app, capsys, "--json", "day", "not-a-date")
+    assert code == 2 and "date" in data["error"]["message"]
+
+
+def test_usage_error_text_goes_to_stderr(app, capsys):
+    assert app.run(["summary", "--days", "many"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == "" and "--help" in captured.err
+    assert '--days needs a whole number such as 5, but got "many".' in captured.err
+
+
+def test_not_found_error_json(app, capsys):
+    code, data = run_json(app, capsys, "--json", "day", "1990-01-01")
+    assert code == 3
+    assert data == {"error": {"code": "not_found", "message": "There is no data for that day.", "hint": "Pick a day after 2000."}}
+
+
+def test_write_command_uses_data_dir(app, capsys, mes_home):
+    code, data = run_json(app, capsys, "--json", "add-note", "hello", "--tags", "a", "b", "--pinned")
+    assert code == 0
+    assert data == {"saved": str(mes_home["data"] / "myapp" / "notes.txt"), "tags": ["a", "b"], "pinned": True}
+    assert (mes_home["data"] / "myapp" / "notes.txt").read_text() == "hello"
+    code, data = run_json(app, capsys, "--json", "add-note", "x", "--no-pinned")
+    assert data["pinned"] is False and data["tags"] is None
+
+
+def test_allowed_level_blocks_before_running(app, capsys, monkeypatch, mes_home):
+    monkeypatch.setenv("MES_ALLOW", "read")
+    code, data = run_json(app, capsys, "--json", "add-note", "hello")
+    assert code == 4 and data["error"]["code"] == "not_allowed"
+    assert not (mes_home["data"] / "myapp").exists()
+    assert run_json(app, capsys, "--json", "summary")[0] == 0
+    monkeypatch.setenv("MES_ALLOW", "write")
+    assert run_json(app, capsys, "--json", "add-note", "hello")[0] == 0
+    assert run_json(app, capsys, "--json", "wipe", "--confirm", "myapp")[0] == 4
+    monkeypatch.setenv("MES_ALLOW", "root")
+    assert run_json(app, capsys, "--json", "summary")[0] == 4
+
+
+def test_allowed_helpers(monkeypatch):
+    assert allowed_level() == "admin"
+    check_allowed("admin")
+    with pytest.raises(NotAllowed):
+        check_allowed("write", "read")
+
+
+def test_refused_and_required_keyword_option(app, capsys):
+    code, data = run_json(app, capsys, "--json", "wipe")
+    assert code == 2
+    code, data = run_json(app, capsys, "--json", "wipe", "--confirm", "myapp")
+    assert code == 5 and data["error"]["code"] == "refused"
+
+
+def test_needs_human_exit_code(app, capsys):
+    code, data = run_json(app, capsys, "--json", "ask")
+    assert code == 6 and data["status"] == "needs_human"
+
+
+def test_unexpected_exception_is_plain_error(app, capsys):
+    code, data = run_json(app, capsys, "--json", "crash")
+    assert code == 1 and data["error"]["code"] == "internal" and data["error"]["hint"]
+
+
+def test_describe(app, capsys):
+    code, data = run_json(app, capsys, "--json", "describe")
+    assert code == 0
+    assert data["app"] == "myapp" and data["version"] == "0.0.0" and data["allowed"] == "admin"
+    cmds = {c["name"]: c for c in data["commands"]}
+    assert {"describe", "guide", "schema", "summary", "day", "add-note", "wipe"} <= set(cmds)
+    assert "sources" not in cmds
+    assert cmds["add-note"]["kind"] == "write" and cmds["wipe"]["kind"] == "admin"
+    assert cmds["day"]["help"] == "One day of data."
+    args = {a["name"]: a for a in cmds["add-note"]["args"]}
+    assert args["text"] == {
+        "name": "text", "flag": None, "kind": "positional", "type": "str", "required": True,
+        "default": None, "many": False, "choices": None, "help": None,
+    }
+    assert args["tags"]["many"] and args["tags"]["flag"] == "--tags"
+    assert args["pinned"]["kind"] == "flag" and args["pinned"]["default"] is False
+    day_args = {a["name"]: a for a in cmds["day"]["args"]}
+    assert day_args["source"]["choices"] == ["sleep", "steps"] and day_args["date"]["type"] == "date"
+    wipe_args = cmds["wipe"]["args"]
+    assert wipe_args[0]["required"] and wipe_args[0]["help"] == "type the app name"
+
+
+def test_no_command_json_is_describe(app, capsys):
+    code, data = run_json(app, capsys, "--json")
+    assert code == 0 and data["app"] == "myapp"
+    assert app.run([]) == 0
+    assert "summary" in capsys.readouterr().out
+
+
+def test_schema_provider(app, capsys):
+    assert run_json(app, capsys, "--json", "schema") == (0, {"tables": {"days": ["date", "value"]}})
+
+
+def test_guide_generated_and_from_agents_md(app, tmp_path, capsys):
+    code, data = run_json(app, capsys, "--json", "guide")
+    assert code == 0 and data["source"] == "generated" and "`summary` (read)" in data["guide"]
+    (tmp_path / "AGENTS.md").write_text("# Use myapp carefully\n")
+    code, data = run_json(app, capsys, "--json", "guide")
+    assert data == {"app": "myapp", "source": "AGENTS.md", "guide": "# Use myapp carefully\n"}
+    assert app.run(["guide"]) == 0
+    assert capsys.readouterr().out == "# Use myapp carefully\n"
+
+
+def test_manifest_gives_title_version_and_jobs(tmp_path, capsys):
+    (tmp_path / "app.toml").write_text(
+        '[app]\nname = "myapp"\ntitle = "My App"\nversion = "1.2.3"\n'
+        '[jobs.sync]\nrun = "summary --days 1"\nschedule = "daily"\n'
+    )
+    app = make_app(tmp_path)
+    code, data = run_json(app, capsys, "--json", "describe")
+    assert data["title"] == "My App" and data["version"] == "1.2.3"
+    assert data["jobs"][0]["name"] == "sync" and data["jobs"][0]["argv"] == ["summary", "--days", "1"]
+
+
+def test_manifest_name_mismatch_is_an_error(tmp_path, capsys):
+    (tmp_path / "app.toml").write_text('[app]\nname = "other"\n')
+    app = make_app(tmp_path)
+    code, data = run_json(app, capsys, "--json", "describe")
+    assert code == 1 and data["error"]["code"] == "manifest_invalid"
+
+
+def test_root_discovered_from_caller_file():
+    app = App("myapp")
+    assert app.root == Path(__file__).resolve().parent.parent  # the repo root (pyproject.toml)
+
+
+def test_registration_errors(tmp_path):
+    app = App("myapp", root=tmp_path)
+    with pytest.raises(ValueError):
+        app.command("describe")(lambda ctx: None)
+    with pytest.raises(ValueError):
+        app.command("x", kind="root")
+    app.command("dup")(lambda ctx: None)
+    with pytest.raises(ValueError):
+        app.command("dup")(lambda ctx: None)
+    with pytest.raises(TypeError):
+        app.command("bad")(lambda: None)
+    with pytest.raises(TypeError):
+        app.command("bad2")(lambda ctx, json=False: None)
+    with pytest.raises(ValueError):
+        App("Bad Name")
+
+
+def test_bare_decorator_uses_function_name(tmp_path, capsys):
+    app = App("myapp", root=tmp_path)
+
+    @app.command
+    def last_run(ctx):
+        return "never"
+
+    assert app.run(["last-run"]) == 0
+    assert capsys.readouterr().out == "never\n"
+
+
+def test_context_config(tmp_path, capsys, mes_home):
+    mes_home["config"].parent.mkdir(parents=True)
+    mes_home["config"].write_text('[apps.myapp]\nunits = "metric"\n')
+    app = App("myapp", root=tmp_path)
+
+    @app.command("units")
+    def units(ctx):
+        return ctx.config
+
+    assert run_json(app, capsys, "--json", "units") == (0, {"units": "metric"})
+
+
+def test_broken_manifest_only_blocks_commands_that_need_it(tmp_path, capsys):
+    (tmp_path / "app.toml").write_text('[app]\nname = "myapp"\ncolour = "red"\n')
+    app = make_app(tmp_path)
+    assert run_json(app, capsys, "--json", "summary") == (0, {"days": 7, "json": True})
+    code, data = run_json(app, capsys, "--json", "describe")
+    assert code == 1 and '"colour"' in data["error"]["message"]
+
+
+def test_subcommand_help(app, capsys):
+    assert app.run(["add-note", "--help"]) == 0
+    out = capsys.readouterr().out
+    assert "--pinned" in out and "--no-pinned" in out and "--json" in out
+
+
+# ---------------------------------------------------------------- review fixes
+
+@pytest.mark.parametrize("value", ["", "  ", "\t"])
+def test_blank_mes_allow_fails_closed(app, capsys, monkeypatch, value):
+    monkeypatch.setenv("MES_ALLOW", value)
+    with pytest.raises(NotAllowed):
+        allowed_level()
+    code, data = run_json(app, capsys, "--json", "summary")
+    assert code == 4 and data["error"]["code"] == "not_allowed"
+
+
+def test_missing_mes_allow_is_admin(monkeypatch):
+    monkeypatch.delenv("MES_ALLOW", raising=False)
+    assert allowed_level() == "admin"
+
+
+def test_plain_usage_errors(app, capsys):
+    code, data = run_json(app, capsys, "--json", "nope")
+    assert code == 2
+    msg = data["error"]["message"]
+    assert msg.startswith('myapp has no command called "nope". Its commands are: ') and "summary" in msg
+    code, data = run_json(app, capsys, "--json", "add-note")
+    assert code == 2 and "needs more information that was not given: text" in data["error"]["message"]
+
+
+def test_help_and_json_gives_json(app, capsys):
+    for argv in (["--help", "--json"], ["summary", "--help", "--json"]):
+        code = app.run(argv)
+        out = capsys.readouterr().out
+        assert code == 0 and "usage:" in json.loads(out)["help"]
+
+
+def test_describe_text_is_a_table(app, capsys, monkeypatch):
+    monkeypatch.setenv("MES_ALLOW", "read")
+    assert app.run(["describe"]) == 0
+    out = capsys.readouterr().out
+    assert "This session may run only read commands" in out
+    assert "command" in out and "kind" in out and "summary" in out and '{"name"' not in out
+
+
+def test_command_name_with_newline_is_refused(app):
+    with pytest.raises(ValueError):
+        app.command("bad\n")(lambda ctx: None)
+    with pytest.raises(ValueError):
+        App("myapp\n", root=".")

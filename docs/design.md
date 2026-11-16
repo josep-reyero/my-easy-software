@@ -1,6 +1,7 @@
 # Design
 
-Status: design only. Nothing described here is built yet. This file records the decisions so far.
+Status: v0.1 is built for one computer (see "Status of v0.1" at the end). This file records the
+decisions so far.
 
 ## Idea
 
@@ -158,3 +159,22 @@ port, a key or a server is.
 6. `mes expose` static export: Cloudflare Pages, link and public modes, then other hosts.
 7. my-bucket-storage, then move the fitness app onto it. Data-event triggers.
 8. Backups, passkeys, signed webhooks, server-mode sharing.
+
+## Status of v0.1
+
+What v0.1 does differently from the design above, and why:
+
+- **Jobs live in `app.toml`** (`[jobs.<name>]` tables, each running one of the app's own commands),
+  not as files in `jobs/`. One file keeps triggers, limits and commands together and checked.
+- **`mes new` writes a `.gitignore`** next to the five files, so `.venv/` (full of this computer's
+  paths) is never committed.
+- **Python 3.12 or newer**, not only 3.14, so mes runs on the Pythons most machines have today.
+- **No dashboards yet.** `mes dev`, `mes deploy` and `mes expose` say they are not available. The
+  acceptance test "a new app shows a live dashboard in under 5 minutes" waits for my-easy-ui; until
+  then the first-use check is: create an app, add a note, read it back and run its job.
+- **Job network host lists are not enforced.** `network = false` gives a job no network at all;
+  a list of hosts gives full internet access, and mes says so wherever the job is shown.
+- **The gate is not a full sandbox yet** (rule 6). It limits time, output, CPU time, file size,
+  memory (Linux) and parallel requests, checks that the app list and the programs it runs can
+  only be changed by its own account, and never runs admin commands. It does not yet isolate an
+  app's files or network from the gate's account; that comes with the dedicated accounts of rule 5.
