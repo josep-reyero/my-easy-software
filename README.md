@@ -1,5 +1,12 @@
 # my-easy-software
 
+> **Rework in progress.** Two changes are being built right now and are not finished: apps are
+> becoming proper packages inside a project, with their own jobs and schedules, contributing to a
+> project's shared data and dashboards ([design](docs/apps.md)); and dashboards are getting fully
+> flexible styles ([design](https://github.com/josep-reyero/my-easy-ui/blob/main/docs/STYLES-DESIGN.md)).
+> Until this note is removed, expect the project file format and some commands to change, and
+> treat what is described below as the previous shape.
+
 > **Consumer apps should ship APIs that let people consume their own data.
 > People then set up their own dashboards and own their data, in an AI-native,
 > fully flexible way.**
@@ -54,8 +61,9 @@ do every step below for you; `mes` answers in plain words and, with `--json`, in
 can read.
 
 ```sh
-# 1. Get mes (it is not published yet): download this repository, then
-uv tool install --editable ./my-easy-software      # "mes" now works in any folder
+# 1. Get mes (it is not on any package index; never install a package of that name from one):
+#    clone this repository, check its address and last commit, then
+uv tool install ./my-easy-software                 # "mes" now works in any folder
 
 # 2. Check this computer and set it up, one step at a time
 mes setup
@@ -67,13 +75,17 @@ uv run my-notes add "My first note"
 uv run mes jobs run rebuild
 uv run mes dev                                     # one link to the dashboard
 
-# 4. Later: put it on your own server (see: mes guide server, mes guide deploy)
-mes server plan my-notes --out plan.sh --signer ~/.ssh/mes-deploy.pub --key deploy=~/.ssh/mes-deploy.pub
-mes deploy my-server
+# 4. Later: put it on your own server (see: mes guide server, mes guide deploy). Two keys: one
+#    only signs (best a hardware key), the other only logs in. On the server, with the
+#    system-installed mes:
+/usr/local/bin/mes server plan my-notes --out plan.sh --signer mes-sign.pub --key deploy=mes-login.pub
+mes deploy my-server --login-key ~/.ssh/mes-login     # signs with ~/.ssh/mes-sign
+mes server selftest my-notes --host my-server         # proves what the sandboxes promise
 ```
 
 Without installing `mes`, `uv run --project ./my-easy-software mes ...` works too. Inside a
-project, `uv run mes ...` always works. Guides for agents: `mes guide` lists them. Agent skills
+project, `uv run mes ...` works on your own computer; a server's root script is only ever made by
+the system-installed mes. Guides for agents: `mes guide` lists them. Agent skills
 (and a Claude Code plugin manifest in `.claude-plugin/`) are in `skills/`. Instructions for
 agents working on this repository: [AGENTS.md](AGENTS.md).
 
