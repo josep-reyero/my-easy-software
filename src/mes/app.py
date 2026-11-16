@@ -41,7 +41,8 @@ Public API
     project the App works on its own (its project is its own name).
     Attributes: ``name``, ``root``, ``app_dir``, ``commands`` (dict name -> ``Command``).
     Properties: ``manifest`` (the composed ``Project`` or ``None``), ``spec`` (this app's
-    ``AppSpec`` or ``None``), ``project`` (the project's name), ``short``, ``title``, ``version``.
+    ``AppSpec`` or ``None``), ``project`` (the project's name: from project.toml, else the app's
+    own name, never ``MES_PROJECT``), ``short``, ``title``, ``version``.
     ``@app.command(name=None, *, kind="read", help=None)``  register a command
         (name defaults to the function name with ``_`` -> ``-``).
     ``@app.schema`` / ``@app.sources``  register a provider ``fn(ctx) -> data``
@@ -389,7 +390,7 @@ def _params_for(func: Callable[..., Any]) -> list[Param]:
 
 
 def _add_param(parser: argparse.ArgumentParser, p: Param) -> None:
-    kw: dict[str, Any] = {"help": p.help, "dest": p.dest}
+    kw: dict[str, Any] = {"help": protocol.safe_text(p.help) if p.help else p.help, "dest": p.dest}
     if p.choices:
         kw["choices"] = p.choices
     if p.kind == "positional":
@@ -690,10 +691,9 @@ class App:
     @property
     def project(self) -> str:
         self._load()
-        if self._project_file is not None:
-            return self._project_file.name
-        session = os.environ.get("MES_PROJECT")
-        return session if session else self.name
+        # Without project.toml the app is its own project. MES_PROJECT never names it: otherwise any
+        # app could take another project's name (and with it that project's data folders).
+        return self._project_file.name if self._project_file is not None else self.name
 
     @property
     def short(self) -> str:
@@ -889,9 +889,9 @@ class App:
         parser.add_argument("--json", action="store_true", help="print only JSON data on stdout")
         sub = parser.add_subparsers(dest="command", metavar="<command>")
         for c in self.commands.values():
-            first = (c.help or "").splitlines()[0] if c.help else None
+            first = protocol.safe_text((c.help or "").splitlines()[0]) if c.help else None
             label = f"[{c.kind}] {first}" if first else f"[{c.kind}]"
-            sp = sub.add_parser(c.name, help=label, description=c.help)
+            sp = sub.add_parser(c.name, help=label, description=protocol.safe_text(c.help) if c.help else None)
             sp.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
                             help="print only JSON data on stdout")
             for p in c.params:
@@ -900,6 +900,14 @@ class App:
 
     def run(self, argv: Sequence[str] | None = None) -> int:
         args, json_mode = protocol.pop_json_flag(sys.argv[1:] if argv is None else argv)
+        # The command's kind is checked before any of its parameters is read: a parameter's own
+        # converter is the app's code, and it must not run for a command that is not allowed.
+        first = next((a for a in args if not a.startswith("-")), None)
+        if first in self.commands:
+            try:
+                check_allowed(self.commands[first].kind, allowed_level())
+            except MesError as e:
+                return protocol.emit_error(e, json_mode=json_mode)
         parser = self.build_parser()
         try:
             ns, _, finished = parse_json_aware(parser, args, json_mode=json_mode)

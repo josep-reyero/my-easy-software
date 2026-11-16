@@ -2,16 +2,18 @@
 # mes-project: demo
 # mes-unit: gate-read
 # Each connection gets its own sandboxed instance of mes-demo.gate-read@.service.
-# Only the account mes-demo (the gate) can connect.
+# Only the account mes-demo can connect, and each instance accepts only an SSH session of
+# that account (never a job). No unit that runs project code can see this socket's folder.
 
 [Unit]
 Description=Sandboxed read requests of the mes gate for project demo (socket)
 
 [Socket]
-ListenStream=/run/mes-demo-gate-read.sock
+ListenStream=/run/mes-demo-gate/read.sock
 SocketUser=mes-demo
 SocketGroup=mes-demo
 SocketMode=0600
+DirectoryMode=0755
 Accept=yes
 MaxConnections=4
 

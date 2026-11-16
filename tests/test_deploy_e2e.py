@@ -4,8 +4,11 @@
 - ``ssh`` is a fake on PATH: it does what sshd does with a forced command, setting
   SSH_ORIGINAL_COMMAND to the request and running ``mes gate --project demo --allow <level>
   --server-root <tmp>`` with the archive on stdin.
-- ``uv`` is a fake that "installs" the project by writing ``.venv/bin/demo``, a small program
-  that runs the project's own cli.py.
+- ``uv`` is a fake. On this computer ``uv build --wheel`` writes an empty wheel named after the
+  folder's pyproject.toml (and records which folder it built). On "the server" ``uv sync
+  --frozen --no-build ...`` "installs" the project by writing ``.venv/bin/demo``, a small
+  program that runs the project's own cli.py, and ``uv pip install --no-index ...`` checks that
+  only the archive's wheels are installed.
 - The test user plays both root (it owns the project's top folder and the signers file) and
   mes-demo (it owns code/), which is the only difference from a real server.
 
@@ -76,8 +79,26 @@ manual = true
 '''
 
 FAKE_UV = '''#!{python}
-import os, sys
-assert sys.argv[1:] == ["sync", "--frozen", "--no-progress"], sys.argv
+import json, os, sys, tomllib
+args = sys.argv[1:]
+log = {log!r}
+if log:
+    with open(log, "a") as f:
+        f.write(json.dumps({{"args": args, "cwd": os.getcwd(), "home": os.environ.get("HOME"),
+                             "no_config": os.environ.get("UV_NO_CONFIG")}}) + "\\n")
+if args[:2] == ["build", "--wheel"]:
+    out, folder = args[args.index("--out-dir") + 1], args[-1]
+    meta = tomllib.load(open(os.path.join(folder, "pyproject.toml"), "rb"))["project"]
+    assert not os.path.exists(os.path.join(folder, "UNTRACKED")), "built from the working folder"
+    open(os.path.join(out, "%s-%s-py3-none-any.whl" % (meta["name"], meta["version"])), "wb").close()
+    sys.exit(0)
+if args[:2] == ["pip", "install"]:
+    for flag in ("--no-deps", "--no-index", "--no-build", "--offline"):
+        assert flag in args, args
+    wheels = [a for a in args if a.endswith(".whl")]
+    assert wheels and all("/wheels/" in w for w in wheels), args
+    sys.exit(0)
+assert args[:5] == ["sync", "--frozen", "--no-progress", "--no-build", "--no-install-project"], args
 if os.path.exists(os.path.join(os.getcwd(), "FAIL_SYNC")):
     sys.stderr.write("could not resolve packages\\n")
     sys.exit(1)
@@ -99,7 +120,8 @@ dest, command = args[args.index("--") + 1:]
 assert dest == "mes-demo@my-server", dest
 env = dict(os.environ, SSH_ORIGINAL_COMMAND=command)
 level = os.environ.get("FAKE_SSH_LEVEL", "deploy")
-boot = "import sys, mes.units; mes.units.UNSAFE_TOOL_ROOTS = (); from mes.cli import main; sys.argv[0] = 'mes'; main()"
+boot = ("import sys, mes.units, mes.gate; mes.units.UNSAFE_TOOL_ROOTS = (); mes.gate.REQUIRE_SANDBOX_ON_SERVER = False; "
+        "from mes.cli import main; sys.argv[0] = 'mes'; main()")
 sys.exit(subprocess.call([sys.executable, "-c", boot, "gate", "--project", "demo", "--allow", level,
                           "--server-root", {root!r}], env=env))
 '''
@@ -155,22 +177,24 @@ def world(tmp_path, signing_key, monkeypatch):
     w.write_project("0.1.0")
     tools = tmp_path / "tools"
     tools.mkdir()
-    uv = _script(tools / "uv", FAKE_UV.format(python=sys.executable, mes_src=MES_SRC))
+    uv = _script(tools / "uv", FAKE_UV.format(python=sys.executable, mes_src=MES_SRC,
+                                              log=str(tmp_path / "uv-log.jsonl")))
     bindir = tmp_path / "bin"
     bindir.mkdir()
     _script(bindir / "ssh", FAKE_SSH.format(python=sys.executable, root=str(w.root)))
+    shutil.copy(uv, bindir / "uv")  # the client builds the wheels with uv too
     monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
     # The server's layout, as the root script of 'mes server plan' leaves it.
     for sub, mode in (("", 0o711), ("code", 0o700), ("data", 0o700), ("state", 0o700), ("store", 0o700),
-                      ("ui", 0o750), ("etc", 0o755), ("log", 0o750)):
+                      ("gate", 0o700), ("webhook", 0o700), ("ui", 0o750), ("etc", 0o750), ("log", 0o750)):
         (w.base / sub).mkdir(mode=mode, parents=True, exist_ok=True)
         (w.base / sub).chmod(mode)
     pub = (signing_key / "deploy.pub").read_text().split()
-    (w.base / "etc" / "allowed_signers").write_text(f'demo namespaces="mes-deploy" {pub[0]} {pub[1]}\n')
+    (w.base / "etc" / "allowed_signers").write_text(f'demo namespaces="mes-deploy,mes-rollback" {pub[0]} {pub[1]}\n')
     (w.base / "etc" / "server.toml").write_text(
         f'[server]\nproject = "demo"\nroot = "{w.root}"\nmes = "/usr/local/bin/mes"\nuv = "{uv}"\n')
     for f in ("allowed_signers", "server.toml"):
-        (w.base / "etc" / f).chmod(0o644)
+        (w.base / "etc" / f).chmod(0o640)
     return w
 
 
@@ -223,10 +247,88 @@ def test_deploy_runs_the_new_release_through_the_gate(world):
     assert json.loads(_ask(w, ["demo", "hello", "--json"]).stdout)["version"] == "0.1.0"
     again = _deploy(w, rollback=True, to=2)
     assert again["release"] == 2
-    log = [json.loads(ln) for ln in (w.base / "code" / deploy.DEPLOY_LOG).read_text().splitlines()]
+    log = [json.loads(ln) for ln in (w.base / "gate" / deploy.DEPLOY_LOG).read_text().splitlines()]
     assert [e["event"] for e in log] == ["deployed", "deployed", "rolled_back", "rolled_back"]
-    gate_log = (w.base / "state" / "gate" / "gate-log.jsonl").read_text()
+    gate_log = (w.base / "gate" / "gate-log.jsonl").read_text()
     assert '"deploy"' in gate_log
+    assert not (w.base / "state" / "gate").exists() and not (w.base / "code" / deploy.DEPLOY_LOG).exists()
+    # The server installed only ready-made wheels, with uv's own settings and caches out of reach.
+    calls = [json.loads(ln) for ln in (w.tmp / "uv-log.jsonl").read_text().splitlines()]
+    server_calls = [c for c in calls if c["args"][0] in ("sync", "pip")]
+    assert server_calls and all(c["home"] == "/nonexistent" and c["no_config"] == "1" for c in server_calls)
+    assert all("--no-build" in c["args"] for c in server_calls)
+    assert [c["args"][-1] for c in calls if c["args"][0] == "pip"][0].endswith("demo-0.1.0-py3-none-any.whl")
+
+
+def test_rollback_is_signed_and_cannot_be_replayed(world):
+    """Finding 5: '["mes", "rollback"]' needed only the deploy login key."""
+    w = world
+    _deploy(w)
+    w.write_project("0.2.0")
+    _deploy(w)
+    with pytest.raises(MesError) as e:  # unsigned
+        deploy._send("mes-demo@my-server", ["mes", "rollback", "--to", "1"], None, 60)
+    assert e.value.exit_code == 2 and "signed with the signing key" in e.value.message
+    import time as _time
+
+    when, nonce = int(_time.time()), "ab" * 16
+    msg = w.tmp / "rb.txt"
+    msg.write_bytes(deploy.rollback_message("demo", 1, when, nonce))
+    sig = deploy.sign(msg, w.keys / "deploy", deploy.ROLLBACK_NAMESPACE)
+    req = ["mes", "rollback", "--to", "1", "--time", str(when), "--nonce", nonce, "--signature", sig]
+    assert deploy._send("mes-demo@my-server", req, None, 60)["release"] == 1
+    with pytest.raises(Refused) as e:
+        deploy._send("mes-demo@my-server", req, None, 60)
+    assert e.value.code == "replay"
+    # A deploy signature is not a rollback signature (namespaces differ), and a stale one is refused.
+    old = when - deploy.ROLLBACK_WINDOW - 10
+    msg.write_bytes(deploy.rollback_message("demo", 2, old, "cd" * 16))
+    sig = deploy.sign(msg, w.keys / "deploy", deploy.ROLLBACK_NAMESPACE)
+    with pytest.raises(Refused) as e:
+        deploy._send("mes-demo@my-server", ["mes", "rollback", "--to", "2", "--time", str(old), "--nonce", "cd" * 16,
+                                            "--signature", sig], None, 60)
+    assert e.value.code == "stale_request"
+    msg.write_bytes(deploy.rollback_message("demo", 2, when, "ef" * 16))
+    sig = deploy.sign(msg, w.keys / "deploy")  # mes-deploy namespace
+    with pytest.raises(Refused) as e:
+        deploy._send("mes-demo@my-server", ["mes", "rollback", "--to", "2", "--time", str(when), "--nonce", "ef" * 16,
+                                            "--signature", sig], None, 60)
+    assert e.value.code == "bad_signature"
+    assert os.readlink(w.base / "code" / "current") == "releases/1"
+
+
+def test_only_the_last_commit_is_packed(world):
+    """Audit F10: the packer read the working folder (a link put in place of a folder was followed,
+    and untracked files under the app's folder ended up in wheels)."""
+    w = world
+    (w.project / "apps" / "demo_app" / "UNTRACKED").write_text("secret")
+    (w.project / "apps" / "demo_app" / "cli.py").write_text("uncommitted change")
+    out, _ = _signed(w)
+    with tarfile.open(out) as t:
+        names = t.getnames()
+        cli = t.extractfile("project/apps/demo_app/cli.py").read().decode()
+    assert "project/apps/demo_app/UNTRACKED" not in names and "uncommitted change" not in cli
+    assert any(n.startswith("wheels/demo-0.1.0") for n in names)
+    elsewhere = w.tmp / "elsewhere"
+    shutil.copytree(w.project / "apps", elsewhere)
+    (elsewhere / "demo_app" / "cli.py").write_text("from a linked folder")
+    (elsewhere / "demo_app" / "UNTRACKED").unlink()
+    shutil.rmtree(w.project / "apps")
+    (w.project / "apps").symlink_to(elsewhere)
+    out2, _ = _signed(w, name="b.tgz")
+    with tarfile.open(out2) as t:
+        cli = t.extractfile("project/apps/demo_app/cli.py").read().decode()
+    assert "from a linked folder" not in cli and "VERSION" in cli
+
+
+def test_an_interrupted_release_does_not_block_sending_it_again(world):
+    """Finding 14: a release unpacked but never completed blocked the same archive forever."""
+    w = world
+    out, sig = _signed(w)
+    (w.base / "code" / "releases" / "1").mkdir(parents=True)
+    (w.base / "code" / "releases" / "1" / "half").write_text("x")
+    assert deploy._send("mes-demo@my-server", ["mes", "deploy", "--signature", sig], out, 60)["release"] >= 1
+    assert (w.base / "gate" / "releases").is_dir()
 
 
 def test_only_the_deploy_level_may_deploy(world):
@@ -333,11 +435,11 @@ def test_signers_that_others_could_change_are_not_trusted(world):
     with pytest.raises(Refused) as e:
         _deploy(w)
     assert e.value.code == "untrusted_file"
-    (w.base / "etc" / "allowed_signers").chmod(0o644)
+    (w.base / "etc" / "allowed_signers").chmod(0o640)
     rsa = w.tmp / "rsa"
     subprocess.run(["ssh-keygen", "-q", "-t", "rsa", "-b", "2048", "-N", "", "-f", str(rsa)], check=True)
     kind, b64 = rsa.with_name("rsa.pub").read_text().split()[:2]
-    (w.base / "etc" / "allowed_signers").write_text(f'demo namespaces="mes-deploy" {kind} {b64}\n')
+    (w.base / "etc" / "allowed_signers").write_text(f'demo namespaces="mes-deploy,mes-rollback" {kind} {b64}\n')
     with pytest.raises(Refused) as e:
         _deploy(w)
     assert e.value.code == "key_type"
@@ -347,11 +449,13 @@ def test_deploy_needs_git_tracked_lock_and_refuses_links(world):
     w = world
     (w.project / "secret-link").symlink_to("/etc/hosts")
     _git(w.project, "add", "secret-link")
+    _git(w.project, "commit", "-q", "-m", "link")
     with pytest.raises(Refused) as e:
         _deploy(w, dry_run=True)
     assert e.value.code == "link_in_project"
     _git(w.project, "rm", "-q", "--cached", "secret-link")
     _git(w.project, "rm", "-q", "--cached", "uv.lock")
+    _git(w.project, "commit", "-q", "-m", "no lock")
     with pytest.raises(MesError) as e:
         _deploy(w, dry_run=True)
     assert e.value.code == "missing_file"
@@ -400,11 +504,13 @@ def test_releases_when_nothing_is_set_up(tmp_path, monkeypatch, world):
 
 
 @pytest.mark.parametrize("line", [
-    'demo cert-authority,namespaces="mes-deploy" {kind} {b64}',
-    'demo,other namespaces="mes-deploy" {kind} {b64}',
-    '* namespaces="mes-deploy" {kind} {b64}',
+    'demo cert-authority,namespaces="mes-deploy,mes-rollback" {kind} {b64}',
+    'demo,other namespaces="mes-deploy,mes-rollback" {kind} {b64}',
+    '* namespaces="mes-deploy,mes-rollback" {kind} {b64}',
     'demo namespaces="mes-deploy,git" {kind} {b64}',
+    'demo namespaces="mes-deploy" {kind} {b64}',
     'demo {kind} {b64}',
+    'demo namespaces="mes-deploy,mes-rollback" {kind} {b64}\n' * 100 + '* cert-authority {kind} {b64}',
 ])
 def test_signer_lines_with_extra_powers_are_not_trusted(world, line):
     w = world
@@ -414,3 +520,38 @@ def test_signer_lines_with_extra_powers_are_not_trusted(world, line):
         _deploy(w)
     assert e.value.code == "untrusted_file"
     assert not (w.base / "code" / "releases").exists() or _releases(w) == []
+
+
+def test_the_release_lock_is_written_only_from_a_checked_describe(tmp_path):
+    """The read sandbox finds the release's apps (running project code); the gate itself writes
+    apps.lock.json only after checking every path stays inside that release."""
+    import projects as helpers
+
+    folder = helpers.write(tmp_path / "rel" / "project", PROJECT_TOML.format(version="0.1.0"),
+                           {"demo_app": APP_TOML}).resolve()
+    good = {"apps": [{"package": "demo_app", "name": "demo-app", "path": str(folder / "apps" / "demo_app"),
+                      "in_project": True, "program": "demo-app"}]}
+    elsewhere = tmp_path / "elsewhere" / "demo_app"
+    elsewhere.mkdir(parents=True)
+    (elsewhere / "app.toml").write_text(APP_TOML)
+    for bad in (
+        {"apps": []},
+        {"apps": [{**good["apps"][0], "path": str(elsewhere.resolve()), "in_project": False}]},
+        {"apps": [{**good["apps"][0], "path": str(folder / "apps" / ".." / "apps" / "demo_app")}]},
+        {"apps": [{**good["apps"][0], "name": "other-app"}]},
+        {"apps": [{**good["apps"][0], "program": "sh"}]},
+    ):
+        with pytest.raises(deploy.MesError):
+            deploy.write_release_lock(folder, bad)
+        assert not (folder / "apps.lock.json").exists()
+    project = deploy.write_release_lock(folder, good)
+    assert list(project.apps) == ["demo-app"]
+    assert json.loads((folder / "apps.lock.json").read_text())["apps"][0]["path"] == str(folder / "apps" / "demo_app")
+
+
+def test_an_installed_app_inside_the_project_gets_its_own_wheel():
+    """The server installs only the archive's wheels (no building there), so an app installed from
+    a folder of the project (vendor/<app>) needs a wheel too; its package is never built there."""
+    fitlab = Path(__file__).resolve().parents[1] / "examples" / "fitlab"
+    assert deploy._inside_path_dependencies(fitlab) == ["vendor/fitlab-rides"]
+    assert "fitlab-rides" in deploy._path_packages(fitlab)

@@ -470,18 +470,20 @@ def server_root(tmp_path):
     return root
 
 
-def _systemd_env(monkeypatch, *, status="2", result="exit-code"):
+def _systemd_env(monkeypatch, *, status="2", result="exit-code", code="1", state="deactivating"):
+    """What systemd shows for the unit while its ExecStopPost runs. The record step gets an empty
+    environment (env -i), so everything comes from these properties."""
     monkeypatch.setattr(jobs, "_is_linux", lambda: True)
-    monkeypatch.setenv("INVOCATION_ID", INVOCATION)
-    monkeypatch.setenv("SERVICE_RESULT", result)
-    monkeypatch.setenv("EXIT_CODE", "exited")
-    monkeypatch.setenv("EXIT_STATUS", status)
+    for k in ("INVOCATION_ID", "SERVICE_RESULT", "EXIT_CODE", "EXIT_STATUS"):
+        monkeypatch.delenv(k, raising=False)
     asked = []
 
     def show(unit, *props):
         asked.append(unit)
         return {"InvocationID": INVOCATION, "ExecMainStartTimestampMonotonic": "1000000",
-                "ExecMainExitTimestampMonotonic": "3500000"}
+                "ExecMainExitTimestampMonotonic": "3500000", "Result": result, "ExecMainCode": code,
+                "ExecMainStatus": status, "ActiveState": state,
+                "ExecStart": '{ path=/x/.venv/bin/demo ; argv[]=/x/.venv/bin/demo --json sync ; ignore_errors=no }'}
 
     monkeypatch.setattr(jobs, "_show", show)
     return asked
@@ -491,38 +493,65 @@ def test_record_from_systemd(server_root, capsys, monkeypatch):
     asked = _systemd_env(monkeypatch)
     code, data = mes(capsys, "jobs", "record", "--project", "demo", "--server-root", str(server_root), "demo-app.sync")
     assert code == 0, data
-    assert asked == ["mes-demo.job.demo-app.sync.service"] * 2
+    assert asked == ["mes-demo.job.demo-app.sync.service"]
     log = paths.server_layout("demo", server_root).run_log
     rec = jobs.read_log(log)[-1]
     assert rec["via"] == "systemd" and rec["exit_code"] == 2 and rec["result"] == "exit-code"
     assert rec["duration_s"] == 2.5 and rec["unit"] == "mes-demo.job.demo-app.sync.service"
     assert rec["project"] == "demo" and rec["job"] == "demo-app.sync" and rec["prev"] == jobs.GENESIS
+    assert rec["invocation"] == INVOCATION and rec["exec"] == "/x/.venv/bin/demo --json sync"
     assert "argv" not in rec  # root reads nothing from the project's files
     code, data = mes(capsys, "jobs", "log", "--verify", "--project", "demo", "--server-root", str(server_root))
-    assert code == 0 and data["records"] == 1
+    assert code == 0 and data["records"] == 1 and data["anchored"] is True
+    # The same run cannot be recorded twice.
+    code, data = mes(capsys, "jobs", "record", "--project", "demo", "--server-root", str(server_root), "demo-app.sync")
+    assert code == 5 and data["error"]["code"] == "already_recorded"
+
+
+def test_record_ignores_a_project_writable_environment(server_root, capsys, monkeypatch):
+    """Finding 4: root used to read SERVICE_RESULT and friends from its environment, which came
+    with the job's settings. Now only systemd's properties count."""
+    _systemd_env(monkeypatch, status="0", result="success")
+    monkeypatch.setenv("SERVICE_RESULT", "exit-code")
+    monkeypatch.setenv("EXIT_STATUS", "99")
+    code, data = mes(capsys, "jobs", "record", "--project", "demo", "--server-root", str(server_root), "demo-app.sync")
+    assert code == 0 and data["result"] == "success" and data["exit_code"] == 0
+
+
+def test_cut_or_emptied_server_log_is_caught_by_its_anchor(server_root, capsys, monkeypatch):
+    """Audit F5: the unkeyed chain still verified after the log was cut or emptied."""
+    _systemd_env(monkeypatch)
+    log = paths.server_layout("demo", server_root).run_log
+    for inv in ("a" * 32, "b" * 32):
+        monkeypatch.setattr(jobs, "_show", lambda unit, *p, inv=inv: {
+            "InvocationID": inv, "Result": "success", "ExecMainCode": "1", "ExecMainStatus": "0",
+            "ActiveState": "deactivating"})
+        assert mes(capsys, "jobs", "record", "--project", "demo", "--server-root", str(server_root), "demo-app.sync")[0] == 0
+    lines = log.read_bytes().splitlines(keepends=True)
+    log.write_bytes(lines[0])  # cut the newest record off: the chain alone still verifies
+    assert jobs.verify_log(log)["records"] == 1
+    code, data = mes(capsys, "jobs", "log", "--verify", "--project", "demo", "--server-root", str(server_root))
+    assert code == 1 and data["error"]["code"] == "run_log_broken"
+    log.write_bytes(b"")
+    code, data = mes(capsys, "jobs", "log", "--verify", "--project", "demo", "--server-root", str(server_root))
+    assert code == 1
 
 
 def test_record_killed_job_has_no_exit_code(server_root, capsys, monkeypatch):
-    _systemd_env(monkeypatch, result="timeout")
-    monkeypatch.setenv("EXIT_CODE", "killed")
-    monkeypatch.setenv("EXIT_STATUS", "TERM")
+    _systemd_env(monkeypatch, result="timeout", code="2", status="15")
     code, data = mes(capsys, "jobs", "record", "--project", "demo", "--server-root", str(server_root), "demo-app.sync")
     assert code == 0 and data["exit_code"] is None and data["result"] == "timeout"
 
 
 def test_forged_systemd_record_is_refused(server_root, capsys, monkeypatch):
-    for k, v in {"SERVICE_RESULT": "success", "EXIT_CODE": "exited", "EXIT_STATUS": "0"}.items():
-        monkeypatch.setenv(k, v)
     argv = ("jobs", "record", "--project", "demo", "--server-root", str(server_root), "demo-app.sync")
     monkeypatch.setattr(jobs, "_is_linux", lambda: False)
     code, data = mes(capsys, *argv)
     assert code == 5 and data["error"]["code"] == "not_from_systemd"
-    monkeypatch.setattr(jobs, "_is_linux", lambda: True)
-    monkeypatch.setenv("INVOCATION_ID", "not-hex")
+    _systemd_env(monkeypatch, state="inactive")  # nobody is just finishing a run
     code, data = mes(capsys, *argv)
     assert code == 5
-    monkeypatch.setenv("INVOCATION_ID", INVOCATION)
-    monkeypatch.setattr(jobs, "_show", lambda unit, *p: {"InvocationID": "f" * 32})
+    monkeypatch.setattr(jobs, "_show", lambda unit, *p: {"InvocationID": "not-hex", "ActiveState": "deactivating"})
     code, data = mes(capsys, *argv)
     assert code == 5
     assert not paths.server_layout("demo", server_root).run_log.exists()
@@ -590,44 +619,83 @@ class FakeRun:
         return subprocess.CompletedProcess(argv, self.code, "", "Unit not loaded." if self.code else "")
 
 
-def test_allow_network_sets_only_the_hosts_and_nameservers(tmp_path):
-    resolv = tmp_path / "resolv.conf"
-    resolv.write_text("# comment\nnameserver 127.0.0.53\nnameserver fe80::1%eth0\nnameserver not-an-ip\n"
-                      "search example.com\n")
+def test_allow_network_sets_only_the_hosts_and_no_nameservers(tmp_path):
+    """Finding 9: name servers were opened on every port; resolved addresses on this computer or the
+    local network were allowed. Now: internet addresses only, written to the job's own hosts file."""
     run = FakeRun()
-    res = jobs.allow_network(
-        "mes-demo.job.demo-app.sync.service", ["api.example.com", "cdn.example.com"],
-        resolver=_resolver({"api.example.com": ["203.0.113.5", "203.0.113.5", "2001:db8::5", "0.0.0.0", "224.0.0.1"],
-                            "cdn.example.com": ["198.51.100.7"]}),
-        resolv_conf=str(resolv), run=run,
-    )
+    hosts_file = "/run/mes-demo-net/demo-app.sync/hosts"
+    written = {}
+    real_write = jobs._write_hosts_file
+
+    def capture(path, unit, found):
+        written.update(path=path, found=found)
+
+    jobs._write_hosts_file = capture
+    try:
+        res = jobs.allow_network(
+            "mes-demo.job.demo-app.sync.service", ["api.example.com", "cdn.example.com"],
+            resolver=_resolver({"api.example.com": ["93.184.216.34", "93.184.216.34", "2606:2800:220:1::1", "0.0.0.0",
+                                                    "224.0.0.1", "127.0.0.1", "10.1.2.3", "169.254.169.254",
+                                                    "::ffff:127.0.0.1"],
+                                "cdn.example.com": ["151.101.1.1"]}),
+            hosts_file=hosts_file, run=run,
+        )
+    finally:
+        jobs._write_hosts_file = real_write
     assert run.calls == [["systemctl", "set-property", "--runtime", "mes-demo.job.demo-app.sync.service", "IPAddressAllow=",
-                          "IPAddressAllow=203.0.113.5 2001:db8::5 198.51.100.7 127.0.0.53 fe80::1"]]
-    assert res["allowed"] == ["203.0.113.5", "2001:db8::5", "198.51.100.7", "127.0.0.53", "fe80::1"]
+                          "IPAddressAllow=93.184.216.34 2606:2800:220:1::1 151.101.1.1"]]
+    assert res["allowed"] == ["93.184.216.34", "2606:2800:220:1::1", "151.101.1.1"]
+    assert written["found"] == {"api.example.com": ["93.184.216.34", "2606:2800:220:1::1"],
+                                "cdn.example.com": ["151.101.1.1"]}
+
+
+def test_local_network_hosts_may_be_private_but_never_this_computer():
+    look = _resolver({"nas.home.arpa": ["192.168.1.20", "127.0.0.1", "169.254.1.1", "fd00::5"],
+                      "api.example.com": ["10.0.0.9", "93.184.216.34"]})
+    found = jobs.resolve_hosts(["nas.home.arpa", "api.example.com"], resolver=look, local=["nas.home.arpa"])
+    assert found == {"nas.home.arpa": ["192.168.1.20", "fd00::5"], "api.example.com": ["93.184.216.34"]}
+
+
+def test_hosts_file_is_only_the_jobs_own(tmp_path, monkeypatch):
+    with pytest.raises(UsageError):
+        jobs._write_hosts_file("/etc/hosts", "mes-demo.job.demo-app.sync.service", {})
+    with pytest.raises(UsageError):
+        jobs._write_hosts_file("/run/mes-other-net/demo-app.sync/hosts", "mes-demo.job.demo-app.sync.service", {})
+    with pytest.raises(UsageError):
+        jobs._write_hosts_file("/run/mes-demo-net/../x/hosts", "mes-demo.job.demo-app.sync.service", {})
+    import re
+
+    target = tmp_path / "mes-demo-net" / "demo-app.sync" / "hosts"
+    monkeypatch.setattr(jobs, "_HOSTS_FILE_RE", re.compile(
+        re.escape(str(tmp_path)) + r"/mes-(?P<project>[a-z]+)-net/(?P<app>[a-z-]+)\.(?P<job>[a-z]+)/hosts\Z"))
+    jobs._write_hosts_file(str(target), "mes-demo.job.demo-app.sync.service", {"api.example.com": ["93.184.216.34"]})
+    lines = target.read_text().splitlines()
+    assert lines[1:] == ["127.0.0.1 localhost", "::1 localhost", "93.184.216.34 api.example.com"]
+    assert oct(target.stat().st_mode & 0o777) == "0o644"
 
 
 def test_allow_network_with_some_hosts_unknown(tmp_path):
     run = FakeRun()
     res = jobs.allow_network("mes-demo.job.demo-app.sync.service", ["api.example.com", "gone.example.com"],
-                             resolver=_resolver({"api.example.com": ["203.0.113.5"]}),
-                             resolv_conf=str(tmp_path / "none"), run=run)
-    assert res["allowed"] == ["203.0.113.5"]
+                             resolver=_resolver({"api.example.com": ["93.184.216.34"]}), run=run)
+    assert res["allowed"] == ["93.184.216.34"] and res["unreachable"] == ["gone.example.com"]
 
 
 def test_allow_network_dns_failure_is_temporary(tmp_path):
     run = FakeRun()
     with pytest.raises(TemporaryFailure) as e:
-        jobs.allow_network("mes-demo.job.demo-app.sync.service", ["api.example.com"], resolver=_resolver({}),
-                           resolv_conf=str(tmp_path / "none"), run=run)
+        jobs.allow_network("mes-demo.job.demo-app.sync.service", ["api.example.com"], resolver=_resolver({}), run=run)
     assert e.value.code == "dns_failed" and e.value.exit_code == 75
     assert run.calls == []  # nothing was allowed
+    with pytest.raises(TemporaryFailure):  # only loopback: nothing it may reach
+        jobs.allow_network("mes-demo.job.demo-app.sync.service", ["api.example.com"],
+                           resolver=_resolver({"api.example.com": ["127.0.0.1"]}), run=run)
 
 
 def test_allow_network_systemd_failure(tmp_path):
     with pytest.raises(MesError) as e:
         jobs.allow_network("mes-demo.job.demo-app.sync.service", ["api.example.com"],
-                           resolver=_resolver({"api.example.com": ["203.0.113.5"]}),
-                           resolv_conf=str(tmp_path / "none"), run=FakeRun(1))
+                           resolver=_resolver({"api.example.com": ["93.184.216.34"]}), run=FakeRun(1))
     assert e.value.code == "systemd_failed" and "Unit not loaded." in e.value.detail
 
 
@@ -638,17 +706,17 @@ def test_allow_network_systemd_failure(tmp_path):
 def test_allow_network_only_for_job_units(unit, tmp_path):
     run = FakeRun()
     with pytest.raises(UsageError):
-        jobs.allow_network(unit, ["api.example.com"], resolver=_resolver({"api.example.com": ["203.0.113.5"]}),
-                           resolv_conf=str(tmp_path / "none"), run=run)
+        jobs.allow_network(unit, ["api.example.com"], resolver=_resolver({"api.example.com": ["93.184.216.34"]}),
+                           run=run)
     assert run.calls == []
 
 
-@pytest.mark.parametrize("host", ["api.example.com\nIPAddressAllow=any", "evil host", "1.2.3.4/0", "*", "-x", ""])
+@pytest.mark.parametrize("host", ["api.example.com\nIPAddressAllow=any", "evil host", "1.2.3.4/0", "*", "-x", "",
+                                  "0x7f.0.0.1", "0x7f.1", "2130706433", "127.1"])
 def test_allow_network_refuses_hostile_hosts(host, tmp_path):
     run = FakeRun()
     with pytest.raises(MesError) as e:
-        jobs.allow_network("mes-demo.job.demo-app.sync.service", [host], resolver=_resolver({host: ["0.0.0.0"]}),
-                           resolv_conf=str(tmp_path / "none"), run=run)
+        jobs.allow_network("mes-demo.job.demo-app.sync.service", [host], resolver=_resolver({host: ["93.184.216.34"]}), run=run)
     assert e.value.code == "unsafe_unit_value"
     assert run.calls == []
 
@@ -656,8 +724,8 @@ def test_allow_network_refuses_hostile_hosts(host, tmp_path):
 def test_resolver_answers_are_validated():
     def liar(host, port, family, kind):
         return [(socket.AF_INET, kind, 6, "", ("any",)), (socket.AF_INET, kind, 6, "", ("10.0.0.1 0.0.0.0/0",)),
-                (socket.AF_INET, kind, 6, "", ()), (socket.AF_INET, kind, 6, "", ("192.0.2.1", 443))]
-    assert jobs.resolve_hosts(["api.example.com"], resolver=liar) == ["192.0.2.1"]
+                (socket.AF_INET, kind, 6, "", ()), (socket.AF_INET, kind, 6, "", ("93.184.216.34", 443))]
+    assert jobs.resolve_hosts(["api.example.com"], resolver=liar) == {"api.example.com": ["93.184.216.34"]}
 
 
 def test_allow_network_command_needs_admin_and_hosts(capsys, monkeypatch):
@@ -705,9 +773,33 @@ def test_job_problems_unit():
 
 
 def test_job_program_of_another_app_is_refused(project_root, capsys, monkeypatch):
-    monkeypatch.setenv("FAKE_APP_NAME", "other")
+    exe = project_root / ".venv" / "bin" / "demo-app"
+    exe.write_text(exe.read_text().replace('os.environ.get("FAKE_APP_NAME", "demo-app")', '"other"'))
     code, data = mes(capsys, "jobs", "run", "export", "--project-dir", str(project_root))
     assert code == 5 and data["error"]["code"] == "app_mismatch"
+
+
+def test_a_job_on_this_computer_gets_no_secrets_from_the_shell(project_root, capsys, monkeypatch):
+    """Audit F12: 'mes jobs run' passed the whole environment (SSH agent, hosting tokens) to the job."""
+    exe = project_root / ".venv" / "bin" / "demo-app"
+    exe.write_text(exe.read_text().replace('os.environ.get("FAKE_APP_NAME", "demo-app")',
+                                           '"demo-app" if not (os.environ.get("SSH_AUTH_SOCK") or '
+                                           'os.environ.get("CLOUDFLARE_API_TOKEN")) else "leaked"'))
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/agent.sock")
+    monkeypatch.setenv("CLOUDFLARE_API_TOKEN", "secret")
+    code, data = mes(capsys, "jobs", "run", "export", "--project-dir", str(project_root))
+    assert code == 0, data
+
+
+def test_jobs_list_can_skip_running_project_code(project_root, capsys, monkeypatch):
+    exe = project_root / ".venv" / "bin" / "demo-app"
+    exe.write_text(exe.read_text().replace("import json, os, sys, time\n", "import json, os, sys, time\n"
+                                           "open(%r, 'w').close()\n" % str(project_root / "ran")))
+    code, data = mes(capsys, "jobs", "list", "--no-describe", "--project-dir", str(project_root))
+    assert code == 0 and not (project_root / "ran").exists()
+    assert any("--no-describe" in w for w in data["warnings"])
+    code, data = mes(capsys, "jobs", "list", "--project-dir", str(project_root))
+    assert code == 0 and (project_root / "ran").exists()  # the check itself does run the app
 
 
 def test_failed_job_text_shows_what_the_app_said(tmp_path, capsys):

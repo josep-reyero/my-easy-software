@@ -54,8 +54,15 @@ bundles), `store/` (buckets).
 Two accounts per project, both without a password and without sudo:
 
 - `mes-<project>`: owns code, data and state; runs the jobs and the SSH gate.
-- `mes-<project>-web`: runs only the dashboard server; can read `ui/` and nothing else of the
-  project (not the data, not the state, not saved logins); no network except its own unix socket.
+- `mes-<project>-web`: runs only the dashboard server; can read `ui/` and write its own sign-in
+  folder `auth/` (beside `ui/`, `mes-<project>-web` 0700) and nothing else of the project (not the
+  data, not the state); no network except its own unix socket.
+
+Folders (`/var/lib/mes/<project>/`, root's 0711): `code data state store gate webhook backups`
+(`mes-<project>` 0700), `ui ui/data ui/specs` (`mes-<project>`, group web, 2750), `auth` (web
+account 0700), `etc home home/.ssh log` (root, group `mes-<project>`, 0750; files 0640). Every
+unit that runs project code sees only its own project's folders (`TemporaryFileSystem=` over
+`/var/lib/mes` plus binds), never `auth/`, `gate/` or the gate's sockets.
 
 Nothing runs as the owner's own user or as root. Units are **system** units (so the sandbox
 directives are really enforced) with `User=mes-<project>` / `User=mes-<project>-web`.
@@ -67,7 +74,9 @@ without root. `mes server remove <project>` renders the matching removal script.
 
 Remote access is only SSH to `mes-<project>` with keys whose `authorized_keys` line forces
 `mes gate --project <project> --allow read|write|deploy` and disables forwarding, pty and agent.
-Admin commands never pass the gate.
+Admin commands never pass the gate. The `deploy` level runs only the mes operations; deploys and rollbacks
+also need a separate signing key. `mes server selftest <project>` proves the sandboxes on the
+server; `mes server analyze` writes systemd's own checks.
 
 ## 4. What each repo finishes in this round
 
@@ -78,16 +87,22 @@ Admin commands never pass the gate.
 - `mes dev`: runs the project locally: watches files, runs `easy-ui preview`, prints one URL.
 - `mes server plan|check|remove` as in section 3, including system units for jobs, the
   `refresh_after` unit and the dashboard socket and service (rendered by calling `easy-ui units`).
-- `mes deploy <host>`: packs the project (git-tracked files only), signs the archive with
-  `ssh-keygen -Y sign` (OpenSSH signatures, Ed25519), sends it through the gate's `deploy` level;
-  the server verifies the signature against the project's `allowed_signers`, unpacks with a hardened
-  extractor into a new release, runs `uv sync --frozen`, switches `current` atomically, publishes
-  dashboards, keeps 5 releases, and can roll back. `--dry-run` shows every step.
-- Gate: full isolation per request with `systemd-run` properties when available on Linux, the
-  existing limits otherwise; `--allow deploy` level.
-- Job network limits: `network = [hosts]` enforced on Linux system units with
-  `IPAddressDeny=any` plus resolved `IPAddressAllow=` refreshed before each run, stated honestly
-  where it cannot be enforced.
+- `mes deploy <host>`: exports the last commit from git's objects (and sibling path dependencies),
+  builds their wheels on the client, signs the archive with `ssh-keygen -Y sign` (OpenSSH
+  signatures, Ed25519, namespace `mes-deploy`) with a signing key that is never the login key,
+  sends it through the gate's `deploy` level; the server verifies the signature against the
+  project's `allowed_signers`, unpacks with a hardened extractor into a new release, runs `uv sync
+  --frozen --no-build` and installs the wheels offline in the deploy sandbox, describes the apps
+  in a read sandbox, records the release as complete, switches `current` atomically, publishes
+  dashboards, keeps 5 releases, and can roll back with a signed, replay-protected request
+  (namespace `mes-rollback`). `--dry-run` shows every step.
+- Gate: on a server the SSH side runs no project code; every request runs in a socket-activated
+  sandbox per level that checks its peer (an SSH session of the project's account). A server
+  without the sockets refuses. The `deploy` level runs only the mes operations.
+- Job network limits: `network = [hosts]` (and `local_network`) enforced on Linux system units with
+  `IPAddressDeny=any` plus resolved internet-only `IPAddressAllow=` refreshed before each run by a
+  root helper that also writes the job's own pinned hosts file (no name server for jobs), stated
+  honestly where it cannot be enforced.
 - `mes expose <project>`: builds a static export through `easy-ui export` and sends it to a hosting
   adapter. Adapters: Cloudflare Pages (first, complete), then Vercel, Netlify, GitHub Pages,
   Render, each behind one small interface; modes `people` (provider access control where the

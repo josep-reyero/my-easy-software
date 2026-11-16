@@ -19,10 +19,16 @@ Used by the system units on a server (admin; they run as root, take only names a
 and read nothing from the project's files):
 
 ``mes jobs record --project P --server-root R <job id>``
-    after each run (``ExecStopPost=+``): appends the run to ``<R>/<P>/log/runs.jsonl``.
-``mes jobs allow-network --unit U -- <host>...``
-    before each run of a job that lists hosts: looks the hosts up and sets the job unit's
-    ``IPAddressAllow=`` (the job unit itself has ``IPAddressDeny=any``).
+    after each run (``ExecStopPost=+``, with an empty environment and ``python -I``): reads the
+    run's result from systemd's own properties (``systemctl show``), appends it to
+    ``<R>/<P>/log/runs.jsonl`` (with the invocation, the release and the command line) and
+    rewrites the anchor ``runs.jsonl.head`` (record count and newest hash).
+``mes jobs allow-network --unit U [--hosts-file F] [--local H]... -- <host>...``
+    before each run of a job that lists hosts: looks the hosts up, keeps only internet
+    addresses (local-network ones only for ``--local`` hosts; never this computer, link-local or
+    multicast), writes the job's own hosts file and sets the job unit's ``IPAddressAllow=`` to
+    exactly those addresses (the job unit itself has ``IPAddressDeny=any``). No name server is
+    opened to the job.
 
 Run log
 -------
@@ -36,7 +42,10 @@ One JSON object per line, per run::
 ``start-failed`` (and whatever else systemd reports). ``prev`` is the SHA-256 (hex) of the
 previous line's exact bytes, without its newline; the first record uses ``GENESIS`` (64 zeros).
 Changing or removing any line other than the last breaks the chain, and ``mes jobs log
---verify`` says where.
+--verify`` says where. The chain alone has no key, so on a personal computer it shows mistakes,
+not a determined edit. On a server root also writes the anchor ``runs.jsonl.head`` after every
+record; ``mes jobs log --verify --server-root`` then also catches a log that was cut, emptied or
+rewritten as a whole.
 
 Public API (besides ``register``)
 ---------------------------------
@@ -51,7 +60,8 @@ Public API (besides ``register``)
 ``rebuild_apps(root, project, *, app=None) -> list[dict]``  ``mes db rebuild``
 ``append_record(log_path, record) -> dict``     adds ``prev`` and writes one line
 ``read_log(log_path) -> list[dict]``, ``verify_log(log_path) -> dict``
-``resolve_hosts(hosts, *, resolver=None) -> list[str]``  addresses for ``allow-network``
+``resolve_hosts(hosts, *, resolver=None, local=()) -> dict[host, list[str]]``  addresses for ``allow-network``
+``address_allowed(addr, *, local) -> bool``, ``write_head(log_path)``, ``check_head(log_path, result)``
 ``nameservers(path="/etc/resolv.conf") -> list[str]``
 """
 
@@ -66,7 +76,6 @@ import ipaddress
 import json
 import os
 import re
-import shutil
 import signal
 import socket
 import stat
@@ -131,9 +140,21 @@ def app_command(root: Path, project: Project, app: str) -> list[str]:
     return [str(exe)]
 
 
+# What a job (or an app asked to describe itself) gets from the person's environment on this
+# computer: only what it needs to find its folders and show times and text. Never SSH_AUTH_SOCK,
+# hosting tokens or anything else the person's shell happens to hold.
+_KEEP_ENV = (
+    "PATH", "HOME", "USER", "LOGNAME", "TZ", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR",
+    "MES_DATA_HOME", "MES_STATE_HOME", "MES_CONFIG", "MES_PROJECT", "MES_DATA_DIR", "MES_STATE_DIR",
+    "MES_STORE_DIR", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME",
+)
+
+
 def _job_env(project: Project, allow: str, job: Job | None = None, root: Path | None = None) -> dict[str, str]:
-    env = dict(os.environ)
+    env = {k: os.environ[k] for k in _KEEP_ENV if k in os.environ}
+    env.setdefault("PATH", "/usr/bin:/bin")
     env.update({
+        "PYTHONNOUSERSITE": "1",
         "MES_ALLOW": allow,
         "MES_DATA_HOME": str(paths.data_home()),
         "MES_STATE_HOME": str(paths.state_home()),
@@ -656,23 +677,32 @@ def _not_from_systemd() -> Refused:
     )
 
 
+def _exec_text(props: dict[str, str]) -> str | None:
+    m = re.search(r"argv\[\]=(.*?) ;", props.get("ExecStart", ""))
+    return m.group(1)[:2000] if m else None
+
+
 def record_systemd_run(project_name: str, job_name: str, server_root: str | Path) -> dict[str, Any]:
-    """Called as root by systemd (ExecStopPost=+) after each run. Only names come in."""
+    """Called as root by systemd (ExecStopPost=+) after each run, with an empty environment: only
+    names come in, and everything about the run is read from systemd's own properties."""
     layout = paths.server_layout(project_name, server_root)
     if not manifest_mod.JOB_ID_RE.fullmatch(job_name or ""):
         raise UsageError(f"{str(job_name)[:70]!r} is not a job id.", hint="Use the job's id: <app>.<job>.")
     unit = units.job_unit(project_name, job_name)
-    invocation = os.environ.get("INVOCATION_ID", "")
-    if not _is_linux() or not _INVOCATION_RE.match(invocation) or not os.environ.get("SERVICE_RESULT"):
+    if not _is_linux():
         raise _not_from_systemd()
-    if _show(unit, "InvocationID").get("InvocationID") != invocation:
+    props = _show(unit, "InvocationID", "Result", "ExecMainCode", "ExecMainStatus", "ActiveState",
+                  "ExecMainStartTimestampMonotonic", "ExecMainExitTimestampMonotonic", "ExecStart")
+    invocation = props.get("InvocationID", "")
+    # While ExecStopPost runs, the unit is "deactivating"; any other time, nobody just finished a run.
+    if not _INVOCATION_RE.match(invocation) or props.get("ActiveState") != "deactivating":
         raise _not_from_systemd()
-    result = os.environ.get("SERVICE_RESULT") or "unknown"
-    exit_kind = os.environ.get("EXIT_CODE")
-    exit_status = os.environ.get("EXIT_STATUS")
-    exit_code = int(exit_status) if exit_kind == "exited" and (exit_status or "").isdigit() else None
+    result = props.get("Result") or "unknown"
+    if not re.fullmatch(r"[a-z-]{1,40}", result):
+        result = "unknown"
+    code, status = props.get("ExecMainCode"), props.get("ExecMainStatus", "")
+    exit_code = int(status) if code == "1" and status.isdigit() else None  # 1 = CLD_EXITED
     duration = None
-    props = _show(unit, "ExecMainStartTimestampMonotonic", "ExecMainExitTimestampMonotonic")
     try:
         start = int(props.get("ExecMainStartTimestampMonotonic", ""))
         end = int(props.get("ExecMainExitTimestampMonotonic", ""))
@@ -689,17 +719,68 @@ def record_systemd_run(project_name: str, job_name: str, server_root: str | Path
     if st is None or not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
         raise Refused("The run log folder does not belong to the account writing the log, so nothing was written.",
                       hint="Run 'mes server plan' and its script again to repair the folders.", code="unsafe_folder")
+    if any(r.get("invocation") == invocation for r in read_log(log)[-500:]):
+        raise Refused("This run is already in the run log, so it was not added twice.",
+                      hint="Nothing to do.", code="already_recorded")
+    try:
+        release_link = os.readlink(layout.current)
+    except OSError:
+        release_link = ""
+    m = re.fullmatch(r"releases/([0-9]{1,9})", release_link)
     rec = append_record(log, {
         "time": _now(),
         "project": project_name,
+        "app": job_name.split(".", 1)[0],
         "job": job_name,
         "via": "systemd",
         "unit": unit,
+        "invocation": invocation,
+        "release": int(m.group(1)) if m else None,
+        "exec": _exec_text(props),
         "exit_code": exit_code,
         "result": result,
         "duration_s": duration,
     })
+    write_head(log)
     return {k: rec[k] for k in ("time", "job", "result", "exit_code", "duration_s")}
+
+
+HEAD_SUFFIX = ".head"
+
+
+def write_head(log_path: Path) -> dict[str, Any]:
+    """Anchor the chain: the number of records and the newest hash, in a file next to the log
+    (root's on a server). A log that was cut, emptied or re-linked no longer matches it."""
+    lines = _log_lines(log_path)
+    head = {"records": len(lines), "head": _line_hash(lines[-1]) if lines else None}
+    tmp = log_path.with_name(log_path.name + HEAD_SUFFIX + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o640)
+    with os.fdopen(fd, "w", encoding="ascii") as f:
+        json.dump(head, f)
+    os.replace(tmp, log_path.with_name(log_path.name + HEAD_SUFFIX))
+    return head
+
+
+def check_head(log_path: Path, result: dict[str, Any]) -> dict[str, Any]:
+    head_path = log_path.with_name(log_path.name + HEAD_SUFFIX)
+    try:
+        head = json.loads(head_path.read_text(encoding="ascii"))
+    except (OSError, ValueError):
+        return {**result, "anchored": False,
+                "note": result["note"] + " There is no anchor file next to this log, so a cut or emptied log "
+                "cannot be told apart from a short one (this is so on a personal computer)."}
+    if not isinstance(head, dict) or head.get("records") != result["records"] or head.get("head") != result["head"]:
+        raise MesError(
+            f"The run log ({log_path}) does not match its anchor: the anchor says {head.get('records')} records, the "
+            f"log has {result['records']}. Records were removed, or the log was replaced.",
+            hint="Do not delete the files: keep them as evidence, and ask someone you trust to look at this server.",
+            code="run_log_broken")
+    return {**result, "anchored": True, "note": "The log matches its anchor (written by root after every run): "
+            "no record was changed, removed or cut off."}
+
+
+_HOSTS_FILE_RE = re.compile(r"^/run/mes-(?P<project>[a-z][a-z0-9-]{1,30})-net/(?P<app>[a-z][a-z0-9-]{1,30})\."
+                            r"(?P<job>[a-z][a-z0-9-]{0,30})/hosts\Z")
 
 
 def nameservers(path: str = "/etc/resolv.conf") -> list[str]:
@@ -718,44 +799,86 @@ def nameservers(path: str = "/etc/resolv.conf") -> list[str]:
     return list(dict.fromkeys(out))
 
 
-def resolve_hosts(hosts: Sequence[str], *, resolver: Callable[..., Any] | None = None) -> list[str]:
-    """Every address the hosts have now (IPv4 and IPv6), validated as addresses."""
+def address_allowed(addr: ipaddress.IPv4Address | ipaddress.IPv6Address, *, local: bool) -> bool:
+    """Internet addresses only; a host listed in local_network may also be on the local network.
+    This computer, link-local (cloud metadata), multicast and reserved addresses never."""
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        addr = addr.ipv4_mapped
+    if addr.is_unspecified or addr.is_multicast or addr.is_loopback or addr.is_link_local or addr.is_reserved:
+        return False
+    if addr.is_global:
+        return True
+    return local and addr.is_private
+
+
+def resolve_hosts(hosts: Sequence[str], *, resolver: Callable[..., Any] | None = None,
+                  local: Sequence[str] = ()) -> dict[str, list[str]]:
+    """Every address each host has now (IPv4 and IPv6) that it may be reached at."""
     look = resolver or socket.getaddrinfo
-    found: list[str] = []
+    found: dict[str, list[str]] = {}
+    local_set = set(units.check_hosts(list(local)))
     for host in units.check_hosts(list(hosts)):
+        out: list[str] = []
         try:
             infos = look(host, 443, 0, socket.SOCK_STREAM)
         except (OSError, UnicodeError):
-            continue
+            infos = []
         for info in infos[:64]:
             try:
                 addr = ipaddress.ip_address(str(info[4][0]).split("%", 1)[0])
             except (ValueError, IndexError, TypeError):
                 continue
-            if addr.is_unspecified or addr.is_multicast:
-                continue
-            found.append(str(addr))
-    return list(dict.fromkeys(found))
+            if address_allowed(addr, local=host in local_set):
+                out.append(str(addr))
+        found[host] = list(dict.fromkeys(out))
+    return found
+
+
+def _write_hosts_file(path: str, unit: str, found: dict[str, list[str]]) -> None:
+    m = _HOSTS_FILE_RE.fullmatch(path or "")
+    u = units.JOB_UNIT_RE.fullmatch(unit)
+    if not m or not u or m.group("project", "app", "job") != u.group("project", "app", "job"):
+        raise UsageError(f"{str(path)[:80]!r} is not the hosts file of {unit}.",
+                         hint="Use /run/mes-<project>-net/<app>.<job>/hosts")
+    lines = ["# Written by mes jobs allow-network before each run: the only names this job can look up.",
+             "127.0.0.1 localhost", "::1 localhost"]
+    for host, addrs in found.items():
+        lines += [f"{a} {host}" for a in addrs]
+    target = Path(path)
+    target.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    tmp = target.with_name(f".hosts.{os.getpid()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o644)
+    with os.fdopen(fd, "w", encoding="ascii") as f:
+        f.write("\n".join(lines) + "\n")
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, target)
 
 
 def allow_network(unit: str, hosts: Sequence[str], *, resolver: Callable[..., Any] | None = None,
-                  resolv_conf: str = "/etc/resolv.conf", run: Callable[..., Any] | None = None) -> dict[str, Any]:
+                  local: Sequence[str] = (), hosts_file: str | None = None,
+                  run: Callable[..., Any] | None = None) -> dict[str, Any]:
     if not isinstance(unit, str) or not units.JOB_UNIT_RE.fullmatch(unit):
         raise UsageError(f"{str(unit)[:80]!r} is not the unit of a mes job.", hint="Use mes-<project>.job.<app>.<job>.service")
     if not hosts:
         raise UsageError("No hosts were given, so nothing would be allowed.", hint="List the job's hosts after --.")
-    addresses = resolve_hosts(hosts, resolver=resolver)
+    if any(h not in hosts for h in local):
+        raise UsageError("A --local host is not in the list of hosts.", hint="List it after -- as well.")
+    found = resolve_hosts(hosts, resolver=resolver, local=local)
+    addresses = list(dict.fromkeys(a for addrs in found.values() for a in addrs))
     if not addresses:
         raise TemporaryFailure(
-            f"None of the job's hosts ({', '.join(hosts)}) could be looked up, so the job was not allowed to reach "
-            "anything and will not start this time.",
-            hint="Check the server's internet connection; the job runs again at its next time.",
+            f"None of the job's hosts ({', '.join(hosts)}) could be looked up to an address it may reach, so the job "
+            "was not allowed to reach anything and will not start this time.",
+            hint="Check the server's internet connection; the job runs again at its next time. A host on your own "
+            "network belongs in local_network in the app's app.toml.",
             code="dns_failed",
         )
-    allowed = addresses + [a for a in nameservers(resolv_conf) if a not in addresses]
-    argv = ["systemctl", "set-property", "--runtime", unit, "IPAddressAllow=", "IPAddressAllow=" + " ".join(allowed)]
+    if hosts_file is not None:
+        _write_hosts_file(hosts_file, unit, found)
+    # No name servers are opened: the job's own hosts file is its only name lookup.
+    argv = ["systemctl", "set-property", "--runtime", unit, "IPAddressAllow=", "IPAddressAllow=" + " ".join(addresses)]
     runner = run or (lambda a: subprocess.run(a, capture_output=True, text=True, timeout=60, check=False,
-                                              stdin=subprocess.DEVNULL))
+                                              stdin=subprocess.DEVNULL, env={"PATH": "/usr/bin:/bin", "LANG": "C"}))
     res = runner(argv)
     if getattr(res, "returncode", 1) != 0:
         raise MesError(
@@ -764,7 +887,8 @@ def allow_network(unit: str, hosts: Sequence[str], *, resolver: Callable[..., An
             code="systemd_failed",
             detail=(getattr(res, "stderr", "") or "").strip()[:500] or None,
         )
-    return {"unit": unit, "hosts": list(hosts), "allowed": allowed}
+    dropped = [h for h, a in found.items() if not a]
+    return {"unit": unit, "hosts": list(hosts), "allowed": addresses, "unreachable": dropped}
 
 
 # --------------------------------------------------------------------------- command handlers
@@ -773,7 +897,15 @@ def allow_network(unit: str, hosts: Sequence[str], *, resolver: Callable[..., An
 def _cmd_list(args: argparse.Namespace) -> Any:
     check_allowed("read")
     root, project = load_project(args.project_dir)
-    warnings = _check_warnings(root, project)
+    # Checking the jobs' commands asks each app to describe itself, which runs the project's own
+    # code (as a read command). --no-describe skips that; root never does it.
+    if args.no_describe:
+        warnings = ["The jobs' commands were not checked (--no-describe)."]
+    elif os.geteuid() == 0:
+        warnings = ["The jobs' commands were not checked: that runs the project's own code, which mes never does "
+                    "as root. Run 'mes jobs list' as your own account to check them."]
+    else:
+        warnings = _check_warnings(root, project)
     if args.json:
         return {"project": project.name, "jobs": [{**j.to_dict(), "when": _when(j)} for j in project.jobs.values()],
                 "disabled": list(project.disabled), "warnings": warnings}
@@ -844,6 +976,8 @@ def _cmd_log(args: argparse.Namespace) -> Any:
         path, name = _log_path(project), project.name
     if args.verify:
         result = verify_log(path)
+        if args.server_root:
+            result = check_head(path, result)
         if args.json:
             return result
         return f"{result['message']}\n{result['note']}"
@@ -922,7 +1056,7 @@ def _cmd_record(args: argparse.Namespace) -> Any:
 
 def _cmd_allow_network(args: argparse.Namespace) -> Any:
     check_allowed("admin")
-    return allow_network(args.unit, args.hosts)
+    return allow_network(args.unit, args.hosts, local=args.local, hosts_file=args.hosts_file)
 
 
 def _project_dir_arg(p: argparse.ArgumentParser) -> None:
@@ -939,7 +1073,12 @@ def register(subparsers: Any) -> None:
     )
     sub = jobs.add_subparsers(dest="jobs_command", metavar="<action>")
 
-    p = sub.add_parser("list", help="The project's jobs, when they run and their limits.")
+    p = sub.add_parser("list", help="The project's jobs, when they run and their limits.",
+                       description="Lists the jobs of every installed app and checks each job's command by asking the "
+                       "app to describe itself, which runs the project's own code as a read command (never as "
+                       "root). --no-describe skips that check.")
+    p.add_argument("--no-describe", action="store_true",
+                   help="do not ask the apps for their commands (runs no project code)")
     _project_dir_arg(p)
     p.set_defaults(func=_cmd_list)
 
@@ -975,5 +1114,9 @@ def register(subparsers: Any) -> None:
     p = sub.add_parser("allow-network", help="(Used by the server's system units before a run.) Let a job reach "
                        "only its hosts.")
     p.add_argument("--unit", required=True, help="the job's unit, mes-<project>.job.<app>.<job>.service")
+    p.add_argument("--hosts-file", default=None,
+                   help="the job's own hosts file, /run/mes-<project>-net/<app>.<job>/hosts")
+    p.add_argument("--local", action="append", default=[], metavar="HOST",
+                   help="a host that may be on the local network (local_network in the app's app.toml)")
     p.add_argument("hosts", nargs="+", help="the host names the job may reach")
     p.set_defaults(func=_cmd_allow_network)

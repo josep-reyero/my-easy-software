@@ -25,9 +25,14 @@ Nothing is ever written through a symlink: an existing folder on the way to a ne
 real folder inside the project's folder. The texts live in ``src/mes/templates/project/`` and
 ``src/mes/templates/app/`` and use ``{{placeholder}}`` markers.
 
-my-easy-software is not published yet, so the generated ``pyproject.toml`` gets a
-``[tool.uv.sources]`` entry pointing at a folder holding the framework: the ``--framework-path``
-given, or else the source checkout mes itself runs from.
+The generated ``pyproject.toml`` always names exactly where my-easy-software comes from in
+``[tool.uv.sources]``, so uv never looks the name up in a package index (where anyone could
+publish a package with that name): a folder holding the framework (``--framework-path``, or the
+source checkout mes itself runs from), written relative to the project folder when possible
+(``mes deploy`` sends a sibling folder such as ``../my-easy-software`` along with the project);
+or else the git repository and exact commit the running mes was installed from
+(``--framework-git URL --framework-rev COMMIT``, or what uv recorded when it installed mes).
+Without one of these, no project is created.
 
 Public API
 ----------
@@ -37,10 +42,11 @@ Public API
 ``validate_name(name) -> str``  checks the project name and returns the Python module name.
 ``app_names(project, short) -> (app, package, prefix)``
 ``default_framework_path() -> Path | None``, ``check_framework_path(path) -> Path``
-``render(name, *, title=None, framework_path=None, app_dir=None, short="main") -> dict[str, str]``
+``render(name, *, title=None, framework_path=None, app_dir=None, short="main", framework_git=None) -> dict[str, str]``
 ``sample_data(project) -> bytes``  the SQLite file of made-up data for a composed project.
-``create(name, *, directory=None, title=None, framework_path=None, cwd=None, short="main") -> dict``
+``create(name, *, directory=None, title=None, framework_path=None, framework_git=None, cwd=None, short="main") -> dict``
 ``new_app(name, *, project_dir=None, title=None) -> dict``
+``installed_git_source() -> (url, commit) | None``  where uv installed the running mes from.
 ``format_result(result) -> str``, ``register(subparsers)``
 """
 
@@ -238,12 +244,53 @@ def _source_path(framework: Path, app_dir: Path | None) -> str:
     return Path(os.path.relpath(framework, app_dir)).as_posix()
 
 
-def _uv_sources(source: str | None) -> str:
+_GIT_URL_RE = re.compile(r"^(?:https://[A-Za-z0-9.-]+(?::[0-9]{1,5})?/[A-Za-z0-9._~/-]{1,200}"
+                         r"|ssh://git@[A-Za-z0-9.-]+/[A-Za-z0-9._~/-]{1,200}"
+                         r"|git@[A-Za-z0-9.-]+:[A-Za-z0-9._~/-]{1,200})\Z")
+_COMMIT_RE = re.compile(r"^[0-9a-f]{40}\Z")
+
+
+def check_git_source(url: str, rev: str) -> tuple[str, str]:
+    if not isinstance(url, str) or not _GIT_URL_RE.match(url):
+        raise UsageError(f"{str(url)[:80]!r} is not a git repository address mes accepts.",
+                         hint="Give an https:// or git@ address of the my-easy-software repository.")
+    if not isinstance(rev, str) or not _COMMIT_RE.match(rev):
+        raise UsageError("--framework-rev must be a full commit (40 hexadecimal characters), so the project "
+                         "always gets exactly the framework you checked.",
+                         hint="See it with: git -C <my-easy-software> rev-parse HEAD")
+    return url, rev
+
+
+def installed_git_source() -> tuple[str, str] | None:
+    """The git repository and commit uv recorded when it installed the running mes, if any."""
+    try:
+        from importlib import metadata
+
+        text = metadata.distribution(FRAMEWORK_NAME).read_text("direct_url.json")
+        data = json.loads(text or "null")
+    except Exception:  # noqa: BLE001 - no record means no source
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("vcs_info"), dict):
+        return None
+    vcs = data["vcs_info"]
+    url = str(data.get("url") or "").removeprefix("git+")
+    try:
+        return check_git_source(url, str(vcs.get("commit_id") or "")) if vcs.get("vcs") == "git" else None
+    except UsageError:
+        return None
+
+
+def _uv_sources(source: str | None, git: tuple[str, str] | None = None) -> str:
+    head = ("\n# Where my-easy-software comes from, exactly. uv takes it only from here and never looks the\n"
+            "# name up in a package index, where anyone could publish a package with that name.\n")
+    if git is not None:
+        url, rev = git
+        return (head + "[tool.uv.sources]\n"
+                f"{FRAMEWORK_NAME} = {{ git = {_toml_str(url)}, rev = {_toml_str(rev)} }}\n")
     if source is None:
         return ""
     return (
-        "\n# my-easy-software is not published yet, so uv takes it from a folder on this computer.\n"
-        "# This line only works where that folder exists; remove it once the framework is published.\n"
+        head + "# This line only works where that folder exists.\n"
         "[tool.uv.sources]\n"
         f"{FRAMEWORK_NAME} = {{ path = {_toml_str(source)}, editable = true }}\n"
     )
@@ -294,6 +341,7 @@ def render(
     framework_path: str | Path | None = None,
     app_dir: str | Path | None = None,
     short: str = DEFAULT_SHORT,
+    framework_git: tuple[str, str] | None = None,
 ) -> dict[str, str]:
     """The text files as ``{relative path: text}``. Nothing is written."""
     module = validate_name(name)
@@ -317,7 +365,7 @@ def render(
         "app_title": app_title,
         "app_title_toml": _toml_str(app_title),
         "mes_version": __version__,
-        "uv_sources": _uv_sources(source),
+        "uv_sources": _uv_sources(source, None if source is not None else framework_git),
     }
     out: dict[str, str] = {}
     for tmpl, target in FILES:
@@ -405,6 +453,7 @@ def create(
     directory: str | Path | None = None,
     title: str | None = None,
     framework_path: str | Path | None = None,
+    framework_git: tuple[str, str] | None = None,
     cwd: str | Path | None = None,
     short: str = DEFAULT_SHORT,
 ) -> dict[str, Any]:
@@ -415,10 +464,23 @@ def create(
     base = Path(cwd) if cwd is not None else Path.cwd()
     folder = (base / (Path(directory).expanduser() if directory is not None else Path(name))).resolve()
 
+    git: tuple[str, str] | None = None
     if framework_path is not None:
         framework = check_framework_path(framework_path)
+    elif framework_git is not None:
+        framework, git = None, check_git_source(*framework_git)
     else:
         framework = default_framework_path()
+        git = None if framework is not None else installed_git_source()
+    if framework is None and git is None:
+        raise Refused(
+            "mes does not know where this project should get my-easy-software from, so no project was "
+            "created. Without an exact source, uv would look the name up in a package index, where "
+            "anyone could publish a package called my-easy-software.",
+            hint="Give the folder of your copy of my-easy-software (--framework-path ../my-easy-software), "
+            "or its repository and commit (--framework-git <address> --framework-rev <commit>).",
+            code="no_framework_source",
+        )
 
     if folder.exists() and not folder.is_dir():
         raise Refused(
@@ -432,18 +494,17 @@ def create(
             hint="Create it somewhere else, for example next to it: --dir ../" + name,
         )
 
-    texts = render(name, title=title, framework_path=framework, app_dir=folder, short=short)
+    texts = render(name, title=title, framework_path=framework, app_dir=folder, short=short, framework_git=git)
     files: dict[str, str | bytes] = {**texts, FIXTURE: sample_data(_compose_texts(texts))}
     _write_files(folder, files, where="--dir")
 
     source_line = None
     notes: list[str] = []
     if framework is None:
-        notes.append(
-            "my-easy-software is not published yet, and this mes is not running from a downloaded "
-            "copy of it, so 'uv sync' in the new project will not find it. Run mes new again with "
-            "--framework-path <folder of my-easy-software> to connect them."
-        )
+        source_line = None
+        notes.append(f"pyproject.toml takes my-easy-software from {git[0]} at commit {git[1][:12]}. "
+                     "mes deploy only sends a framework folder right next to the project, so for deploys "
+                     "keep a copy next to it and use --framework-path instead.")
     else:
         source_line = _source_path(framework, folder)
         if _home_name_in(source_line):
@@ -510,6 +571,7 @@ def create(
         ],
         "short": short,
         "framework_path": source_line,
+        "framework_git": {"url": git[0], "rev": git[1]} if git else None,
         "next_steps": steps,
         "notes": notes,
     }
@@ -758,6 +820,7 @@ def _handle(args: argparse.Namespace) -> Any:
         title=args.title,
         framework_path=args.framework_path,
         short=args.app,
+        framework_git=(args.framework_git, args.framework_rev) if args.framework_git else None,
     )
     return result if args.json else format_result(result)
 
@@ -780,8 +843,12 @@ def register(subparsers: Any) -> None:
                    help="the folder for the project (default: a new folder named after it, here)")
     p.add_argument("--title", default=None, help="a short human title (default: from the name)")
     p.add_argument("--framework-path", dest="framework_path", metavar="PATH", default=None,
-                   help="the folder of my-easy-software to use, while it is not published "
-                   "(default: the copy this mes runs from, when it is one)")
+                   help="the folder of my-easy-software to use (default: the copy this mes runs from, "
+                   "when it is one)")
+    p.add_argument("--framework-git", dest="framework_git", metavar="URL", default=None,
+                   help="instead: the git repository of my-easy-software (with --framework-rev)")
+    p.add_argument("--framework-rev", dest="framework_rev", metavar="COMMIT", default=None,
+                   help="the exact commit of --framework-git (40 hexadecimal characters)")
     p.add_argument("--app", default=DEFAULT_SHORT, metavar="SHORT",
                    help=f'the short name of its first app (default "{DEFAULT_SHORT}": the app <name>-{DEFAULT_SHORT})')
     p.set_defaults(func=_handle)

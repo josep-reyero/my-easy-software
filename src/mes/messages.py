@@ -86,7 +86,9 @@ SIGN_IN_WHY_NO_LINK_MAC = (
     "come back."
 )
 SIGN_IN_WHY_NO_LINK_LINUX = (
-    " To get the sign-in link, the agent can run: sudo tailscale up (it prints a link to open)."
+    " To get the sign-in link, run in a terminal on this computer: sudo tailscale up (it prints a "
+    "link to open, and waits until you have signed in). mes does not run it for you, because it "
+    "changes this computer's network settings."
 )
 
 APPROVE_ACTION = "approve this computer in your Tailscale admin page"
@@ -130,6 +132,12 @@ T: dict[str, dict[str, str]] = {
             "uv is installed but did not answer when asked for its version, so it may be damaged. "
             "Installing it again from its official source usually fixes this."
         ),
+        "why_manual": (
+            "uv is the tool that installs each app with exactly the parts it needs and runs it. This "
+            "system has no package of it that mes knows, so install it by following uv's own "
+            "instructions: https://docs.astral.sh/uv/getting-started/installation/ (mes never "
+            "suggests running a script downloaded from the internet straight into a shell)."
+        ),
     },
     "systemd": {
         "title": "Jobs can be started automatically",
@@ -158,6 +166,12 @@ T: dict[str, dict[str, str]] = {
         "why_manual_mac": (
             "Tailscale is not installed, and this Mac has no Homebrew to install it automatically. "
             "Download the Tailscale app from https://tailscale.com/download/mac and open it."
+        ),
+        "why_manual_linux": (
+            "Tailscale is not installed. This Linux system has no Tailscale package that mes knows, so "
+            "install it from Tailscale's official package repository for your system, as described at "
+            "https://tailscale.com/download/linux (mes never suggests running a script downloaded from "
+            "the internet straight into a shell)."
         ),
         "why_unsupported": "Not checked, because mes does not support this system.",
     },

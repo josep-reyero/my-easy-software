@@ -106,6 +106,14 @@ def _app_err(text: str, package: str | None = None) -> ManifestError:
     return e.value
 
 
+def test_unknown_job_key_names_key_and_allowed_keys():
+    err = _app_err('[app]\nname = "myapp-x"\ncommand = "myapp-x"\n[jobs.sync]\nrunn = "sync"\nmanual = true\n')
+    assert '"runn"' in err.message and "[jobs.sync]" in err.message
+    assert "run, schedule, after, manual, webhook, memory, timeout, network, local_network, writes" in err.hint
+    assert 'Did you mean "run"?' in err.hint
+    assert err.code == "manifest_invalid" and err.exit_code == 1
+
+
 def _compose_err(tmp_path: Path, project: str, apps: dict[str, str]) -> ManifestError:
     with pytest.raises(ManifestError) as e:
         helpers.load(tmp_path / "p", project, apps)
@@ -664,6 +672,45 @@ def test_short_names_and_prefixes():
     assert manifest.short_name("fitdata-garmin", "fitdata") == "garmin"
     assert manifest.short_name("strava-sync", "fitdata") == "strava-sync"
     assert manifest.table_prefix("strava-sync") == "strava_sync_"
+
+
+@pytest.mark.parametrize("host", ["localhost", "db", "x.localhost", "printer.local", "nas.lan", "api.internal"])
+def test_local_network_hosts_are_refused(host):
+    with pytest.raises(ManifestError) as e:
+        manifest.loads_app(_job(f'run = "sync"\nmanual = true\nnetwork = ["{host}"]'))
+    assert "local network" in e.value.message
+
+
+@pytest.mark.parametrize("host", ["0x7f.0.0.1", "0x7f.1", "2130706433", "127.1", "1.1.1.1", "x.0x7f",
+                                  "169.254.169.254", "017700000001"])
+def test_numeric_hosts_in_any_spelling_are_refused(host, tmp_path):
+    """Audit F6: 0x7f.0.0.1 and 0x7f.1 passed the check and resolve to this computer. Refused in
+    an app's network and local_network, and in a project's add_network."""
+    for key in ("network", "local_network"):
+        with pytest.raises(ManifestError):
+            manifest.loads_app(_job(f'run = "sync"\nmanual = true\n{key} = ["{host}"]'))
+    with pytest.raises(ManifestError):
+        manifest.loads(f'[project]\nname = "myapp"\napps = ["myapp_x"]\n'
+                       f'[settings.myapp-x]\njobs.sync.add_network = ["{host}"]\n')
+
+
+def test_local_network_hosts_are_allowed_where_marked(tmp_path):
+    app = manifest.loads_app(_job('run = "sync"\nmanual = true\nnetwork = ["api.example.com"]\n'
+                                  'local_network = ["nas.home.arpa", "api.example.com"]'))
+    assert app.jobs["sync"].local_network == ("nas.home.arpa",)
+    p = helpers.load(tmp_path / "ln", '[project]\nname = "myapp"\napps = ["myapp_x"]\n'
+                     '[settings.myapp-x]\njobs.sync.add_network = ["cdn.example.com"]\n',
+                     {"myapp_x": _job('run = "sync"\nmanual = true\nnetwork = ["api.example.com"]\n'
+                                      'local_network = ["nas.home.arpa", "cdn.example.com"]')})
+    job = p.jobs["myapp-x.sync"]
+    assert job.network == ("api.example.com", "cdn.example.com") and job.local_network == ("nas.home.arpa",)
+    assert job.hosts == ("api.example.com", "cdn.example.com", "nas.home.arpa")
+    assert job.to_dict()["local_network"] == ["nas.home.arpa"] and job.network_allowed
+    only_local = manifest.loads_app(_job('run = "sync"\nmanual = true\nlocal_network = ["nas.home.arpa"]'))
+    assert only_local.jobs["sync"].network == () and only_local.jobs["sync"].local_network == ("nas.home.arpa",)
+    for bad in ("localhost", "x.localhost", "https://nas.home.arpa", "nas"):
+        with pytest.raises(ManifestError):
+            manifest.loads_app(_job(f'run = "sync"\nmanual = true\nlocal_network = ["{bad}"]'))
 
 
 # ---------------------------------------------------------------- the fitness project (contract 8.2, 8.3)

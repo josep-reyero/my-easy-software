@@ -296,7 +296,9 @@ def test_admin_never_runs_through_gate(registered, mes_home):
     for allow in ("read", "write", "deploy"):
         out = _run(["fakeapp", "reset", "--json"], allow=allow)
         assert out.exit_code == 4
-        assert "admin" in _json(out)["error"]["message"]
+        assert _json(out)["error"]["code"] == "not_allowed"
+        if allow != "deploy":
+            assert "admin" in _json(out)["error"]["message"]
     refused = _run(["fakeapp", "summary", "--json"], allow="admin")
     assert refused.exit_code == 5
     for bad in ("", "root", "READ", None, "deploy\n"):
@@ -674,19 +676,25 @@ def test_deploy_key_on_a_personal_machine_installs_nothing(registered):
     assert out.exit_code == 3 and "deploy, rollback, releases, status" in _json(out)["error"]["hint"]
 
 
-def test_deploy_key_runs_app_commands_as_write(registered, mes_home):
-    env = _json(_run(["fakeapp", "env", "--json"], allow="deploy"))
-    assert env["MES_ALLOW"] == "write"
-    ok = _run(["fakeapp", "add", "v", "--json"], allow="deploy")
-    assert ok.exit_code == 0 and (_data(mes_home) / "added.txt").read_text() == "v"
+def test_deploy_key_cannot_run_app_commands(registered, mes_home):
+    """Finding 5: the deploy key ran app commands as write, so a stolen deploy key could change data
+    without the signing key. Now it only runs the mes operations."""
+    for request in (["fakeapp", "env", "--json"], ["fakeapp", "add", "v", "--json"]):
+        out = _run(request, allow="deploy")
+        assert out.exit_code == 4 and _json(out)["error"]["code"] == "not_allowed"
+    assert _run(["fakeapp", "summary"], allow="deploy").exit_code == 4
+    assert not (_data(mes_home) / "added.txt").exists()
 
 
 # --------------------------------------------------------------------------- on a server
 
 
 @pytest.fixture
-def server(tmp_path):
-    """A server folder like /var/lib/mes with fakeproj deployed as release 1."""
+def server(tmp_path, monkeypatch):
+    """A server folder like /var/lib/mes with fakeproj deployed as release 1. A real server always
+    has the request sockets; these tests run without them, so the fail-closed switch is lifted
+    (test_a_server_without_sandbox_sockets_runs_nothing keeps it on)."""
+    monkeypatch.setattr(gate, "REQUIRE_SANDBOX_ON_SERVER", False)
     root = tmp_path / "srv"
     layout = paths.server_layout("fakeproj", root)
     release = layout.releases / "1"
@@ -703,7 +711,20 @@ def test_server_runs_the_current_release(server):
     assert out.exit_code == 0, out
     assert Path(_json(out)["cwd"]).resolve() == (layout.releases / "1" / "project").resolve()
     assert _log_lines(server)[0]["isolation"] == "limits"  # no sandbox sockets in this folder
-    assert gate.log_path(gate.locate("fakeproj", server)) == layout.state / "gate" / "gate-log.jsonl"
+    # Finding 11: the gate's log and locks are in gate/, which no job or write request can change.
+    assert gate.log_path(gate.locate("fakeproj", server)) == layout.gate / "gate-log.jsonl"
+    assert not (layout.state / "gate").exists()
+
+
+def test_a_server_without_sandbox_sockets_runs_nothing(server, monkeypatch):
+    """Finding 2: on a server without the request sockets the gate used to fall back to running the
+    app (and its describe) directly as the SSH account, with no sandbox at all."""
+    monkeypatch.setattr(gate, "REQUIRE_SANDBOX_ON_SERVER", True)
+    layout = paths.server_layout("fakeproj", server)
+    for allow, request in (("read", ["fakeapp", "summary", "--json"]), ("write", ["fakeapp", "add", "x", "--json"])):
+        out = _run(request, allow=allow, server_root=server)
+        assert out.exit_code == 75 and _json(out)["error"]["code"] == "sandbox_unavailable"
+    assert not (layout.data / "added.txt").exists()
 
 
 def test_server_environment_has_only_the_project_folders(server, monkeypatch):
@@ -719,7 +740,8 @@ def test_server_environment_has_only_the_project_folders(server, monkeypatch):
     assert ok.exit_code == 0 and (layout.data / "added.txt").read_text() == "srv"
 
 
-def test_server_without_a_release_runs_nothing(tmp_path):
+def test_server_without_a_release_runs_nothing(tmp_path, monkeypatch):
+    monkeypatch.setattr(gate, "REQUIRE_SANDBOX_ON_SERVER", False)
     root = tmp_path / "srv"
     layout = paths.server_layout("fakeproj", root)
     out = _run(["fakeapp", "summary", "--json"], server_root=root)
@@ -844,16 +866,68 @@ def test_requests_go_to_their_own_sandbox_instance(server, instances):
     assert {r["isolation"] for r in lines if r["decision"] in ("allowed", "done")} == {"systemd"}
 
 
-def test_deploy_key_app_commands_use_the_write_sandbox(server, instances):
+def test_deploy_key_app_commands_reach_no_sandbox(server, instances):
     out = _run(["fakeapp", "add", "x", "--json"], allow="deploy", server_root=server)
-    assert out.exit_code == 0
-    assert instances.connections == {"read": 0, "write": 1, "deploy": 0}
-
-
-def test_sandbox_checks_the_kind_again(server, instances):
-    out = _run(["fakeapp", "reset", "--json"], allow="write", server_root=server)
     assert out.exit_code == 4
-    assert instances.connections["write"] == 0  # refused before anything was handed over
+    assert instances.connections == {"read": 0, "write": 0, "deploy": 0}
+
+
+def test_the_sandbox_checks_the_kind(server, instances):
+    layout = paths.server_layout("fakeproj", server)
+    out = _run(["fakeapp", "reset", "--json"], allow="write", server_root=server)
+    assert out.exit_code == 4 and _json(out)["error"]["code"] == "not_allowed"
+    assert instances.connections["write"] == 1  # the sandbox, not the SSH side, asked the app
+    assert not (layout.data / "reset.txt").exists()
+    assert _log_lines(server)[-1]["decision"] == "refused"
+
+
+def test_the_ssh_side_runs_no_project_code_when_sandboxes_exist(server, instances, monkeypatch):
+    """Finding 2: the SSH-side gate ran the release's app (describe) as mes-<p> outside every sandbox."""
+    callers = []
+    real = gate.ask_commands
+
+    def spy(*a, **k):
+        callers.append(threading.current_thread() is threading.main_thread())
+        return real(*a, **k)
+
+    monkeypatch.setattr(gate, "ask_commands", spy)
+    real_limited = gate.run_limited
+
+    def spy_run(*a, **k):
+        callers.append(threading.current_thread() is threading.main_thread())
+        return real_limited(*a, **k)
+
+    monkeypatch.setattr(gate, "run_limited", spy_run)
+    out = _run(["fakeapp", "summary", "--json"], server_root=server)
+    assert out.exit_code == 0
+    assert callers and not any(callers)  # every app start happened in the sandbox (its thread here)
+
+
+def test_project_form_requests_are_resolved_inside_the_sandbox(server, instances, monkeypatch):
+    """The request forms of the apps contract (``[project, short, command]``, ``[project, command]``
+    with one app) are resolved by the sandboxed instance, so the SSH side still runs no project
+    code; kinds are checked there against the resolved app, and the log names the app that ran."""
+    callers = []
+    real_limited = gate.run_limited
+
+    def spy_run(*a, **k):
+        callers.append(threading.current_thread() is threading.main_thread())
+        return real_limited(*a, **k)
+
+    monkeypatch.setattr(gate, "run_limited", spy_run)
+    layout = paths.server_layout("fakeproj", server)
+    out = _run(["fakeproj", "summary", "--days", "5", "--json"], server_root=server)
+    assert out.exit_code == 0 and _json(out) == {"days": 5}, out
+    out = _run(["fakeproj", "fakeapp", "summary", "--days", "6", "--json"], server_root=server)
+    assert out.exit_code == 0 and _json(out) == {"days": 6}, out
+    assert callers and not any(callers)
+    finished = [r for r in _log_lines(server) if r["event"] == "finished"]
+    assert finished[-1]["app"] == "fakeapp" and finished[-1]["requested"] == "fakeproj"
+    out = _run(["fakeproj", "fakeapp", "add", "x", "--json"], allow="read", server_root=server)
+    assert out.exit_code == 4 and _json(out)["error"]["code"] == "not_allowed"
+    assert not (layout.data / "added.txt").exists()
+    out = _run(["fakeproj", "add", "x", "--json"], allow="deploy", server_root=server)
+    assert out.exit_code == 4  # a deploy key never runs app commands, in either form
 
 
 def test_sandbox_limits_apply_inside_the_instance(server, instances):
@@ -949,14 +1023,34 @@ def test_child_refusals_are_plain_errors(server):
 
 
 def test_child_through_the_real_command(server):
-    """``mes gate child`` as systemd runs it: the connection is stdin and stdout."""
+    """``mes gate child`` as systemd runs it: the connection is stdin and stdout. Here stdin is a
+    pipe, not a unix socket from an SSH session, so the peer check refuses (finding 3)."""
     line = json.dumps({"kind": "app", "request": ["fakeapp", "summary", "--days", "2", "--json"]}).encode() + b"\n"
     done = subprocess.run([sys.executable, "-m", "mes.cli", "gate", "child", "--project", "fakeproj",
                            "--server-root", str(server), "--level", "read"],
                           input=line, capture_output=True, timeout=60)
-    assert done.returncode == 0, done.stderr
     head, out, _ = gate.read_answer(io.BytesIO(done.stdout), gate.DEFAULT_MAX_OUTPUT)
-    assert head["exit_code"] == 0 and json.loads(out) == {"days": 2}
+    assert head["exit_code"] == 5 and json.loads(out)["error"]["code"] == "sandbox_peer"
+    assert not (paths.server_layout("fakeproj", server).data / "added.txt").exists()
+
+
+@pytest.mark.parametrize("uid, cgroup, expected", [
+    (1000, "0::/user.slice/user-1000.slice/session-4.scope\n", None),
+    (1000, "0::/system.slice/sshd.service\n", None),
+    (1000, "0::/system.slice/ssh.service\n", None),
+    (1000, "0::/system.slice/system-sshd.slice/sshd@3-10.0.0.1:22-10.0.0.2:5000.service\n", None),
+    (1001, "0::/user.slice/user-1001.slice/session-4.scope\n", "another_account"),
+    (1000, None, "no_cgroup"),
+    (1000, "0::/mes.slice/mes-demo.slice/mes-demo.job.sync.service\n", "from_a_job"),
+    (1000, "0::/system.slice/mes-demo.job.sync.service\n", "not_an_ssh_session"),
+    (1000, "0::/user.slice/user-1000.slice/user@1000.service/app.slice/x.service\n", "not_an_ssh_session"),
+    (1000, "0::/user.slice/user-2000.slice/session-4.scope\n", "not_an_ssh_session"),
+    (1000, "0::/system.slice/mes-demo.webhook.service\n", "not_an_ssh_session"),
+])
+def test_peer_must_be_an_ssh_session_of_the_project(uid, cgroup, expected):
+    """Finding 3: any process of mes-<p> (a job, the webhook receiver) could connect to the request
+    sockets and run write requests. The child now checks who is on the other end."""
+    assert gate.peer_problem(uid, cgroup, my_uid=1000) == expected
 
 
 @pytest.mark.parametrize("answer", [

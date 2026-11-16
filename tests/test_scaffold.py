@@ -357,12 +357,29 @@ def test_default_framework_path_is_this_checkout():
     assert scaffold.default_framework_path() == FRAMEWORK
 
 
-def test_without_framework_a_note_explains_what_to_do(tmp_path, monkeypatch):
+def test_without_a_framework_source_no_project_is_made(tmp_path, monkeypatch):
+    """Audit F7: without a source, pyproject.toml named only 'my-easy-software>=0.1.0', which uv
+    would take from a package index where anyone could register that name."""
     monkeypatch.setattr(scaffold, "default_framework_path", lambda: None)
+    monkeypatch.setattr(scaffold, "installed_git_source", lambda: None)
+    with pytest.raises(Refused) as e:
+        scaffold.create("notes", directory=tmp_path / "n")
+    assert e.value.code == "no_framework_source"
+    assert not (tmp_path / "n").exists()
+
+
+def test_framework_from_git_is_pinned_to_a_commit(tmp_path, monkeypatch):
+    monkeypatch.setattr(scaffold, "default_framework_path", lambda: None)
+    rev = "a" * 40
+    monkeypatch.setattr(scaffold, "installed_git_source", lambda: ("https://git.example.com/me/my-easy-software", rev))
     result = scaffold.create("notes", directory=tmp_path / "n")
-    assert result["framework_path"] is None
-    assert any("--framework-path" in n for n in result["notes"])
-    assert "[tool.uv.sources]" not in (tmp_path / "n" / "pyproject.toml").read_text()
+    data = tomllib.loads((tmp_path / "n" / "pyproject.toml").read_text())
+    assert data["tool"]["uv"]["sources"]["my-easy-software"] == {
+        "git": "https://git.example.com/me/my-easy-software", "rev": rev}
+    assert result["framework_git"]["rev"] == rev
+    for url, bad_rev in (("https://x.example.com/a", "main"), ("file:///etc", rev), ("https://x.example.com/a b", rev)):
+        with pytest.raises(UsageError):
+            scaffold.create("other", directory=tmp_path / "o", framework_git=(url, bad_rev))
 
 
 def test_home_name_in_path_gives_a_note(tmp_path, monkeypatch):

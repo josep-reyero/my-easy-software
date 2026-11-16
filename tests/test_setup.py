@@ -221,14 +221,21 @@ def test_uv_found_reports_version():
     "fake,fix",
     [
         (mac(missing=("uv",)), "brew install uv"),
-        (mac(missing=("uv", "brew")), "curl -LsSf https://astral.sh/uv/install.sh | sh"),
         (linux(missing=("uv",), os_release=ARCH), "sudo pacman -S uv"),
-        (linux(missing=("uv",)), "curl -LsSf https://astral.sh/uv/install.sh | sh"),
     ],
 )
 def test_uv_missing_gives_official_install(fake, fix):
     it = items_for(fake)["uv"]
     assert it["status"] == "todo" and it["fix"] == fix and not it["needs_human"]
+
+
+@pytest.mark.parametrize("fake", [mac(missing=("uv", "brew")), linux(missing=("uv",))])
+def test_uv_without_a_package_manager_points_to_the_docs_not_a_shell_pipe(fake):
+    """Audit F7: the fix was 'curl ... | sh'."""
+    it = items_for(fake)["uv"]
+    assert it["status"] == "todo" and it["needs_human"] and not it.get("fix")
+    assert it["detail"] == "https://docs.astral.sh/uv/getting-started/installation/"
+    assert "| sh" not in json.dumps(it)
 
 
 def test_uv_broken():
@@ -278,12 +285,17 @@ def test_no_systemd_at_all():
     [
         (mac(**NO_TAILSCALE, exists=()), "brew install --cask tailscale"),
         (linux(**NO_TAILSCALE, os_release=ARCH), "sudo pacman -S tailscale && sudo systemctl enable --now tailscaled"),
-        (linux(**NO_TAILSCALE, os_release=OTHER_LINUX), "curl -fsSL https://tailscale.com/install.sh | sh"),
     ],
 )
 def test_install_command_exact(fake, expected):
     it = items_for(fake)["tailscale-installed"]
     assert it["status"] == "todo" and it["fix"] == expected and not it["needs_human"]
+
+
+def test_other_linux_gets_the_official_page_not_a_shell_pipe():
+    it = items_for(linux(**NO_TAILSCALE, os_release=OTHER_LINUX))["tailscale-installed"]
+    assert it["status"] == "todo" and it["needs_human"] and not it.get("fix")
+    assert it["detail"] == "https://tailscale.com/download/linux" and "| sh" not in json.dumps(it)
 
 
 def test_install_command_debian_and_ubuntu_use_official_repo():
@@ -521,16 +533,15 @@ def test_setup_continues_to_start_then_sign_in(mes_home):
     fake = linux(commands={("tailscale", "status", "--json"): (1, "", "failed to connect to local tailscaled")})
     first = setup.run_setup({"tailscale": "install"}, probe=fake.probe())
     assert by_id(first)["tailscale-running"]["fix"] == "sudo systemctl enable --now tailscaled"
-    # Then it is running but signed out: setup asks Tailscale for the link.
-    def up(argv):
-        return (1, "\nTo authenticate, visit:\n\n\t" + SIGN_IN_URL + "\n\n", "timeout waiting for Running")
-    fake2 = linux(commands={("tailscale", "status", "--json"): (0, status("NeedsLogin"), ""), ("tailscale", "up"): up})
+    # Then it is running but signed out: setup says what to run, and never runs 'tailscale up'
+    # itself (audit F12: that changes the computer's network settings).
+    fake2 = linux(commands={("tailscale", "status", "--json"): (0, status("NeedsLogin"), "")})
     second = setup.run_setup({}, probe=fake2.probe())
     assert second["status"] == "needs_human" and second["id"] == "tailscale-sign-in"
     assert second["action"] == "create or sign in to your Tailscale account"
-    assert second["url"] == SIGN_IN_URL
+    assert second["url"] is None and "sudo tailscale up" in second["why"]
     assert second["rerun"] == "mes setup"
-    assert fake2.ran("tailscale", "up", "--timeout=15s")
+    assert not fake2.ran("tailscale", "up")
     assert protocol.exit_code_for(second) == 6
 
 
@@ -541,25 +552,12 @@ def test_setup_uses_auth_url_from_status_without_running_up():
     assert not fake.ran("tailscale", "up")
 
 
-def test_setup_sign_in_link_found_in_status_after_up():
-    calls = {"n": 0}
-
-    def st(argv):
-        calls["n"] += 1
-        return (0, status("NeedsLogin", AuthURL=SIGN_IN_URL if calls["n"] > 1 else ""), "")
-
-    fake = linux(commands={("tailscale", "status", "--json"): st, ("tailscale", "up"): (124, "", "timed out")})
-    result = setup.run_setup({}, probe=fake.probe())
-    assert result["url"] == SIGN_IN_URL
-
-
 def test_setup_sign_in_without_link_linux_and_mac():
-    denied = (1, "", "Access denied: prefs write access denied")
-    fake = linux(commands={("tailscale", "status", "--json"): (0, status("NeedsLogin"), ""), ("tailscale", "up"): denied})
+    fake = linux(commands={("tailscale", "status", "--json"): (0, status("NeedsLogin"), "")})
     result = setup.run_setup({}, probe=fake.probe())
     assert result["status"] == "needs_human" and result["url"] is None
-    assert "sudo tailscale up" in result["why"]
-    fake_mac = mac(commands={("tailscale", "status", "--json"): (0, status("NeedsLogin"), ""), ("tailscale", "up"): denied})
+    assert "sudo tailscale up" in result["why"] and not fake.ran("tailscale", "up")
+    fake_mac = mac(commands={("tailscale", "status", "--json"): (0, status("NeedsLogin"), "")})
     result_mac = setup.run_setup({}, probe=fake_mac.probe())
     assert "menu bar" in result_mac["why"]
 

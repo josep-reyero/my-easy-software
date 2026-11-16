@@ -187,11 +187,18 @@ class ServerLayout:
 
     ``base`` (``/var/lib/mes/<project>``) belongs to root and can only be entered, not listed.
     ``code``, ``data``, ``state`` and ``store`` belong to ``mes-<project>`` and nobody else can
-    open them. ``ui`` belongs to ``mes-<project>`` and is readable by ``mes-<project>-web``;
-    ``web`` (``ui/auth``) belongs to ``mes-<project>-web`` (the dashboard sign-in state). ``etc``,
-    ``home`` and ``log`` belong to root: ``etc`` holds the signer list, the gate's login shell and
-    the paths of the tools; ``home/.ssh/authorized_keys`` the keys that may connect; ``log`` the
-    tamper-evident run log that only root writes.
+    open them. ``code`` also holds the deploy tools' own folders (``uv-cache``, ``uv-python``), so
+    jobs and the write gate, which see ``code`` read-only, cannot change what the next deploy runs.
+    ``ui`` belongs to ``mes-<project>`` and is readable by ``mes-<project>-web``; ``auth``
+    belongs to ``mes-<project>-web`` alone (the dashboard sign-in: password hash, passkeys,
+    sessions), so not even the project's own code can read it. ``gate`` (the gate's log, locks and
+    deploy records) and ``webhook`` (the webhook receiver's replay record and trigger notes) belong
+    to ``mes-<project>`` but no job or sandboxed request has them writable. ``etc``, ``home`` and
+    ``log`` belong to root (``etc`` and ``home`` with the group ``mes-<project>``, mode 0750, so
+    only root and the project's account can look inside): ``etc`` holds the signer list, the
+    gate's login shell, the paths of the tools and the webhook job list;
+    ``home/.ssh/authorized_keys`` the keys that may connect; ``log`` the tamper-evident run log
+    that only root writes.
     """
 
     project: str
@@ -205,11 +212,16 @@ class ServerLayout:
     releases = property(lambda self: self.code / "releases")
     current = property(lambda self: self.code / "current")
     incoming = property(lambda self: self.code / "incoming")
+    uv_cache = property(lambda self: self.code / "uv-cache")
+    uv_python = property(lambda self: self.code / "uv-python")
     data = property(lambda self: self.base / "data")
     state = property(lambda self: self.base / "state")
     ui = property(lambda self: self.base / "ui")
-    web = property(lambda self: self.base / "ui" / "auth")  # the dashboard sign-in, only for mes-<p>-web
+    auth = property(lambda self: self.base / "auth")  # the dashboard sign-in, only for mes-<p>-web
+    web = auth
     store = property(lambda self: self.base / "store")
+    gate = property(lambda self: self.base / "gate")  # gate log, locks, deploy records: no job writes here
+    webhook = property(lambda self: self.base / "webhook")
     etc = property(lambda self: self.base / "etc")
     home = property(lambda self: self.base / "home")
     log = property(lambda self: self.base / "log")
@@ -219,8 +231,10 @@ class ServerLayout:
     server_toml = property(lambda self: self.etc / "server.toml")
     gate_shell = property(lambda self: self.etc / "gate-shell")
     webhook_key = property(lambda self: self.etc / "webhook.key")
+    webhook_jobs = property(lambda self: self.etc / "webhook-jobs")
     run_log = property(lambda self: self.log / "runs.jsonl")
-    triggers = property(lambda self: self.state / "triggers")
+    triggers = property(lambda self: self.webhook / "triggers")
+    release_records = property(lambda self: self.gate / "releases")
 
     @property
     def current_project(self) -> Path:

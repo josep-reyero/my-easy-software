@@ -2,11 +2,16 @@
 
 How to get a computer ready for mes projects, driven by you (the agent) without blocking on prompts.
 
-0. Get `mes` itself (it is not published yet): with the user's yes, download the my-easy-software
-   repository and run `uv tool install --editable <the my-easy-software folder>`. `mes` is then
-   available everywhere. (Without installing it: `uv run --project <the my-easy-software folder> mes ...`.
-   Inside a project made with `mes new`, `uv run mes ...` always works.) If `uv` itself is missing,
-   `mes doctor` cannot run yet: install uv from its official source first (https://docs.astral.sh/uv/).
+0. Get `mes` itself (it is not published on a package index; never install a package called
+   my-easy-software from one, since anyone could publish that name there): with the user's yes,
+   clone the repository the user names (`git clone <my-easy-software repository address>`), check
+   that it is the one they mean (the address they gave, and `git log -1` shows the commit they
+   expect), and run `uv tool install <the my-easy-software folder>`. `mes` is then available
+   everywhere. (Without installing it: `uv run --project <the my-easy-software folder> mes ...`.
+   Inside a project made with `mes new`, `uv run mes ...` works on this computer; on a server use
+   the system-installed mes, see `mes guide server`.) If `uv` itself is missing, `mes doctor`
+   cannot run yet: install uv with the system's package manager or as uv's own instructions say
+   (https://docs.astral.sh/uv/getting-started/installation/).
 
 1. Run `mes --json setup`. It returns a checklist:
    `{"ok": bool, "items": [{"id", "title", "status", "why", "fix", "needs_human", "detail"}]}`.
@@ -35,7 +40,8 @@ Talking to the user:
 - Install software only after the user says yes, and only from official package sources.
 - Never ask the user to edit a file or type a command, except their own passwords.
 
-Tailscale (private network): if it is missing, explain that it links the user's own devices into
+Tailscale (private network): mes never runs `tailscale up` (it changes the computer's network
+settings); when a sign-in is needed, it tells the person to run it. If Tailscale is missing, explain that it links the user's own devices into
 a private network only they can enter, that it is free for personal use and takes about two
 minutes, and offer to install it. If they decline, projects stay in local-only mode on this
 computer: say so.
@@ -50,9 +56,12 @@ commands. Its `why` (and, line by line, its `detail`) gives:
   (`--socket PATH` changes the dashboard server's socket, `--port N` the HTTPS port; use another
   port for each project served from the same server);
 - the private name the dashboard server must accept, given when its units are made:
-  `mes server plan <name> --allow-host <server>.<tailnet>.ts.net` (it passes `--allow-host` to
-  `easy-ui units`; the dashboard's units are `mes-<name>-web.socket` and `mes-<name>-web.service`),
-  then the script it prints is run as before. The name comes from `tailscale status` when this
+  `mes server plan <name> --allow-host <server>.<tailnet>.ts.net` (the same as
+  `--origin https://<server>.<tailnet>.ts.net`; mes passes it to `easy-ui units --origin` and
+  renders the units `mes-<name>-web.socket` and `mes-<name>-web.service` itself), then the
+  script it prints is run as before;
+- the dashboard password, set once on the server:
+  `sudo -u mes-<name>-web easy-ui set-password --ui-dir /var/lib/mes/<name>/ui --auth-dir /var/lib/mes/<name>/auth`. The name comes from `tailscale status` when this
   computer is the server, otherwise it is a placeholder to replace;
 - how to check (`tailscale serve status`) and how to stop (`sudo tailscale serve --https=443 off`).
 Tell the user it makes the dashboard open on their own devices only. Never use `tailscale funnel`:

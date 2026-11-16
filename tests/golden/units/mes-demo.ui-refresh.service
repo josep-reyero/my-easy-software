@@ -44,6 +44,7 @@ RestrictSUIDSGID=yes
 LockPersonality=yes
 RestrictRealtime=yes
 RestrictNamespaces=yes
+RemoveIPC=yes
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources
@@ -52,8 +53,13 @@ LimitCORE=0
 TasksMax=256
 # The dashboard server's account reads ui/ through its group, so new files are group-readable.
 UMask=0027
+# Of all the projects' folders, only these of this project are there (read-only unless listed
+# as writable); other projects, the sign-in folder and the gate's own folder are not.
+TemporaryFileSystem=/var/lib/mes:ro
+BindReadOnlyPaths=/var/lib/mes/demo/code /var/lib/mes/demo/data /var/lib/mes/demo/state
+BindPaths=/var/lib/mes/demo/ui
 ReadWritePaths=/var/lib/mes/demo/ui
-InaccessiblePaths=-/var/lib/mes/demo/etc/webhook.key
+InaccessiblePaths=-/run/mes-demo-gate -/var/lib/mes/demo/etc/webhook.key
 PrivateNetwork=yes
 RestrictAddressFamilies=AF_UNIX
 IPAddressDeny=any

@@ -12,19 +12,27 @@ Steps
 2. Build the export into a new private temporary folder (``easy-ui export``) and look at every
    file it wrote (regular files only, safe paths, size limits).
 3. In ``link`` mode, check that the key is in no file.
-4. Ask the person (``needs_input``, exit 6) with a question that lists exactly which dashboards,
-   which tables and columns, which provider and site, and who will be able to open it. The answer
+4. Ask the person (``needs_input``, exit 6). The question starts with fixed fields mes writes
+   itself (provider, address, who will be able to open it), then lists the dashboards and the data
+   that leaves the computer, where every name and value that comes from the project is quoted and
+   cut short (the same listing is in ``shared_data`` as structured JSON). The answer
    is a fingerprint (``--answer confirm=<fingerprint>``) of all of that and of every exported
    file, so a yes only ever covers what was shown: when anything changed, mes asks again.
    ``--yes`` skips the question (the person said yes beforehand).
 5. Upload with the adapter (``mes.expose.adapters``). ``--dry-run`` stops before this and lists
-   every request the adapter would make; it needs no token.
-6. In ``link`` mode the link is ``<site>#k=<key>``: the key is only in the part after ``#``,
+   every request the adapter would make; it needs no token. The reported address is always the one
+   the provider answered with. In people mode the site is opened like a stranger afterwards and
+   must ask for a sign-in, or the new version is deleted again. Earlier versions are deleted.
+6. In ``link`` mode the link is ``<address>#k=<key>``: the key is only in the part after ``#``,
    which browsers never send to the provider, and the adapter never receives it.
+
+``--remove`` takes the site down at the provider (every version), after the same kind of
+confirmation (``--answer confirm=remove`` or ``--yes``).
 
 Public API
 ----------
-``MODES``, ``WHO``, ``expose(...) -> dict``, ``fingerprint(summary, files, *, encrypted) -> str``,
+``MODES``, ``WHO``, ``expose(...) -> dict``, ``remove(...) -> dict``,
+``fingerprint(summary, files, *, encrypted) -> str``,
 ``collect_files(folder) -> list[ExportFile]``, ``register(subparsers)``.
 """
 
@@ -47,7 +55,7 @@ from mes import manifest as manifest_mod
 from mes import paths, protocol, siblings
 from mes.app import check_allowed
 from mes.errors import MesError, NotFound, Refused, UsageError
-from mes.expose.adapters import ADAPTERS, Adapter, ExportFile, Http, api_base, load_token
+from mes.expose.adapters import ADAPTERS, Adapter, ExportFile, Http, load_token
 
 MODES = ("people", "link", "public")
 WHO = {
@@ -185,8 +193,14 @@ _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}\Z")
 
 def _short(value: Any, limit: int = 200) -> str:
     text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
-    text = "".join(c for c in text if c.isprintable())
-    return text[:limit]
+    text = "".join(c for c in text if c.isprintable())  # also drops direction marks and other format characters
+    return text[:limit] + ("..." if len(text) > limit else "")
+
+
+def _quoted(value: Any, limit: int = 80) -> str:
+    """A name or value from the project's data, as it appears in a question: quoted, cut short,
+    plain ASCII (anything else written as \\uXXXX), so it can never pass for mes's own words."""
+    return json.dumps(_short(value, limit), ensure_ascii=True)
 
 
 def _visible(answer: dict[str, Any]) -> list[dict[str, Any]]:
@@ -256,23 +270,32 @@ def fingerprint(summary: dict[str, Any], files: list[ExportFile], *, encrypted: 
     return hashlib.sha256(text.encode("ascii")).hexdigest()
 
 
+MAX_QUESTION_DATA = 3000
+
+
+def _address(adapter: Adapter, site: str) -> str:
+    return (f"the address {adapter.title} gives the site, normally {adapter.site_url(site)} (mes reports the real one "
+            "after uploading)")
+
+
 def _question(summary: dict[str, Any], project: manifest_mod.Project, adapter: Adapter) -> str:
-    parts = []
-    for d in summary["visible"]:
-        values = ", ".join(f"{k}={v}" for k, v in d["values"].items()) or "no controls"
-        rows = "; ".join(f"{q['rows']} row(s) of {', '.join(q['columns']) or 'nothing'}"
-                         + (" (cut short)" if q["truncated"] else "") for q in d["queries"]) or "no data"
-        parts.append(f"{d['title']} ({d['slug']}, for {values}): {rows}")
-    tables = " | ".join(parts)
     who = WHO[summary["mode"]]
     if summary["mode"] == "people":
         who += ": " + ", ".join(summary["people"])
-    return (
-        f'Share these dashboards of "{project.title}" on {adapter.title}, at {adapter.site_url(summary["site"])}? '
-        f"Dashboards: {', '.join(summary['dashboards'])}. "
-        f"Data that will leave this computer (a copy of only what those dashboards show): {tables}. "
-        f"Who will be able to open it: {who}."
-    )
+    fixed = (f"Provider: {adapter.title}. Address: {_address(adapter, summary['site'])}. "
+             f"Who will be able to open it: {who}. "
+             f"Dashboards: {', '.join(summary['dashboards'])}. ")
+    parts = []
+    for d in summary["visible"]:
+        values = ", ".join(f"{_quoted(k, 40)}={_quoted(v, 60)}" for k, v in d["values"].items()) or "no controls"
+        rows = "; ".join(f"{q['rows']} row(s) of {', '.join(_quoted(c, 40) for c in q['columns']) or 'nothing'}"
+                         + (" (cut short)" if q["truncated"] else "") for q in d["queries"]) or "no data"
+        parts.append(f"{d['slug']} (title {_quoted(d['title'])}, for {values}): {rows}")
+    data = " | ".join(parts)
+    if len(data) > MAX_QUESTION_DATA:
+        data = data[:MAX_QUESTION_DATA] + " ... (the full list is in shared_data)"
+    return (fixed + "Data that will leave this computer, a copy of only what those dashboards show (names and "
+            f"values in quotes come from the project's data): {data}. Share exactly this?")
 
 
 def _rerun(args: dict[str, Any]) -> str:
@@ -351,7 +374,7 @@ def expose(project_name: str, *, provider: str, mode: str, dashboards: list[str]
         content = result.get("content_sha256") if isinstance(result.get("content_sha256"), str) else None
         digest = fingerprint(summary, files, encrypted=encrypted, content_sha256=content)
         visible = {"dashboards": names, "data": shown, "who": WHO[mode], "people": people_list,
-                   "where": adapter.site_url(site_name)}
+                   "where": _address(adapter, site_name)}
 
         if dry_run:
             return {
@@ -367,7 +390,7 @@ def expose(project_name: str, *, provider: str, mode: str, dashboards: list[str]
             question = _question(summary, project, adapter)
             if answer is not None:
                 question = "What would be shared has changed since that answer, so mes asks again. " + question
-            return protocol.needs_input(
+            asked = protocol.needs_input(
                 id="expose-confirm",
                 question=question,
                 why=("Sharing sends a copy of this data outside your own devices. Only you can decide that, and a yes "
@@ -382,29 +405,101 @@ def expose(project_name: str, *, provider: str, mode: str, dashboards: list[str]
                               "people": people_list, "site": site, "project_dir": project_dir,
                               "working": working}),
             )
+            asked["shared"] = {"provider": adapter.title, "site": site_name, "mode": mode, "who": WHO[mode],
+                               "people": people_list, "dashboards": names}
+            asked["shared_data"] = shown
+            return asked
 
         token = load_token(adapter)
-        http = Http(api_base(adapter), provider=adapter.title,
-                    secrets_to_hide=(token,) + ((key,) if key else ()))
+        http = Http(adapter.base, provider=adapter.title, secrets_to_hide=(token,) + ((key,) if key else ()))
         done = adapter.upload(site_name, out_dir, files, mode, people_list, token, http)
-        url = str(done.get("url") or adapter.site_url(site_name))
+        url = done.get("url")
+        if not isinstance(url, str) or not re.fullmatch(r"https://[a-z0-9.-]{1,253}", url):
+            raise MesError(f"{adapter.title} did not say at which address the site is, so mes reports none.",
+                           hint="Look at the site in your provider account.", code="provider_no_address")
         link = f"{url}#k={key}" if encrypted else url
+        visible["where"] = url
+        kept = list(done.get("earlier_not_removed") or [])
         out = {
             "shared": True, "project": project.name, "provider": provider, "site": site_name, "mode": mode,
             "url": link, "visible": visible, "files": len(files), "requests": http.log,
+            "removed_earlier_versions": int(done.get("removed_earlier") or 0), "earlier_versions_kept": kept,
         }
+        if done.get("hosts"):
+            out["addresses"] = [f"https://{h}" for h in done["hosts"]]
         if mode == "link":
             out["message"] = ("Shared. Anyone holding this link can open the dashboards; the key is the part after "
-                              "#, which is never sent to the provider. To stop the link from working, run mes "
-                              "expose again (a new key is made) and share only the new link.")
+                              "#, which is never sent to the provider.")
         elif mode == "people":
-            out["message"] = ("Shared. Only the listed people can open it, after signing in with their email. To "
-                              "change who can open it, run mes expose again with the new list.")
+            out["message"] = ("Shared. mes opened the site like a stranger and it asked for a sign-in, so only the "
+                              "listed people can open it, after signing in with their email.")
         else:
             out["message"] = "Shared. Anyone on the internet can open it."
+        if kept:
+            out["message"] += (f" {len(kept)} earlier version(s) could not be deleted and are still online at their "
+                               "own addresses (with their old data, and in link mode their old key still opens them). "
+                               f"Delete them in your {adapter.title} account, or take everything down with: "
+                               f"mes expose {project.name} --to {provider} --remove")
+        else:
+            out["message"] += (" Earlier versions were deleted, so old links stop working. To take the site down "
+                               f"completely: mes expose {project.name} --to {provider} --remove")
         return out
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def remove(project_name: str, *, provider: str, site: str | None = None, project_dir: str | None = None,
+           yes: bool = False, answer: str | None = None, dry_run: bool = False) -> dict[str, Any]:
+    """Take the shared site down at the provider: every version, so no old link or old address
+    keeps working."""
+    if provider not in ADAPTERS:
+        raise UsageError(f"{provider[:40]!r} is not a hosting provider mes knows.",
+                         hint="Use one of: " + ", ".join(ADAPTERS))
+    adapter = ADAPTERS[provider]
+    if not adapter.available:
+        raise adapter.refuse()  # type: ignore[attr-defined]
+    paths.check_name(project_name)
+    if project_dir is not None or manifest_mod.find() is not None:
+        project = _project(project_name, project_dir)
+        site_name = _site(site, project, adapter)
+    else:
+        if not site and not adapter.site_re.match(project_name):
+            raise UsageError("Give the site's name with --site.", hint="mes expose <project> --to ... --remove --site NAME")
+        site_name = site or project_name
+        if not adapter.site_re.match(site_name):
+            raise UsageError(f"{site_name[:80]!r} cannot be a site name on {adapter.title}.", hint="Check --site.")
+    if dry_run:
+        return {"dry_run": True, "provider": provider, "site": site_name, "steps": adapter.remove_plan(site_name),
+                "message": "Nothing was deleted: these are the steps mes would take. No token was needed or read."}
+    if answer == "no":
+        return {"removed": False, "message": "Nothing was deleted, as you chose."}
+    if not yes and answer != "remove":
+        words = ["mes", "expose", project_name, "--to", provider, "--remove", "--site", site_name]
+        if project_dir:
+            words += ["--project-dir", project_dir]
+        return protocol.needs_input(
+            id="expose-remove",
+            question=(f"Provider: {adapter.title}. Site: {site_name}. Delete this site and every version of it at "
+                      f"{adapter.title}? Everyone, including the people you shared it with, loses access, and old "
+                      "links stop working."),
+            why="Deleting a site cannot be undone; only you can decide that.",
+            options=[protocol.option("remove", "Yes, delete the site", f"Every version is deleted at {adapter.title}."),
+                     protocol.option("no", "No, keep it", "Nothing is deleted.")],
+            recommended="remove",
+            rerun=" ".join(shlex.quote(w) for w in words) + " --answer confirm=<value>",
+        )
+    token = load_token(adapter)
+    http = Http(adapter.base, provider=adapter.title, secrets_to_hide=(token,))
+    done = adapter.remove(site_name, token, http)
+    kept = list(done.get("not_removed") or [])
+    if not done.get("removed"):
+        msg = f"There is no site called {site_name} at {adapter.title}, so nothing was deleted."
+    elif kept:
+        msg = (f"The site {site_name} was deleted at {adapter.title}, but {len(kept)} version(s) could not be: delete "
+               "them in your account.")
+    else:
+        msg = f"The site {site_name} and every version of it were deleted at {adapter.title}."
+    return {**done, "provider": provider, "site": site_name, "requests": http.log, "message": msg}
 
 
 def _parse_answer(raw: list[str]) -> str | None:
@@ -420,6 +515,15 @@ def _parse_answer(raw: list[str]) -> str | None:
 
 def _handle(args: argparse.Namespace) -> Any:
     check_allowed("admin")  # sending data outside your own devices is the most powerful thing mes does
+    if args.remove:
+        if args.mode or args.dashboard or args.people or args.working:
+            raise UsageError("--remove takes the whole site down; it goes without --mode, --dashboard, --people "
+                             "and --working.", hint="mes expose <project> --to <provider> --remove [--site NAME]")
+        return remove(args.project, provider=args.to, site=args.site, project_dir=args.project_dir, yes=args.yes,
+                      answer=_parse_answer(args.answer), dry_run=args.dry_run)
+    if not args.mode:
+        raise UsageError("Say who may open it with --mode people, link or public.",
+                         hint="For example: mes expose <project> --to cloudflare-pages --mode link")
     return expose(args.project, provider=args.to, mode=args.mode, dashboards=args.dashboard, people=args.people,
                   site=args.site, project_dir=args.project_dir, yes=args.yes, answer=_parse_answer(args.answer),
                   working=args.working,
@@ -436,7 +540,7 @@ def register(subparsers: Any) -> None:
     )
     p.add_argument("project", help="the project's name")
     p.add_argument("--to", required=True, choices=list(ADAPTERS), help="the hosting provider")
-    p.add_argument("--mode", required=True, choices=list(MODES),
+    p.add_argument("--mode", default=None, choices=list(MODES),
                    help="people: only named people; link: anyone with the link (encrypted); public: anyone")
     p.add_argument("--dashboard", action="append", default=[], metavar="NAME",
                    help="a dashboard to share (repeat; default: those listed in [ui] dashboards)")
@@ -450,4 +554,6 @@ def register(subparsers: Any) -> None:
     p.add_argument("--answer", action="append", default=[], metavar="confirm=VALUE",
                    help="the answer to the confirmation question")
     p.add_argument("--dry-run", action="store_true", help="show every step and upload nothing (no token needed)")
+    p.add_argument("--remove", action="store_true",
+                   help="take the shared site down at the provider (every version), after a confirmation")
     p.set_defaults(func=_handle)

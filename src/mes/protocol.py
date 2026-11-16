@@ -227,8 +227,14 @@ def _json_default(o: Any) -> Any:
     raise TypeError(f"cannot turn {type(o).__name__} into JSON")
 
 
+# Characters that are invisible or change how text around them is shown (C1 controls, bidi
+# overrides and isolates, line and paragraph separators): always written as \uXXXX escapes.
+_JSON_ESCAPE = re.compile("[\u0080-\u009f\u061c\u200b-\u200f\u2028-\u202e\u2066-\u2069\ufeff]")
+
+
 def to_json(data: Any) -> str:
-    return json.dumps(data, default=_json_default, ensure_ascii=False, indent=2)
+    text = json.dumps(data, default=_json_default, ensure_ascii=False, indent=2)
+    return _JSON_ESCAPE.sub(lambda m: f"\\u{ord(m.group()):04x}", text)
 
 
 def _scalar(v: Any) -> str:
@@ -353,12 +359,13 @@ def format_text(data: Any) -> str:
 
 # C0 and C1 control characters except tab and newline. App data shown on a terminal must not be
 # able to move the cursor, clear the screen, change the window title or hide text.
-_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+_CONTROL_CHARS = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\u061c\u200b-\u200f\u2028-\u202e\u2066-\u2069\ufeff]")
 
 
 def safe_text(text: str) -> str:
     """``text`` with terminal control characters shown as ``\\xNN`` instead of acted on."""
-    return _CONTROL_CHARS.sub(lambda m: f"\\x{ord(m.group()):02x}", text)
+    return _CONTROL_CHARS.sub(lambda m: f"\\x{ord(m.group()):02x}" if ord(m.group()) < 0x100
+                              else f"\\u{ord(m.group()):04x}", text)
 
 
 def emit(result: Any, *, json_mode: bool, out: TextIO | None = None) -> int:

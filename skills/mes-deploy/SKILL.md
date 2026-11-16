@@ -7,4 +7,6 @@ description: Put a my-easy-software project on the user's own Linux server and k
 
 Run `mes guide server` (first time) and `mes guide deploy` (every update), and follow them;
 `mes guide backup` for backups. mes never uses sudo: show the user the plan script, let them read
-it and run it themselves. Start every deploy with `mes --json deploy <server> --dry-run`.
+it and run it themselves; the plan is made with the system-installed mes, never `uv run mes`.
+Two keys: a signing key (best a hardware key) and a separate login key. Start every deploy with
+`mes --json deploy <server> --dry-run`, and after the first one run `mes server selftest`.

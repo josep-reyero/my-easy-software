@@ -1,6 +1,8 @@
 # Made by my-easy-software (mes). Do not edit: run 'mes server plan' again and the script it writes instead.
 # mes-project: demo
 # mes-unit: webhook
+# It sees only etc/ (the secret and the list of webhook jobs, both written by root) and its own
+# webhook/ folder (the replay record and the trigger notes), which no job can write.
 
 [Unit]
 Description=Signed webhooks of project demo
@@ -45,14 +47,20 @@ RestrictSUIDSGID=yes
 LockPersonality=yes
 RestrictRealtime=yes
 RestrictNamespaces=yes
+RemoveIPC=yes
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources
 SystemCallErrorNumber=EPERM
 LimitCORE=0
 TasksMax=256
-ReadWritePaths=/var/lib/mes/demo/state/triggers
-InaccessiblePaths=-/var/lib/mes/demo/data -/var/lib/mes/demo/store -/var/lib/mes/demo/code
+# Of all the projects' folders, only these of this project are there (read-only unless listed
+# as writable); other projects, the sign-in folder and the gate's own folder are not.
+TemporaryFileSystem=/var/lib/mes:ro
+BindReadOnlyPaths=/var/lib/mes/demo/etc
+BindPaths=/var/lib/mes/demo/webhook
+ReadWritePaths=/var/lib/mes/demo/webhook
+InaccessiblePaths=-/run/mes-demo-gate
 # No network of its own: requests arrive only through the socket.
 PrivateNetwork=yes
 RestrictAddressFamilies=AF_UNIX

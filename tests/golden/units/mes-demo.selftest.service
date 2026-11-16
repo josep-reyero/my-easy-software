@@ -1,0 +1,68 @@
+# Made by my-easy-software (mes). Do not edit: run 'mes server plan' again and the script it writes instead.
+# mes-project: demo
+# mes-unit: selftest
+# network: none
+
+[Unit]
+Description=mes self-test probe of project demo (a job's sandbox)
+
+[Service]
+Type=oneshot
+User=mes-demo
+Group=mes-demo
+ExecStart="/usr/local/bin/mes" "server" "selftest-probe" "demo" "--context" "job" "--server-root" "/var/lib/mes"
+WorkingDirectory=/var/lib/mes/demo/code/current/project
+Environment="MES_PROJECT=demo"
+Environment="MES_DATA_DIR=/var/lib/mes/demo/data"
+Environment="MES_STATE_DIR=/var/lib/mes/demo/state"
+Environment="MES_STORE_DIR=/var/lib/mes/demo/store"
+Environment="HOME=/var/lib/mes/demo/state"
+Environment="LANG=C.UTF-8"
+Environment="PYTHONDONTWRITEBYTECODE=1"
+Environment="MES_PROJECT_DIR=/var/lib/mes/demo/code/current/project"
+Environment="MES_ALLOW=write"
+Environment="MES_JOB=demo-app.selftest"
+Slice=mes.slice
+MemoryMax=128M
+MemorySwapMax=0
+TimeoutStartSec=120
+UMask=0077
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+DevicePolicy=closed
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+KeyringMode=private
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+RemoveIPC=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
+LimitCORE=0
+TasksMax=256
+# Of all the projects' folders, only these of this project are there (read-only unless listed
+# as writable); other projects, the sign-in folder and the gate's own folder are not.
+TemporaryFileSystem=/var/lib/mes:ro
+BindReadOnlyPaths=/var/lib/mes/demo/code
+BindPaths=/var/lib/mes/demo/data /var/lib/mes/demo/store /var/lib/mes/demo/state
+ReadWritePaths=/var/lib/mes/demo/data /var/lib/mes/demo/store /var/lib/mes/demo/state
+BindPaths=-/var/lib/mes/demo/gate/selftest
+InaccessiblePaths=-/run/mes-demo-gate -/var/lib/mes/demo/etc/webhook.key
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any

@@ -7,7 +7,7 @@
 Description=Start mes job demo-app.hook of project demo when its signed webhook arrives
 
 [Path]
-PathModified=/var/lib/mes/demo/state/triggers/demo-app.hook
+PathModified=/var/lib/mes/demo/webhook/triggers/demo-app.hook
 Unit=mes-demo.job.demo-app.hook.service
 
 [Install]

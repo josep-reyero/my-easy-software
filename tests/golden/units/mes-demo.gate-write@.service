@@ -47,14 +47,20 @@ RestrictSUIDSGID=yes
 LockPersonality=yes
 RestrictRealtime=yes
 RestrictNamespaces=yes
+RemoveIPC=yes
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources
 SystemCallErrorNumber=EPERM
 LimitCORE=0
 TasksMax=256
+# Of all the projects' folders, only these of this project are there (read-only unless listed
+# as writable); other projects, the sign-in folder and the gate's own folder are not.
+TemporaryFileSystem=/var/lib/mes:ro
+BindReadOnlyPaths=/var/lib/mes/demo/code
+BindPaths=/var/lib/mes/demo/data /var/lib/mes/demo/state /var/lib/mes/demo/store
 ReadWritePaths=/var/lib/mes/demo/data /var/lib/mes/demo/state /var/lib/mes/demo/store
-InaccessiblePaths=-/var/lib/mes/demo/state/gate -/var/lib/mes/demo/etc/webhook.key -/var/lib/mes/demo/code/incoming
+InaccessiblePaths=-/run/mes-demo-gate -/var/lib/mes/demo/etc/webhook.key -/var/lib/mes/demo/code/incoming
 PrivateNetwork=yes
 RestrictAddressFamilies=AF_UNIX
 IPAddressDeny=any
