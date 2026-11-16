@@ -41,6 +41,10 @@ name = "fitdata"
 title = "Fitness"
 apps = ["fitdata_garmin"]        # installed apps, by package name; order matters for overrides
 
+[tables.activities]              # a shared table: any installed app may add rows to it
+columns = { id = "text", date = "text", type = "text", distance_m = "real", duration_s = "real" }
+key = ["source", "id"]           # "source" (the app that wrote the row) is added automatically
+
 [settings.fitdata_garmin]        # optional per-project overrides of what the app declares
 jobs.daily.schedule = "*-*-* 06,12,21:00:00"
 jobs.backfill.enabled = false
@@ -55,8 +59,9 @@ cli = "fitdata_garmin.cli:app"   # a mes.App
 
 [data]
 folder = "garmin"                # its own subfolder of the project's data folder
-tables = ["days", "activities", "files"]   # tables it owns in the project's shared database
-rebuild = "index"                # the command that rebuilds only these tables from its files
+writes = ["days", "activities"]  # shared project tables it contributes rows to
+tables = ["garmin_files"]        # tables only this app owns
+rebuild = "index"                # rebuilds its own rows and tables from its files, nothing else
 
 [jobs.activities]
 run = "activities-sync --days 2" # a command of THIS app; no app name needed
@@ -66,7 +71,10 @@ memory = "512M"
 timeout = "20m"
 
 [ui]
-dashboards = ["overview", "sleep"]   # shipped in the app's dashboards/ folder
+dashboards = ["garmin-training"]     # whole dashboards shipped in the app's dashboards/ folder
+
+[ui.contributes.overview]            # panels it adds to the project's shared "overview" dashboard
+sections = "dashboards/overview-garmin.yaml"
 ```
 
 ## How a project is composed
@@ -78,15 +86,28 @@ dashboards = ["overview", "sleep"]   # shipped in the app's dashboards/ folder
   (`fitdata-garmin.activities`). A job always runs its own app's command. `after =` may name a job
   of another app in the same project. The project can change a schedule or switch a job off in
   `[settings.<app>]` without editing the app.
-- **Data.** One data folder and one shared SQLite database per project. Each app keeps its files
-  under its own subfolder and declares the tables it owns; its rebuild command may drop and
-  recreate only those tables. Any app may read any table. Two apps may not declare the same table.
-  Cross-app views belong to the project (`[views]` in `project.toml`, plain SELECTs).
-- **Dashboards.** `mes` gathers dashboards from every app plus the project's own `ui/dashboards/`.
-  A project dashboard with the same name replaces an app's (like overriding a template), so an
-  owner or their agent can reshape an app's dashboard without touching the app. The tables the
-  dashboards may read are the union of what the apps' `[ui]` sections allow, narrowed by the
-  project if it wants.
+- **Data: apps contribute to the same data.** One data folder and one shared SQLite database per
+  project, and every app can read all of it. There are two kinds of table:
+  - *Shared tables* are declared by the project (`[tables.<name>]` in `project.toml`, with their
+    columns) and any installed app may write rows into them. Every row carries the app that wrote
+    it (`source`), and an app's rebuild replaces only its own rows. This is how a Garmin app and a
+    Strava app both feed one `activities` table, and one `days` table gets sleep from one app and
+    weight from another (apps fill different columns of the same day; the project says which app
+    wins when two fill the same column).
+  - *App tables* belong to one app (declared in its `app.toml`) for data nobody else produces.
+  Each app keeps its raw files under its own subfolder. Cross-app views are plain SELECTs in
+  `[views]` in `project.toml`.
+- **Dashboards: apps contribute to the same dashboards.** A dashboard is a list of sections.
+  The project owns the dashboards (`ui/dashboards/`), and an app can do three things:
+  - ship whole dashboards of its own;
+  - *contribute sections to a project dashboard* by naming it (`[ui.contributes.overview]` in
+    `app.toml`, pointing at a file of rows and components), so installing an app adds its panels to
+    the shared "Overview" without anyone editing that dashboard;
+  - be overridden: a project file with the same name replaces an app's dashboard or contributed
+    section, so the owner or their agent always has the last word.
+  Components read shared tables like any other, so one chart can show data from several apps
+  without knowing which app produced which row. The tables dashboards may read are the union of
+  what the project and the apps allow, narrowed by the project if it wants.
 - **Network and limits.** Declared per job, in the app. The server plan shows them per app so the
   owner can see what each installed app is allowed to reach.
 - **Guides.** `fitdata guide` joins the project's AGENTS.md with each app's.
@@ -102,6 +123,7 @@ dashboards = ["overview", "sleep"]   # shipped in the app's dashboards/ folder
 ## Moving the fitness project to this shape
 
 `fitdata` becomes a project with one app, `apps/fitdata_garmin/`, holding today's code. Its files
-already live under `garmin/` in the data folder, so nothing moves on disk. The tables `days`,
-`activities` and `files` become that app's tables. The commands `fitdata-garmin ...` keep working,
+already live under `garmin/` in the data folder, so nothing moves on disk. `days` and `activities`
+become shared project tables that the Garmin app fills (ready for a second source), and `files`
+becomes the app's own table. The commands `fitdata-garmin ...` keep working,
 and `fitdata ...` becomes the project command that reaches it.
