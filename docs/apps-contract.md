@@ -262,7 +262,11 @@ writes `<project>/apps.lock.json` atomically (mode 0644):
 
 It holds this computer's paths, so it is in `.gitignore` and never deployed: `mes deploy` packs
 git-tracked files only, and the server runs `mes apps sync` itself after `uv sync --frozen`.
-`mes dev` runs it before anything else.
+`mes dev` runs it before anything else. The `mes apps sync` command (and `mes dev`) then also runs
+`mes db sync` on the shared database when that file already exists (it never creates one), so the
+views follow the apps list at once: removing an app hides its rows, adding it back shows them. A
+problem there is a warning, because the lock was written. Deploys leave this out (the release is
+not current yet); on the server the job units' `ExecStartPre` does it (I1).
 
 **Reading the lock (every reader: mes, the gate, ui, the fitness project command).** Refuse with
 *"The list of installed apps (apps.lock.json) is out of date, so the apps cannot be found
@@ -299,6 +303,9 @@ fitness project works on a computer without mes.
   - The plan script also disables and removes old-form units (`mes-<p>.job.<job>.*`,
     `mes-<p>.net.<job>.service`) where it finds them, each line guarded by an existence test.
 - Environment of a run: as today, plus `MES_JOB=<job id>` and `MES_PROJECT_DIR=<project folder>`.
+  `mes jobs run` and `mes db rebuild` on a personal computer also set `MES_PROJECT`,
+  `MES_DATA_DIR` and `MES_STATE_DIR` to the project's folders, exactly as the units and the gate
+  do, so an app that does not import mes finds `<data folder>/<project>.sqlite` (I2).
 - Run log: `"app"` is the app name, `"job"` the job id. Webhooks: `POST /hooks/<job id>`, trigger
   file `state/triggers/<job id>`.
 - `mes server plan` lists network hosts, memory and time limits per app.
@@ -388,10 +395,17 @@ text with surrounding whitespace removed + `;`.
 The complete script for the fitlab example is in section 9.6.
 
 ### 4.4 Plain-SQL rules (apps that do not import the framework)
-1. Open `<data folder>/<project>.sqlite`; busy timeout of at least 30 s.
-2. Before writing, run the schema script (4.3) inside the write transaction. The app may ship a
-   copy of it; when `project.toml` changes, the copy must be regenerated with
-   `mes db schema --sql`.
+1. Open `<data folder>/<project>.sqlite`; busy timeout of at least 30 s. When mes runs the app
+   (`MES_PROJECT` is this project and `MES_DATA_DIR` is set: jobs, units, the gate,
+   `mes db rebuild`), the data folder is `MES_DATA_DIR`, whatever the app's own settings say (I2).
+2. Before writing, inside the write transaction, run the schema script (4.3): every
+   `CREATE TABLE` / `CREATE INDEX` statement (they are `IF NOT EXISTS`), and a view's
+   `DROP VIEW` / `CREATE VIEW` pair only when that view does not exist yet. Existing views belong
+   to mes (`mes db sync` keeps them in line with `project.toml` and the installed apps): an app's
+   copy lists the apps of the day it was made, and running its views again would hide the rows of
+   every app added since (I3). The app may ship a copy; when `project.toml` changes, the copy must
+   be regenerated with `mes db schema --sql`. Statements start at the beginning of a line with
+   `CREATE TABLE`, `CREATE INDEX`, `DROP VIEW IF EXISTS "<name>"` or `CREATE VIEW "<name>"`.
 3. Write only rows whose `source` is the app's own name, and only into the `T__rows` of tables in
    its `[data] writes`. Each key column is non-NULL.
 4. Delete only rows of its own: `DELETE FROM "<T>__rows" WHERE "source" = '<own app name>'`
@@ -1306,6 +1320,15 @@ queries:
       WHERE date > date((SELECT max(date) FROM activities), '-' || :days || ' days')
       ORDER BY date DESC
       LIMIT 20
+  per_week:
+    sql: |
+      SELECT strftime('%Y-%W', date) AS week,
+             round(coalesce(sum(CASE WHEN type = 'walking' THEN distance_m END), 0) / 1000.0, 1) AS "Walking km",
+             round(coalesce(sum(CASE WHEN type = 'cycling' THEN distance_m END), 0) / 1000.0, 1) AS "Cycling km"
+      FROM activities
+      WHERE date > date((SELECT max(date) FROM activities), '-' || :days || ' days')
+      GROUP BY 1
+      ORDER BY 1
 
 layout:
   - - type: controls
@@ -1328,10 +1351,18 @@ layout:
         - {column: type, label: Type}
         - {column: source, label: App}
         - {column: km, label: km, format: decimal1}
+    - type: bar
+      title: Distance per week, every app
+      query: per_week
+      x: week
+      y: [Walking km, Cycling km]
+      stacked: true
+      format: decimal1
 ```
 
 Composed `overview` layout: the controls and stats row, the walks section's row (at the anchor),
-the recent-activities table, the rides section's row (at the end).
+the recent-activities table with the chart of both apps' distances (one chart and one table that
+show rows of both apps, I4), the rides section's row (at the end).
 
 ### 9.6 The schema script `mes db schema --sql` must print for fitlab
 
@@ -1403,6 +1434,13 @@ With throwaway `MES_DATA_HOME`, `MES_STATE_HOME`, `EASYUI_STATE_HOME`, `MES_CONF
    `["fitlab-rides", "add", "2026-01-06", "10", "30", "--json"]` at read exits 4;
    `["fitlab", "describe", "--json"]` succeeds.
 
+### 9.8 What else `examples/fitlab` holds (beyond this contract's files)
+`ui/theme.yaml` (the ready-made theme "trail"), `ui/styles/10-fitlab.css` (a project stylesheet)
+and `ui/sections/fitlab-walks.overview.yaml` (the project's replacement of the walks section: a
+line chart with the component id `walk-trend`, which the stylesheet restyles). They show the
+project-level look and an override on top of the two apps; `tests/test_fitlab.py` checks them
+when easy-ui is installed (I5).
+
 ## 10. Who builds what
 
 | Area | mes | ui | fit |
@@ -1416,3 +1454,30 @@ With throwaway `MES_DATA_HOME`, `MES_STATE_HOME`, `EASYUI_STATE_HOME`, `MES_CONF
 | scaffolding (7) | yes | none | none |
 | fitness migration (8) | none | none | yes |
 | `examples/fitlab` and the proof (9) | files + test | its steps 5 to 7 | none |
+
+## 11. Changes after the integration run
+
+The three parts were first run together on a two-app project made with `mes new` and
+`mes new-app`, and on the fitness project with a second app added. Each mismatch found was fixed
+at its root, and the contract above was changed where it was wrong or silent:
+
+- **I1** (2.5): removing an app from `[project] apps` left its rows visible, because nothing
+  rewrote the views' `IN (...)` lists until the next job that writes data. `mes apps sync` (the
+  command, and `mes dev`) now runs `mes db sync` on an existing database.
+- **I2** (3, 4.4): `mes jobs run` and `mes db rebuild` did not tell a plain app (fitness) where the
+  project's data folder is, and fitdata-garmin ignored `MES_DATA_DIR`, so under mes it wrote a
+  different `fitdata.sqlite` than the one `mes db` and easy-ui read. mes now sets `MES_PROJECT`,
+  `MES_DATA_DIR` and `MES_STATE_DIR` for local runs too, and the rule that a plain app uses
+  `MES_DATA_DIR` when mes runs it is written down.
+- **I3** (4.4): plain-SQL rule 2 said to run the whole schema script before each write. An app's
+  copy holds the views for the apps of the day it was made, so a rebuild by fitdata-garmin after a
+  second app was added replaced the views and hid the other app's rows. The rule now runs a view's
+  statements only when the view is missing.
+- **I4** (9.5): the worked example had no single chart showing rows of both apps; the overview
+  gains "Distance per week, every app" in the row of the recent-activities table.
+- **I5** (9.8): the example also carries a theme, a stylesheet and a section override, so the
+  proof covers the project's look and overrides on top of the apps.
+- Smaller: when `project.toml` still names a removed app in more than one place (`prefer`,
+  `[settings.<app>]`, `refresh_after`), one message lists every place; `mes new-app` kept losing
+  the blank line after `[project.scripts]`, and now also says when the project does not depend on
+  my-easy-software (its generated `cli.py` needs it).

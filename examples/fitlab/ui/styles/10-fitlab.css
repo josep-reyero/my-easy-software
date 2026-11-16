@@ -1,0 +1,6 @@
+/* Fit lab: bigger, italic dashboard titles and a thicker walking chart. */
+.eui-dashboard-title { font-size: 2.6rem; font-style: italic; }
+[data-id="walk-trend"] {
+  --eui-chart-1: #b0383a;
+  --eui-chart-line-width: 4;
+}

@@ -1,0 +1,23 @@
+# The project's own version of the walks section on the overview: a line chart instead of the
+# app's bar chart. It replaces apps/fitlab_walks/dashboards/overview-walks.yaml for this project.
+spec: easy-ui/sections-v1
+sections:
+  - id: walks
+    position: after:activity
+    queries:
+      walks_trend:
+        sql: |
+          SELECT date AS day, round(sum(distance_m) / 1000.0, 1) AS "Walked km"
+          FROM activities
+          WHERE source = 'fitlab-walks'
+            AND date > date((SELECT max(date) FROM activities), '-' || :days || ' days')
+          GROUP BY 1
+          ORDER BY 1
+    layout:
+      - - type: line
+          id: walk-trend
+          title: Walking, day by day
+          query: walks_trend
+          x: day
+          y: [Walked km]
+          format: decimal1
