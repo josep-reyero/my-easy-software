@@ -98,7 +98,7 @@ def run_dev(project_dir: str | None = None, *, port: int | None = None, stop_aft
     out = out or sys.stdout
     err = err or sys.stderr
     root = project_root(project_dir)
-    apps.sync(root)
+    apps.sync(root, update_database=True)
     project = manifest_mod.load(root)
     if not project.has_dashboards:
         raise UsageError(
@@ -191,10 +191,10 @@ def run_dev(project_dir: str | None = None, *, port: int | None = None, stop_aft
                 name = _rel(f, root)
                 if f.name in (manifest_mod.MANIFEST_FILE, manifest_mod.APP_FILE):
                     try:
-                        apps.sync(root)
+                        apps.sync(root, update_database=True)
                         project = manifest_mod.load(root)
-                        _say(err, f"{name} changed and is still correct (the list of apps was written again). If you "
-                             "changed [ui] or the apps, stop and start mes dev again to use the new settings.")
+                        _say(err, f"{name} changed and is still correct: the list of apps was written again and the "
+                             "shared database follows it. The preview shows the change by itself.")
                     except MesError as e:
                         _say(err, f"{name} changed and now has a problem: {e.message} {e.hint or ''}")
                 else:

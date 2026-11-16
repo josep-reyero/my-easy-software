@@ -662,6 +662,7 @@ def test_new_app_adds_the_folder_and_edits_two_lines(made):
     assert py["tool"]["hatch"]["build"]["targets"]["wheel"]["packages"] == ["apps/my_notes_main", "apps/my_notes_rides"]
     # Only those lines changed: the rest of the file is as it was.
     after = (made / "pyproject.toml").read_text().splitlines()
+    assert len(after) == len(before_py.splitlines()) + 1  # one line added, the blank lines kept
     assert sorted(set(after) - set(before_py.splitlines())) == [
         'my-notes-rides = "my_notes_rides.cli:main"', 'packages = ["apps/my_notes_main", "apps/my_notes_rides"]']
     p = manifest.load(made)
@@ -715,6 +716,15 @@ def test_new_app_gives_the_line_when_it_cannot_edit(made):
     assert "project.toml" not in result["changed"]
     assert any('"my_notes_rides"' in n and "under [project]" in n for n in result["notes"])
     assert (made / "project.toml").read_text() == text
+
+
+def test_new_app_says_when_the_project_does_not_use_mes(made):
+    """A project that does not depend on my-easy-software (like the fitness one) gets a plain note:
+    the generated cli.py uses mes.App, so the program would not start without it."""
+    py = made / "pyproject.toml"
+    py.write_text(py.read_text().replace('dependencies = ["my-easy-software>=0.1.0"]', "dependencies = []"))
+    result = scaffold.new_app("rides", project_dir=made)
+    assert any("does not depend on it" in n and "uv add my-easy-software" in n for n in result["notes"])
 
 
 def test_mes_new_app_command(made, capsys):

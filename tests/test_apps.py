@@ -249,3 +249,89 @@ def test_gate_rewrites_project_requests(root):
     assert e.value.exit_code == 2 and "a, b" in e.value.hint
     with pytest.raises(MesError):
         gate.resolve_request(where, ["pp", "describe", "more"])
+
+
+# --------------------------------------------------------------------------- integration fixes
+
+
+SHARED = '[tables.t]\nkey = ["k"]\ncolumns = { k = "text", v = "integer" }\n'
+WA = '[app]\nname = "pp-a"\ncommand = "pp-a"\n[data]\nwrites = ["t"]\n'
+WB = '[app]\nname = "pp-b"\ncommand = "pp-b"\n[data]\nwrites = ["t"]\n'
+
+
+def _rows_by_source(root: Path) -> list[tuple]:
+    import sqlite3
+
+    from mes import db
+
+    conn = sqlite3.connect(db.db_path(manifest.load(root)))
+    try:
+        return conn.execute('SELECT source, k FROM "t" ORDER BY source').fetchall()
+    finally:
+        conn.close()
+
+
+def test_sync_makes_the_views_follow_the_apps_list(tmp_path):
+    """Removing an app from [project] apps hides its rows at once: mes apps sync brings an existing
+    database's views in line (found by the integration run: before, they kept the old IN list)."""
+    import sqlite3
+
+    from mes import db
+
+    root = helpers.write(tmp_path / "pp", PROJECT + SHARED, {"pp_a": WA, "pp_b": WB})
+    for name in ("pp-a", "pp-b", "pp"):
+        _program(root, name)
+    apps.sync(root, update_database=True)  # no database yet: nothing is created
+    project = manifest.load(root)
+    assert not db.db_path(project).exists()
+    db.sync(project)
+    conn = sqlite3.connect(db.db_path(project))
+    conn.executemany('INSERT INTO "t__rows" VALUES (?, ?, 1)', [("pp-a", "x"), ("pp-b", "y")])
+    conn.commit()
+    conn.close()
+    assert _rows_by_source(root) == [("pp-a", "x"), ("pp-b", "y")]
+
+    (root / "project.toml").write_text(PROJECT.replace('"pp_a", "pp_b"', '"pp_a"') + SHARED)
+    apps.sync(root)  # what a deploy does: the lock only
+    assert _rows_by_source(root) == [("pp-a", "x"), ("pp-b", "y")]
+    out = apps.sync(root, update_database=True)  # the mes apps sync command and mes dev
+    assert out["database"]["views_recreated"] == ["t"]
+    assert _rows_by_source(root) == [("pp-a", "x")]
+
+    (root / "project.toml").write_text(PROJECT + SHARED)  # adding it back shows its rows again
+    apps.sync(root, update_database=True)
+    assert _rows_by_source(root) == [("pp-a", "x"), ("pp-b", "y")]
+
+
+def test_sync_reports_a_database_problem_as_a_warning(tmp_path):
+    import sqlite3
+
+    from mes import db
+
+    root = helpers.write(tmp_path / "pp", PROJECT + SHARED, {"pp_a": WA, "pp_b": WB})
+    for name in ("pp-a", "pp-b", "pp"):
+        _program(root, name)
+    path = db.db_path(manifest.load(root), create_folder=True)
+    conn = sqlite3.connect(path)
+    conn.execute('CREATE TABLE "t" (x)')  # a table where the view must go
+    conn.close()
+    out = apps.sync(root, update_database=True)
+    assert (root / manifest.LOCK_FILE).exists()
+    assert out["database"] is None and any("--reset t" in w for w in out["warnings"])
+
+
+def test_removed_app_is_named_once_for_every_place(tmp_path):
+    text = (PROJECT.replace('"pp_a", "pp_b"', '"pp_a"') + SHARED.replace('columns', 'prefer = ["pp-b"]\ncolumns')
+            + '[settings.pp-b]\njobs.tidy.timeout = "5m"\n[ui]\nrefresh_after = ["pp-b.tidy"]\n')
+    root = helpers.write(tmp_path / "pp", text, {"pp_a": WA})
+    with pytest.raises(ManifestError) as e:
+        manifest.load(root)
+    msg = e.value.message
+    assert '"pp-b"' in msg and "[tables.t] prefer" in msg and "[settings.pp-b]" in msg and "refresh_after" in msg
+    assert "remove these lines too" in e.value.hint
+    # One stray mention keeps its own, more specific message.
+    root = helpers.write(tmp_path / "pq", PROJECT.replace('"pp_a", "pp_b"', '"pp_a"') + SHARED
+                         + '[ui]\nrefresh_after = ["pp-b.tidy"]\n', {"pp_a": WA})
+    with pytest.raises(ManifestError) as e:
+        manifest.load(root)
+    assert "no enabled job with that id" in e.value.message

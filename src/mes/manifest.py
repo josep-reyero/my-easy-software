@@ -1375,6 +1375,32 @@ def _pfail(pf: ProjectFile, where: str, problem: str, hint: str, code: str | Non
     return _fail(pf.path.name if pf.path else MANIFEST_FILE, where, problem, hint, code)
 
 
+def _removed_app_references(pf: ProjectFile, apps: dict[str, Any]) -> None:
+    """One message for every place project.toml still names an app that is not installed, when it
+    names it in more than one place (typically after removing the app from [project] apps), so the
+    person fixes them all at once instead of one error at a time."""
+    packages = {a.package for a in apps.values()}
+    places: dict[str, list[str]] = {}
+    for t in pf.tables.values():
+        for p in t.prefer:
+            if p not in apps:
+                places.setdefault(p, []).append(f"[tables.{t.name}] prefer")
+    for key in pf.settings:
+        if key not in apps and key not in packages:
+            places.setdefault(key, []).append(f"[settings.{key}]")
+    if pf.ui is not None:
+        for job_id in pf.ui.refresh_after:
+            app_name = job_id.split(".", 1)[0]
+            if app_name not in apps:
+                places.setdefault(app_name, []).append(f'[ui] refresh_after "{job_id}"')
+    for name, where in places.items():
+        if len(where) > 1:
+            raise _pfail(pf, ", ".join(where), f'project.toml still names the app "{name}", which is not in '
+                         "[project] apps, in these places.",
+                         f"If {name} was removed from the project, remove these lines too. If not, add its package "
+                         f"to [project] apps. Installed apps: {', '.join(apps) or 'none'}.")
+
+
 def compose(pf: ProjectFile, located: list[Located], *, lock_used: bool = False) -> Project:
     """Read each app's app.toml and tie everything together (contract sections 0 to 3)."""
     root = pf.root
@@ -1437,6 +1463,7 @@ def compose(pf: ProjectFile, located: list[Located], *, lock_used: bool = False)
             ui=af.ui,
         )
 
+    _removed_app_references(pf, apps)
     warnings: list[str] = []
     for t in pf.tables.values():
         for spec in apps.values():

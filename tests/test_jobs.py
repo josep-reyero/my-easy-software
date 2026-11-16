@@ -91,7 +91,8 @@ elif cmd[0] == "crash":
     sys.exit(3)
 elif cmd[0] == "ok":
     print(json.dumps({{"argv": cmd, "allow": os.environ.get("MES_ALLOW"),
-                      "job": os.environ.get("MES_JOB"), "cwd": os.getcwd()}}))
+                      "job": os.environ.get("MES_JOB"), "cwd": os.getcwd(),
+                      "data_dir": os.environ.get("MES_DATA_DIR"), "project": os.environ.get("MES_PROJECT")}}))
 elif cmd[0] == "fail":
     print("the source refused the request", file=sys.stderr)
     sys.exit(3)
@@ -203,6 +204,9 @@ def test_run_success_logs_and_sets_env(project_root, capsys, mes_home):
     assert out["allow"] == "write"
     assert out["job"] == "demo-app.export"
     assert Path(out["cwd"]).resolve() == project_root.resolve()
+    # The project's folders, as the units and the gate give them: a plain program (no mes import)
+    # then writes the same <data folder>/<project>.sqlite that mes db and easy-ui read.
+    assert out["project"] == "demo" and out["data_dir"] == str(mes_home["data"] / "demo")
 
     records = jobs.read_log(log_file(mes_home))
     assert len(records) == 1

@@ -137,6 +137,12 @@ def _job_env(project: Project, allow: str, job: Job | None = None, root: Path | 
         "MES_ALLOW": allow,
         "MES_DATA_HOME": str(paths.data_home()),
         "MES_STATE_HOME": str(paths.state_home()),
+        # The project's own folders, exactly as the units and the gate give them, so an app that
+        # does not import mes (a plain program) writes the same <data folder>/<project>.sqlite
+        # that mes db and easy-ui read.
+        "MES_PROJECT": project.name,
+        "MES_DATA_DIR": str(paths.project_data_dir(project.name)),
+        "MES_STATE_DIR": str(paths.project_state_dir(project.name)),
     })
     if root is not None or project.root is not None:
         env["MES_PROJECT_DIR"] = str(root or project.root)

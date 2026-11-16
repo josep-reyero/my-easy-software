@@ -54,6 +54,18 @@ When it is missing or out of date (for example after editing `project.toml`), yo
 "The list of installed apps (apps.lock.json) is out of date ..." Run `mes apps sync`. Apps that are
 all in `apps/` also work without it.
 
+When the project's shared database already exists, `mes apps sync` also brings it in line with
+`project.toml` (as `mes db sync` does), so the shared views always show the rows of exactly the
+listed apps.
+
+## Removing an app
+
+Take its package out of `[project] apps`, and remove what still names it in `project.toml`: a
+`prefer` entry, its `[settings.<app>]` and its job ids in `[ui] refresh_after` (one message lists
+every place). Then run `mes apps sync`: its jobs, its dashboards and sections, and its rows in the
+shared views are gone. The rows stay in the database file until `mes db check --prune` removes
+them, so adding the app back shows them again.
+
 ```bash
 mes apps list      # the apps, where each one is, its jobs
 mes apps sync      # find them and write apps.lock.json (after uv sync, or after changing a toml file)

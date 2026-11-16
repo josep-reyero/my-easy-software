@@ -20,7 +20,10 @@ Public API
 ``find_installed(root, packages, *, runner=None) -> dict[str, Path]``
 ``resolve(root, project_file, *, runner=None) -> list[Located]``
 ``describe_app(root, spec, *, runner=None) -> dict``  the app's ``--json describe``, checked.
-``sync(root, *, runner=None) -> dict``     writes the lock; returns a summary.
+``sync(root, *, runner=None, strict=True, update_database=False) -> dict``
+    writes the lock; returns a summary. With ``update_database`` (the ``mes apps sync`` command and
+    ``mes dev``), an existing shared database is then brought in line with project.toml
+    (``mes db sync``), so the views stop showing the rows of an app that was removed.
 ``write_lock(root, project_file, located) -> Path``
 ``check(root, *, runner=None) -> checklist``
 ``register(subparsers)``
@@ -257,9 +260,13 @@ def write_lock(root: Path, pf: ProjectFile, located: list[Located], programs: di
     return target
 
 
-def sync(root: str | Path, *, runner: Runner | None = None, strict: bool = True) -> dict[str, Any]:
+def sync(root: str | Path, *, runner: Runner | None = None, strict: bool = True,
+         update_database: bool = False) -> dict[str, Any]:
     """Find, check and lock the apps. ``strict=False`` (deploys) reports job problems instead of
-    refusing, as ``mes deploy`` always has."""
+    refusing, as ``mes deploy`` always has. ``update_database`` also runs ``mes db sync`` on an
+    existing shared database (never creating one); a problem there becomes a warning, because the
+    lock itself was written. Deploys leave it off: the release is not the current one yet, and the
+    job units' ExecStartPre brings the database in line on the server."""
     root = Path(root).resolve()
     pf = manifest_mod.load_file(root)
     located = resolve(root, pf, runner=runner)
@@ -280,6 +287,20 @@ def sync(root: str | Path, *, runner: Runner | None = None, strict: bool = True)
         raise MesError(" ".join(problems) + " The list of apps was not written.",
                        hint="Fix the app.toml (or the app's commands), then run: mes apps sync", code="job_invalid")
     lock = write_lock(root, pf, located, {s.package: (s.name, s.program) for s in project.apps.values()})
+    warnings = list(project.warnings)
+    database = None
+    if update_database and project.tables:
+        from mes import db
+
+        target = db.db_path(project)
+        if target.is_file():
+            try:
+                done = db.sync(project, path=target)
+                database = {"file": str(target), "views_recreated": done["views_recreated"],
+                            "columns_added": done["columns_added"], "problems": done["problems"]}
+            except MesError as e:
+                warnings.append(f"The list of apps was written, but the shared database could not be brought in line "
+                                f"with project.toml: {e.message} {e.hint or ''}".strip())
     return {
         "project": project.name,
         "lock": str(lock),
@@ -288,7 +309,8 @@ def sync(root: str | Path, *, runner: Runner | None = None, strict: bool = True)
         "jobs": list(project.jobs),
         "commands": kinds,
         "problems": problems,
-        "warnings": list(project.warnings),
+        "warnings": warnings,
+        "database": database,
         "message": f"The list of installed apps of {project.name} is up to date ({len(project.apps)} "
         f"app{'s' if len(project.apps) != 1 else ''}).",
     }
@@ -425,11 +447,15 @@ def _cmd_list(args: argparse.Namespace) -> Any:
 
 def _cmd_sync(args: argparse.Namespace) -> Any:
     check_allowed("write")
-    result = sync(_root(args))
+    result = sync(_root(args), update_database=True)
     if args.json:
         return result
     lines = [result["message"], f"Written to {result['lock']}."]
     lines += [f"- {a['name']} ({a['short']}): {a['location']}" for a in result["apps"]]
+    changed = (result["database"] or {}).get("views_recreated") or []
+    if changed:
+        lines.append(f"The shared database now follows the apps list: the views {', '.join(changed)} were made "
+                     "again, so they show the rows of exactly the apps listed in project.toml.")
     lines += [f"Please note: {w}" for w in result["warnings"]]
     return "\n".join(lines)
 

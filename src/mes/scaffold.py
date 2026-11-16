@@ -590,8 +590,9 @@ def _add_script(text: str, app: str, target: str) -> str | None:
         return None  # already there: leave it to the person
     insert = f'{app} = "{target}"\n'
     head = body.rstrip("\n")
-    new_body = head + "\n" + insert + body[len(head):].lstrip("\n") if head.strip() else "\n" + insert + body.lstrip("\n")
-    if not body.endswith("\n\n") and span[1] < len(text):
+    trailing = body[len(head):]  # the newlines after the last line, kept (minus the one ending it)
+    new_body = head + "\n" + insert + trailing[1:] if head.strip() else "\n" + insert + body.lstrip("\n")
+    if not new_body.endswith("\n\n") and span[1] < len(text):
         new_body = new_body.rstrip("\n") + "\n\n"
     return text[:span[0]] + new_body + text[span[1]:]
 
@@ -679,6 +680,15 @@ def new_app(name: str, *, project_dir: str | Path | None = None, title: str | No
             else:
                 py.write_text(with_pkg, encoding="utf-8")
                 changed.append("pyproject.toml")
+        try:
+            deps = tomllib.loads(py.read_text(encoding="utf-8")).get("project", {}).get("dependencies", [])
+        except tomllib.TOMLDecodeError:
+            deps = []
+        if not any(isinstance(d, str) and re.match(rf"{re.escape(FRAMEWORK_NAME)}\b", d.strip()) for d in deps):
+            notes.append(f"The new app's commands use my-easy-software (mes.App in cli.py), but this project does "
+                         f"not depend on it, so the app's program would not start. Add {FRAMEWORK_NAME} to the "
+                         "dependencies in pyproject.toml (for example: uv add my-easy-software), or write the app's "
+                         "commands without it.")
     else:
         notes.append(f'There is no pyproject.toml, so the app\'s program is not set up. Add {app} = '
                      f'"{package}.cli:main" under [project.scripts].')
