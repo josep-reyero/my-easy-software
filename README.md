@@ -30,7 +30,7 @@ Version 1 round (in progress). A **project** (`project.toml`) holds one or more 
 jobs and their dashboards. What works:
 
 - `mes new` creates a project whose app stores data in SQLite and whose dashboard works at once;
-  `mes dev` shows it on this computer with one link (needs my-easy-ui).
+  `mes dev` shows it on this computer with one link (needs [my-easy-ui](https://github.com/josep-reyero/my-easy-ui)).
 - `mes server plan` writes one readable root script that sets a project up on a Linux server with
   its own two accounts, folders and sandboxed system units; you run it once with sudo, and
   `mes server check` verifies it. mes itself never uses sudo.
@@ -79,9 +79,9 @@ Pieces:
 
 - **my-easy-software** (this repo): the framework and its `mes` command for creating, previewing,
   deploying and sharing projects.
-- **my-easy-ui**: the dashboard server and renderer. Dashboards are plain description files with
+- **[my-easy-ui](https://github.com/josep-reyero/my-easy-ui)**: the dashboard server and renderer. Dashboards are plain description files with
   no code in them.
-- **my-bucket-storage**: space-efficient storage with an SDK.
+- **[my-bucket-storage](https://github.com/josep-reyero/my-bucket-storage)**: space-efficient storage with an SDK.
 - **[fitdata-garmin](https://github.com/josep-reyero/fitdata-garmin)**: the first app, a personal
   archive of Garmin fitness data.
 
