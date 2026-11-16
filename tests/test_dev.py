@@ -20,6 +20,8 @@ import pytest
 from mes import cli, dev, siblings
 from mes.errors import ManifestError, NotFound, UsageError
 
+import projects as helpers
+
 FAKE = """#!{python}
 import json, os, sys, time
 args = sys.argv[1:]
@@ -39,15 +41,26 @@ else:
 
 PROJECT = """[project]
 name = "demo"
+apps = ["demo_app"]
 
-[jobs.rebuild]
-run = "demo rebuild"
-manual = true
+[tables.daily]
+key = ["day"]
+columns = { day = "text", n = "integer" }
 
 [ui]
-data = "demo.sqlite"
-tables = ["daily"]
 dashboards = ["main"]
+"""
+
+APP = """[app]
+name = "demo-app"
+command = "demo-app"
+
+[data]
+writes = ["daily"]
+
+[jobs.rebuild]
+run = "rebuild"
+manual = true
 """
 
 
@@ -62,6 +75,8 @@ def fake(tmp_path, monkeypatch):
     monkeypatch.setattr(dev, "POLL", 0.05)
     for var in ("MES_PROJECT", "MES_DATA_DIR", "MES_STATE_DIR", "MES_STORE_DIR"):
         monkeypatch.delenv(var, raising=False)
+    synced: list[str] = []
+    monkeypatch.setattr(dev.apps, "sync", lambda root, **kw: synced.append(str(root)))  # tested in test_apps
 
     class Fake:
         path = exe
@@ -74,6 +89,8 @@ def fake(tmp_path, monkeypatch):
         def pid() -> int:
             return int(pid.read_text())
 
+        syncs = synced
+
     return Fake
 
 
@@ -81,7 +98,7 @@ def fake(tmp_path, monkeypatch):
 def project(tmp_path):
     folder = tmp_path / "demo"
     (folder / "ui" / "dashboards").mkdir(parents=True)
-    (folder / "project.toml").write_text(PROJECT)
+    helpers.write(folder, PROJECT, {"demo_app": APP})
     (folder / "ui" / "dashboards" / "main.yaml").write_text("spec: easy-ui/v1\ntitle: Demo\n")
     return folder
 
@@ -119,7 +136,8 @@ def test_json_mode_prints_exactly_one_object(fake, project):
     info = json.loads(lines[0])
     assert info["project"] == "demo" and info["url"] == URL
     assert "sample data" in info["data"]
-    assert info["watching"] == ["project.toml", "ui/dashboards/main.yaml"]
+    assert info["watching"] == ["project.toml", "ui/dashboards/main.yaml", "apps/demo_app/app.toml"]
+    assert fake.syncs == [str(project.resolve())] or fake.syncs == [str(project)]
     assert _gone(fake.pid())
 
 
@@ -200,7 +218,8 @@ def test_data_change_rebuilds_the_dashboard_data(fake, project, mes_home):
 
 
 def test_no_ui_section_is_a_usage_error(fake, project):
-    (project / "project.toml").write_text('[project]\nname = "demo"\n')
+    (project / "project.toml").write_text(PROJECT.split("[ui]")[0])
+    (project / "ui" / "dashboards" / "main.yaml").unlink()
     with pytest.raises(UsageError) as e:
         dev.run_dev(str(project), stop_after=0.1, out=io.StringIO(), err=io.StringIO())
     assert "[ui]" in e.value.message and "[ui]" in e.value.hint
@@ -209,6 +228,7 @@ def test_no_ui_section_is_a_usage_error(fake, project):
 
 def test_easy_ui_missing_is_not_found(project, monkeypatch, tmp_path):
     monkeypatch.setenv("MES_EASY_UI", str(tmp_path / "nowhere" / "easy-ui"))
+    monkeypatch.setattr(dev.apps, "sync", lambda root, **kw: None)
     with pytest.raises(siblings.NotFound) as e:
         dev.run_dev(str(project), stop_after=0.1, out=io.StringIO(), err=io.StringIO())
     assert e.value.code == "easy_ui_missing" and "my-easy-ui" in e.value.message

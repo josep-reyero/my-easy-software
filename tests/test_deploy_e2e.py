@@ -37,7 +37,7 @@ MES_SRC = str(Path(mes.__file__).resolve().parent.parent)
 
 CLI = '''
 from mes import App
-app = App("demo")
+app = App("demo-app")
 
 
 @app.command("hello", kind="read")
@@ -62,11 +62,16 @@ name = "demo"
 title = "Demo"
 version = "{version}"
 
-[apps.demo]
-cli = "demo"
+apps = ["demo_app"]
+'''
+
+APP_TOML = '''
+[app]
+name = "demo-app"
+cli = "demo_app.cli:app"
 
 [jobs.rebuild]
-run = "demo rebuild"
+run = "rebuild"
 manual = true
 '''
 
@@ -78,11 +83,12 @@ if os.path.exists(os.path.join(os.getcwd(), "FAIL_SYNC")):
     sys.exit(1)
 here = os.getcwd()
 os.makedirs(os.path.join(here, ".venv", "bin"), exist_ok=True)
-prog = os.path.join(here, ".venv", "bin", "demo")
-with open(prog, "w") as f:
-    f.write("#!{python}\\nimport sys\\nsys.path[:0] = [%r, %r]\\nfrom demo.cli import main\\nmain()\\n"
-            % (os.path.join(here, "src"), {mes_src!r}))
-os.chmod(prog, 0o700)
+for name, entry in (("demo-app", "from demo_app.cli import main"), ("demo", "from mes.project import main")):
+    prog = os.path.join(here, ".venv", "bin", name)
+    with open(prog, "w") as f:
+        f.write("#!{python}\\nimport sys\\nsys.path[:0] = [%r, %r]\\n%s\\nmain()\\n"
+                % (os.path.join(here, "apps"), {mes_src!r}, entry))
+    os.chmod(prog, 0o700)
 '''
 
 FAKE_SSH = '''#!{python}
@@ -128,13 +134,15 @@ class World:
 
     def write_project(self, version: str) -> None:
         p = self.project
-        (p / "src" / "demo").mkdir(parents=True, exist_ok=True)
+        (p / "apps" / "demo_app").mkdir(parents=True, exist_ok=True)
         (p / "project.toml").write_text(PROJECT_TOML.format(version=version))
         (p / "pyproject.toml").write_text('[project]\nname = "demo"\nversion = "%s"\n'
-                                          '[project.scripts]\ndemo = "demo.cli:main"\n' % version)
+                                          '[project.scripts]\ndemo = "mes.project:main"\n'
+                                          'demo-app = "demo_app.cli:main"\n' % version)
         (p / "uv.lock").write_text("version = 1\n")
-        (p / "src" / "demo" / "__init__.py").write_text("")
-        (p / "src" / "demo" / "cli.py").write_text(f"VERSION = {version!r}\n" + CLI)
+        (p / "apps" / "demo_app" / "__init__.py").write_text("")
+        (p / "apps" / "demo_app" / "app.toml").write_text(APP_TOML)
+        (p / "apps" / "demo_app" / "cli.py").write_text(f"VERSION = {version!r}\n" + CLI)
         _git(p, "add", "-A")
         _git(p, "commit", "-q", "-m", f"version {version}")
 

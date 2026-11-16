@@ -104,9 +104,21 @@ def _write_program(folder: Path, name: str, body: str) -> Path:
 
 
 def make_project(folder: Path, toml: str = PROJECT_TOML) -> Path:
-    """A project folder with project.toml and its installed program; returns the program."""
+    """A project folder with project.toml, apps/<app>/app.toml for each ``[apps.<app>] cli`` of the
+    old one-file form used here, and the installed program; returns the program."""
+    import tomllib
+
     folder.mkdir(parents=True, exist_ok=True)
-    (folder / "project.toml").write_text(toml)
+    data = tomllib.loads(toml)
+    apps = data.pop("apps", {})
+    project = data["project"]
+    lines = ["[project]"] + [f"{k} = {json.dumps(v)}" for k, v in project.items()]
+    lines.append("apps = " + json.dumps([a.replace("-", "_") for a in apps]))
+    (folder / "project.toml").write_text("\n".join(lines) + "\n")
+    for app, conf in apps.items():
+        pkg = folder / "apps" / app.replace("-", "_")
+        pkg.mkdir(parents=True, exist_ok=True)
+        (pkg / "app.toml").write_text(f'[app]\nname = "{app}"\ncommand = "{conf.get("cli", app)}"\n')
     return _write_program(folder / ".venv" / "bin", "fakeapp", FAKE_APP.format(python=sys.executable, root=str(folder)))
 
 
@@ -176,7 +188,7 @@ def test_registry_add_refuses_wrong_or_broken_program(tmp_path):
         registry.add(wrong)
     assert e.value.code == "wrong_app"
     notmes = tmp_path / "notmes"
-    make_project(notmes, '[project]\nname = "notmes"\n[apps.notmes]\ncli = "notmes"\n')
+    make_project(notmes, '[project]\nname = "notmesproj"\n[apps.notmes]\ncli = "notmes"\n')
     _write_program(notmes / ".venv" / "bin", "notmes", "#!/bin/sh\necho hello\n")
     with pytest.raises(registry.MesError) as e:
         registry.add(notmes)
@@ -720,7 +732,7 @@ def test_server_without_a_release_runs_nothing(tmp_path):
 
 def test_server_refuses_another_project_or_account(server, monkeypatch):
     layout = paths.server_layout("fakeproj", server)
-    (layout.current_project / "project.toml").write_text('[project]\nname = "other"\n[apps.fakeapp]\ncli = "fakeapp"\n')
+    (layout.current_project / "project.toml").write_text('[project]\nname = "other"\napps = ["fakeapp"]\n')
     out = _run(["fakeapp", "summary", "--json"], server_root=server)
     assert out.exit_code == 5 and _json(out)["error"]["code"] == "wrong_project"
     real = os.getuid()

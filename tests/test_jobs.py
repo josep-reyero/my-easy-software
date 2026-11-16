@@ -18,7 +18,18 @@ import pytest
 
 from mes import cli, jobs, paths
 from mes.errors import MesError, TemporaryFailure, UsageError
-from mes.manifest import loads
+
+import projects as helpers
+
+
+def loads(old_toml: str, tmp: Path | None = None):
+    """The composed project of an old-form test project.toml."""
+    import tempfile
+
+    from mes import manifest
+
+    with tempfile.TemporaryDirectory() as d:
+        return manifest.load(helpers.write_old(Path(d), old_toml))
 
 PROJECT_TOML = """
 [project]
@@ -72,7 +83,7 @@ cmd = [a for a in sys.argv[1:] if a != "--json"]
 KINDS = {{"ok": "read", "fail": "write", "sleep": "read", "temp": "write", "touch": "write",
          "reset": "admin", "describe": "read", "crash": "write"}}
 if cmd[0] == "describe":
-    print(json.dumps({{"app": os.environ.get("FAKE_APP_NAME", "demo"),
+    print(json.dumps({{"app": os.environ.get("FAKE_APP_NAME", "demo-app"),
                       "commands": [{{"name": n, "kind": k}} for n, k in KINDS.items()]}}))
 elif cmd[0] == "crash":
     print(json.dumps({{"error": {{"code": "not_found", "message": "The notes-per-day table does not exist yet.",
@@ -97,15 +108,14 @@ elif cmd[0] == "touch":
 
 
 def make_project(root: Path, *, toml: str = PROJECT_TOML, installed: bool = True) -> Path:
-    root.mkdir(parents=True, exist_ok=True)
-    (root / "project.toml").write_text(toml)
+    helpers.write_old(root, toml)
     (root / "pyproject.toml").write_text(
-        '[project]\nname = "demo"\nversion = "0.1.0"\n\n[project.scripts]\ndemo = "demo.cli:main"\n'
+        '[project]\nname = "demo"\nversion = "0.1.0"\n\n[project.scripts]\ndemo-app = "demo_app.cli:main"\n'
     )
     if installed:
         bin_dir = root / ".venv" / "bin"
         bin_dir.mkdir(parents=True)
-        exe = bin_dir / "demo"
+        exe = bin_dir / "demo-app"
         exe.write_text(FAKE_APP.format(python=sys.executable))
         exe.chmod(0o755)
     return root
@@ -137,15 +147,15 @@ def test_list_json(project_root, capsys):
     code, data = mes(capsys, "jobs", "list", "--project-dir", str(project_root))
     assert code == 0
     assert data["project"] == "demo"
-    by = {j["name"]: j for j in data["jobs"]}
-    assert by["sync"]["trigger"] == "schedule" and by["sync"]["app"] == "demo"
-    assert by["sync"]["argv"] == ["ok", "sync", "--days", "3"]
-    assert by["sync"]["network"] == ["api.example.com"]
-    assert by["sync"]["network_enforced"] == {"server": True, "this_computer": False}
-    assert by["export"]["network_enforced"] == {"server": True, "this_computer": True}
-    assert by["build"]["when"] == 'after "sync" succeeds'
-    assert by["export"]["network"] is False
-    assert by["slow"]["timeout"] == "1s"
+    by = {j["id"]: j for j in data["jobs"]}
+    assert by["demo-app.sync"]["trigger"] == "schedule" and by["demo-app.sync"]["app"] == "demo-app"
+    assert by["demo-app.sync"]["argv"] == ["ok", "sync", "--days", "3"]
+    assert by["demo-app.sync"]["network"] == ["api.example.com"]
+    assert by["demo-app.sync"]["network_enforced"] == {"server": True, "this_computer": False}
+    assert by["demo-app.export"]["network_enforced"] == {"server": True, "this_computer": True}
+    assert by["demo-app.build"]["when"] == 'after "demo-app.sync" succeeds'
+    assert by["demo-app.export"]["network"] is False
+    assert by["demo-app.slow"]["timeout"] == "1s"
     assert data["warnings"] == []
 
 
@@ -186,20 +196,20 @@ def test_run_success_logs_and_sets_env(project_root, capsys, mes_home):
     code, data = mes(capsys, "jobs", "run", "export", "--project-dir", str(project_root))
     assert code == 0, data
     assert data["project"] == "demo"
-    assert [r["job"] for r in data["runs"]] == ["export"]
+    assert [r["job"] for r in data["runs"]] == ["demo-app.export"]
     out = data["runs"][0]["data"]  # the app runs with --json, so its data comes back parsed
     assert out == json.loads(data["runs"][0]["output"])
     assert out["argv"] == ["ok", "export"]
     assert out["allow"] == "write"
-    assert out["job"] == "export"
+    assert out["job"] == "demo-app.export"
     assert Path(out["cwd"]).resolve() == project_root.resolve()
 
     records = jobs.read_log(log_file(mes_home))
     assert len(records) == 1
     rec = records[0]
-    assert rec["job"] == "export" and rec["exit_code"] == 0 and rec["result"] == "success"
-    assert rec["project"] == "demo" and rec["app"] == "demo" and rec["via"] == "mes jobs run"
-    assert rec["argv"] == [str(project_root.resolve() / ".venv" / "bin" / "demo"), "--json", "ok", "export"]
+    assert rec["job"] == "demo-app.export" and rec["exit_code"] == 0 and rec["result"] == "success"
+    assert rec["project"] == "demo" and rec["app"] == "demo-app" and rec["via"] == "mes jobs run"
+    assert rec["argv"] == [str(project_root.resolve() / ".venv" / "bin" / "demo-app"), "--json", "ok", "export"]
     assert rec["prev"] == jobs.GENESIS
     assert set(rec) >= {"time", "job", "argv", "exit_code", "duration_s", "prev"}
     assert oct(log_file(mes_home).stat().st_mode & 0o777) == oct(0o600)
@@ -208,21 +218,21 @@ def test_run_success_logs_and_sets_env(project_root, capsys, mes_home):
 def test_run_text_mode(project_root, capsys):
     assert cli.run(["jobs", "run", "export", "--project-dir", str(project_root)]) == 0
     out = capsys.readouterr().out
-    assert 'Job "export" finished successfully' in out
+    assert 'Job "demo-app.export" finished successfully' in out
 
 
 def test_run_follows_after_chain(project_root, capsys, mes_home):
     code, data = mes(capsys, "jobs", "run", "sync", "--project-dir", str(project_root))
     assert code == 0, data
-    assert [r["job"] for r in data["runs"]] == ["sync", "build", "report"]
+    assert [r["job"] for r in data["runs"]] == ["demo-app.sync", "demo-app.build", "demo-app.report"]
     assert order_file(mes_home).read_text().split() == ["build", "report"]
-    assert [r["job"] for r in jobs.read_log(log_file(mes_home))] == ["sync", "build", "report"]
+    assert [r["job"] for r in jobs.read_log(log_file(mes_home))] == ["demo-app.sync", "demo-app.build", "demo-app.report"]
 
 
 def test_run_no_chain(project_root, capsys, mes_home):
     code, data = mes(capsys, "jobs", "run", "sync", "--no-chain", "--project-dir", str(project_root))
     assert code == 0
-    assert [r["job"] for r in data["runs"]] == ["sync"]
+    assert [r["job"] for r in data["runs"]] == ["demo-app.sync"]
     assert not order_file(mes_home).exists()
 
 
@@ -230,10 +240,10 @@ def test_run_failure_stops_chain(project_root, capsys, mes_home):
     code, data = mes(capsys, "jobs", "run", "broken", "--project-dir", str(project_root))
     assert code == 1
     assert data["error"]["code"] == "job_failed"
-    assert 'The job "broken" stopped with an error' in data["error"]["message"]
-    assert "(after-broken) were not started" in data["error"]["message"]
+    assert 'The job "demo-app.broken" stopped with an error' in data["error"]["message"]
+    assert "(demo-app.after-broken) were not started" in data["error"]["message"]
     assert "the source refused the request" in data["error"]["detail"]
-    assert "uv run demo fail" in data["error"]["hint"] and "'detail'" not in data["error"]["hint"]
+    assert "uv run demo-app fail" in data["error"]["hint"] and "'detail'" not in data["error"]["hint"]
     assert not order_file(mes_home).exists()  # after-broken did not run
     rec = jobs.read_log(log_file(mes_home))[-1]
     assert rec["result"] == "exit-code" and rec["exit_code"] == 3
@@ -243,7 +253,7 @@ def test_run_failure_text_goes_to_stderr(project_root, capsys):
     assert cli.run(["jobs", "run", "broken", "--project-dir", str(project_root)]) == 1
     cap = capsys.readouterr()
     assert cap.out == ""
-    assert 'The job "broken" stopped with an error' in cap.err and "What to do:" in cap.err
+    assert 'The job "demo-app.broken" stopped with an error' in cap.err and "What to do:" in cap.err
     assert "What the app said:\nthe source refused the request" in cap.err
 
 
@@ -309,26 +319,28 @@ def test_two_apps_in_one_project(tmp_path, capsys, mes_home):
     toml = ('[project]\nname = "demo"\n[apps.demo]\ncli = "demo"\n[apps.tool]\ncli = "tool"\n'
             '[jobs.a]\nrun = "demo ok a"\nmanual = true\n[jobs.b]\nrun = "tool ok b"\nafter = "a"\n')
     root = make_project(tmp_path / "two", toml=toml)
-    tool = root / ".venv" / "bin" / "tool"
+    tool = root / ".venv" / "bin" / "demo-tool"
     tool.write_text(FAKE_APP.format(python=sys.executable).replace(
-        'os.environ.get("FAKE_APP_NAME", "demo")', '"tool"'))
+        'os.environ.get("FAKE_APP_NAME", "demo-app")', '"demo-tool"'))
     tool.chmod(0o755)
     code, data = mes(capsys, "jobs", "run", "a", "--project-dir", str(root))
     assert code == 0, data
-    assert [(r["job"], r["data"]["argv"]) for r in data["runs"]] == [("a", ["ok", "a"]), ("b", ["ok", "b"])]
-    assert [r["app"] for r in jobs.read_log(log_file(mes_home))] == ["demo", "tool"]
+    # b belongs to another app and waits for a: after = "demo-app.a" in its app.toml.
+    assert [(r["job"], r["data"]["argv"]) for r in data["runs"]] == [("demo-app.a", ["ok", "a"]),
+                                                                      ("demo-tool.b", ["ok", "b"])]
+    assert [r["app"] for r in jobs.read_log(log_file(mes_home))] == ["demo-app", "demo-tool"]
 
 
-def test_run_line_must_start_with_an_app_of_the_project(tmp_path, capsys):
-    toml = '[project]\nname = "demo"\n[jobs.x]\nrun = "python -c 1"\nmanual = true\n'
+def test_run_line_starts_with_a_command_of_the_app(tmp_path, capsys):
+    toml = '[project]\nname = "demo"\n[jobs.x]\nrun = "demo -c 1"\nmanual = true\n'
     root = make_project(tmp_path / "bad", toml=toml)
     code, data = mes(capsys, "jobs", "list", "--project-dir", str(root))
-    assert code != 0 and "not an app of this project" in data["error"]["message"]
+    assert code != 0 and "not the name of one of the app's commands" in data["error"]["message"]
 
 
 def test_interpreter_is_never_an_app_program(tmp_path):
-    toml = '[project]\nname = "demo"\n[apps.demo]\ncli = "python3"\n[jobs.x]\nrun = "demo ok"\nmanual = true\n'
-    root = make_project(tmp_path / "py", toml=toml)
+    root = make_project(tmp_path / "py", toml='[project]\nname = "demo"\n')
+    (root / "apps" / "demo_app" / "app.toml").write_text('[app]\nname = "demo-app"\ncommand = "python3"\n')
     with pytest.raises(MesError):
         jobs.load_project(root)
 
@@ -395,15 +407,15 @@ def test_log_command(project_root, capsys, mes_home):
     mes(capsys, "jobs", "run", "sync", "--project-dir", str(project_root))
     code, data = mes(capsys, "jobs", "log", "--project-dir", str(project_root))
     assert code == 0
-    assert [r["job"] for r in data["runs"]] == ["export", "sync", "build", "report"]
+    assert [r["job"] for r in data["runs"]] == ["demo-app.export", "demo-app.sync", "demo-app.build", "demo-app.report"]
     code, data = mes(capsys, "jobs", "log", "--job", "build", "--limit", "5", "--project-dir", str(project_root))
-    assert [r["job"] for r in data["runs"]] == ["build"]
+    assert [r["job"] for r in data["runs"]] == ["demo-app.build"]
     code, data = mes(capsys, "jobs", "log", "--verify", "--project-dir", str(project_root))
     assert code == 0 and data["ok"] and data["records"] == 4
     code, data = mes(capsys, "jobs", "log", "--limit", "0", "--project-dir", str(project_root))
     assert code == 2
 
-    text = log_file(mes_home).read_text().replace('"job":"export"', '"job":"exporT"')
+    text = log_file(mes_home).read_text().replace('"job":"demo-app.export"', '"job":"demo-app.exporT"')
     log_file(mes_home).write_text(text)
     code, data = mes(capsys, "jobs", "log", "--verify", "--project-dir", str(project_root))
     assert code == 1 and data["error"]["code"] == "run_log_broken"
@@ -411,9 +423,9 @@ def test_log_command(project_root, capsys, mes_home):
 
 def test_log_of_the_server(tmp_path, capsys):
     layout = paths.server_layout("demo", tmp_path / "srv")
-    jobs.append_record(layout.run_log, {"time": "t", "project": "demo", "job": "sync", "via": "systemd"})
+    jobs.append_record(layout.run_log, {"time": "t", "project": "demo", "job": "demo-app.sync", "via": "systemd"})
     code, data = mes(capsys, "jobs", "log", "--project", "demo", "--server-root", str(tmp_path / "srv"))
-    assert code == 0 and [r["job"] for r in data["runs"]] == ["sync"] and data["project"] == "demo"
+    assert code == 0 and [r["job"] for r in data["runs"]] == ["demo-app.sync"] and data["project"] == "demo"
     code, data = mes(capsys, "jobs", "log", "--verify", "--project", "demo", "--server-root", str(tmp_path / "srv"))
     assert code == 0 and data["records"] == 1
     code, data = mes(capsys, "jobs", "log", "--server-root", str(tmp_path / "srv"))
@@ -427,8 +439,8 @@ def test_status_shows_last_run(project_root, capsys):
     code, data = mes(capsys, "jobs", "status", "--project-dir", str(project_root))
     assert code == 0
     by = {r["job"]: r for r in data["jobs"]}
-    assert by["export"]["last_result"] == "success" and by["export"]["last_exit_code"] == 0
-    assert by["sync"]["last_run"] is None
+    assert by["demo-app.export"]["last_result"] == "success" and by["demo-app.export"]["last_exit_code"] == 0
+    assert by["demo-app.sync"]["last_run"] is None
     assert "mes server check" in data["note"]
 
 
@@ -473,14 +485,14 @@ def _systemd_env(monkeypatch, *, status="2", result="exit-code"):
 
 def test_record_from_systemd(server_root, capsys, monkeypatch):
     asked = _systemd_env(monkeypatch)
-    code, data = mes(capsys, "jobs", "record", "--project", "demo", "--server-root", str(server_root), "sync")
+    code, data = mes(capsys, "jobs", "record", "--project", "demo", "--server-root", str(server_root), "demo-app.sync")
     assert code == 0, data
-    assert asked == ["mes-demo.job.sync.service"] * 2
+    assert asked == ["mes-demo.job.demo-app.sync.service"] * 2
     log = paths.server_layout("demo", server_root).run_log
     rec = jobs.read_log(log)[-1]
     assert rec["via"] == "systemd" and rec["exit_code"] == 2 and rec["result"] == "exit-code"
-    assert rec["duration_s"] == 2.5 and rec["unit"] == "mes-demo.job.sync.service"
-    assert rec["project"] == "demo" and rec["job"] == "sync" and rec["prev"] == jobs.GENESIS
+    assert rec["duration_s"] == 2.5 and rec["unit"] == "mes-demo.job.demo-app.sync.service"
+    assert rec["project"] == "demo" and rec["job"] == "demo-app.sync" and rec["prev"] == jobs.GENESIS
     assert "argv" not in rec  # root reads nothing from the project's files
     code, data = mes(capsys, "jobs", "log", "--verify", "--project", "demo", "--server-root", str(server_root))
     assert code == 0 and data["records"] == 1
@@ -490,14 +502,14 @@ def test_record_killed_job_has_no_exit_code(server_root, capsys, monkeypatch):
     _systemd_env(monkeypatch, result="timeout")
     monkeypatch.setenv("EXIT_CODE", "killed")
     monkeypatch.setenv("EXIT_STATUS", "TERM")
-    code, data = mes(capsys, "jobs", "record", "--project", "demo", "--server-root", str(server_root), "sync")
+    code, data = mes(capsys, "jobs", "record", "--project", "demo", "--server-root", str(server_root), "demo-app.sync")
     assert code == 0 and data["exit_code"] is None and data["result"] == "timeout"
 
 
 def test_forged_systemd_record_is_refused(server_root, capsys, monkeypatch):
     for k, v in {"SERVICE_RESULT": "success", "EXIT_CODE": "exited", "EXIT_STATUS": "0"}.items():
         monkeypatch.setenv(k, v)
-    argv = ("jobs", "record", "--project", "demo", "--server-root", str(server_root), "sync")
+    argv = ("jobs", "record", "--project", "demo", "--server-root", str(server_root), "demo-app.sync")
     monkeypatch.setattr(jobs, "_is_linux", lambda: False)
     code, data = mes(capsys, *argv)
     assert code == 5 and data["error"]["code"] == "not_from_systemd"
@@ -526,7 +538,7 @@ def test_record_refuses_hostile_names(server_root, capsys, monkeypatch, project,
 def test_record_refuses_missing_or_linked_log_folder(tmp_path, capsys, monkeypatch):
     _systemd_env(monkeypatch)
     root = tmp_path / "srv"
-    argv = ("jobs", "record", "--project", "demo", "--server-root", str(root), "sync")
+    argv = ("jobs", "record", "--project", "demo", "--server-root", str(root), "demo-app.sync")
     code, data = mes(capsys, *argv)  # the server was never set up: a plain refusal, not a crash
     assert code == 5 and data["error"]["code"] == "unsafe_folder"
     (root / "demo").mkdir(parents=True)
@@ -542,14 +554,14 @@ def test_record_refuses_log_folder_of_another_account(server_root, capsys, monke
     _systemd_env(monkeypatch)
     real = os.getuid()
     monkeypatch.setattr(jobs.os, "getuid", lambda: real + 4242)
-    code, data = mes(capsys, "jobs", "record", "--project", "demo", "--server-root", str(server_root), "sync")
+    code, data = mes(capsys, "jobs", "record", "--project", "demo", "--server-root", str(server_root), "demo-app.sync")
     assert code == 5 and data["error"]["code"] == "unsafe_folder"
 
 
 def test_record_needs_write(server_root, capsys, monkeypatch):
     _systemd_env(monkeypatch)
     monkeypatch.setenv("MES_ALLOW", "read")
-    code, _ = mes(capsys, "jobs", "record", "--project", "demo", "--server-root", str(server_root), "sync")
+    code, _ = mes(capsys, "jobs", "record", "--project", "demo", "--server-root", str(server_root), "demo-app.sync")
     assert code == 4
 
 
@@ -580,19 +592,19 @@ def test_allow_network_sets_only_the_hosts_and_nameservers(tmp_path):
                       "search example.com\n")
     run = FakeRun()
     res = jobs.allow_network(
-        "mes-demo.job.sync.service", ["api.example.com", "cdn.example.com"],
+        "mes-demo.job.demo-app.sync.service", ["api.example.com", "cdn.example.com"],
         resolver=_resolver({"api.example.com": ["203.0.113.5", "203.0.113.5", "2001:db8::5", "0.0.0.0", "224.0.0.1"],
                             "cdn.example.com": ["198.51.100.7"]}),
         resolv_conf=str(resolv), run=run,
     )
-    assert run.calls == [["systemctl", "set-property", "--runtime", "mes-demo.job.sync.service", "IPAddressAllow=",
+    assert run.calls == [["systemctl", "set-property", "--runtime", "mes-demo.job.demo-app.sync.service", "IPAddressAllow=",
                           "IPAddressAllow=203.0.113.5 2001:db8::5 198.51.100.7 127.0.0.53 fe80::1"]]
     assert res["allowed"] == ["203.0.113.5", "2001:db8::5", "198.51.100.7", "127.0.0.53", "fe80::1"]
 
 
 def test_allow_network_with_some_hosts_unknown(tmp_path):
     run = FakeRun()
-    res = jobs.allow_network("mes-demo.job.sync.service", ["api.example.com", "gone.example.com"],
+    res = jobs.allow_network("mes-demo.job.demo-app.sync.service", ["api.example.com", "gone.example.com"],
                              resolver=_resolver({"api.example.com": ["203.0.113.5"]}),
                              resolv_conf=str(tmp_path / "none"), run=run)
     assert res["allowed"] == ["203.0.113.5"]
@@ -601,7 +613,7 @@ def test_allow_network_with_some_hosts_unknown(tmp_path):
 def test_allow_network_dns_failure_is_temporary(tmp_path):
     run = FakeRun()
     with pytest.raises(TemporaryFailure) as e:
-        jobs.allow_network("mes-demo.job.sync.service", ["api.example.com"], resolver=_resolver({}),
+        jobs.allow_network("mes-demo.job.demo-app.sync.service", ["api.example.com"], resolver=_resolver({}),
                            resolv_conf=str(tmp_path / "none"), run=run)
     assert e.value.code == "dns_failed" and e.value.exit_code == 75
     assert run.calls == []  # nothing was allowed
@@ -609,15 +621,15 @@ def test_allow_network_dns_failure_is_temporary(tmp_path):
 
 def test_allow_network_systemd_failure(tmp_path):
     with pytest.raises(MesError) as e:
-        jobs.allow_network("mes-demo.job.sync.service", ["api.example.com"],
+        jobs.allow_network("mes-demo.job.demo-app.sync.service", ["api.example.com"],
                            resolver=_resolver({"api.example.com": ["203.0.113.5"]}),
                            resolv_conf=str(tmp_path / "none"), run=FakeRun(1))
     assert e.value.code == "systemd_failed" and "Unit not loaded." in e.value.detail
 
 
 @pytest.mark.parametrize("unit", [
-    "mes-demo.net.sync.service", "sshd.service", "mes-demo.job.sync.service\nx", "mes-demo.job.sync.timer",
-    "mes-demo.job.sync.service; reboot", "-mes-demo.job.sync.service", "",
+    "mes-demo.net.demo-app.sync.service", "sshd.service", "mes-demo.job.demo-app.sync.service\nx", "mes-demo.job.demo-app.sync.timer",
+    "mes-demo.job.demo-app.sync.service; reboot", "-mes-demo.job.demo-app.sync.service", "",
 ])
 def test_allow_network_only_for_job_units(unit, tmp_path):
     run = FakeRun()
@@ -631,7 +643,7 @@ def test_allow_network_only_for_job_units(unit, tmp_path):
 def test_allow_network_refuses_hostile_hosts(host, tmp_path):
     run = FakeRun()
     with pytest.raises(MesError) as e:
-        jobs.allow_network("mes-demo.job.sync.service", [host], resolver=_resolver({host: ["0.0.0.0"]}),
+        jobs.allow_network("mes-demo.job.demo-app.sync.service", [host], resolver=_resolver({host: ["0.0.0.0"]}),
                            resolv_conf=str(tmp_path / "none"), run=run)
     assert e.value.code == "unsafe_unit_value"
     assert run.calls == []
@@ -646,10 +658,10 @@ def test_resolver_answers_are_validated():
 
 def test_allow_network_command_needs_admin_and_hosts(capsys, monkeypatch):
     monkeypatch.setenv("MES_ALLOW", "write")
-    code, _ = mes(capsys, "jobs", "allow-network", "--unit", "mes-demo.job.sync.service", "--", "api.example.com")
+    code, _ = mes(capsys, "jobs", "allow-network", "--unit", "mes-demo.job.demo-app.sync.service", "--", "api.example.com")
     assert code == 4
     monkeypatch.setenv("MES_ALLOW", "admin")
-    code, _ = mes(capsys, "jobs", "allow-network", "--unit", "mes-demo.job.sync.service")
+    code, _ = mes(capsys, "jobs", "allow-network", "--unit", "mes-demo.job.demo-app.sync.service")
     assert code == 2
 
 
@@ -662,7 +674,7 @@ def test_job_run_must_be_an_app_command(tmp_path, capsys):
     root = make_project(tmp_path / "x", toml=toml)
     code, data = mes(capsys, "jobs", "run", "bad", "--project-dir", str(root))
     assert code == 1 and data["error"]["code"] == "job_invalid"
-    assert 'Job "bad" runs "demo nosuchcmd", but demo has no such command' in data["error"]["message"]
+    assert 'Job "demo-app.bad" runs "nosuchcmd" of demo-app, but demo-app has no such command' in data["error"]["message"]
     assert "Nothing was run." in data["error"]["message"]
     code, data = mes(capsys, "jobs", "run", "boss", "--project-dir", str(root))
     assert code == 1 and "admin command" in data["error"]["message"]
@@ -680,9 +692,9 @@ def test_bad_job_in_chain_stops_before_anything_runs(tmp_path, capsys, mes_home)
 
 def test_job_problems_unit():
     project = loads(PROJECT_TOML)
-    assert jobs.job_problems(project, {"demo": {"ok": "read", "fail": "write", "sleep": "read", "temp": "write",
+    assert jobs.job_problems(project, {"demo-app": {"ok": "read", "fail": "write", "sleep": "read", "temp": "write",
                                                 "touch": "write"}}) == []
-    problems = jobs.job_problems(project, {"demo": {"ok": "admin"}}, [project.job("export")])
+    problems = jobs.job_problems(project, {"demo-app": {"ok": "admin"}}, [project.job("export")])
     assert problems and "admin command" in problems[0]
     problems = jobs.job_problems(project, {}, [project.job("export")])
     assert "has no such command" in problems[0] and "(its commands are: none)" in problems[0]
@@ -699,10 +711,10 @@ def test_failed_job_text_shows_what_the_app_said(tmp_path, capsys):
     root = make_project(tmp_path / "x", toml=toml)
     assert cli.run(["jobs", "run", "stats", "--no-chain", "--project-dir", str(root)]) == 1
     err = capsys.readouterr().err
-    assert 'The job "stats" stopped with an error' in err
+    assert 'The job "demo-app.stats" stopped with an error' in err
     assert "What the app said:\nThe notes-per-day table does not exist yet." in err
     assert "Its advice: Run the rebuild job first." in err
-    assert "uv run demo crash" in err and "'detail'" not in err
+    assert "uv run demo-app crash" in err and "'detail'" not in err
     assert "were not started" not in err  # nothing waits for it
 
 
@@ -718,7 +730,7 @@ def test_crash_inside_mes_still_logs_the_run(project_root, capsys, mes_home, mon
     code, data = mes(capsys, "jobs", "run", "export", "--project-dir", str(project_root))
     assert code == 1
     rec = jobs.read_log(log_file(mes_home))[-1]
-    assert rec["job"] == "export" and rec["result"] == "interrupted"
+    assert rec["job"] == "demo-app.export" and rec["result"] == "interrupted"
 
 
 def test_plain_words_for_limits_network_and_log(project_root, capsys):

@@ -831,13 +831,15 @@ def test_no_project_means_no_serve_item(mes_home, tmp_path):
 
 
 def test_project_folder_with_ui_is_found(tmp_path):
-    (tmp_path / "project.toml").write_text('[project]\nname = "notes"\n[ui]\ndata = "notes.sqlite"\n')
-    (tmp_path / "src").mkdir()
-    s = setup.dashboard_serve(cwd=tmp_path / "src")
+    head = '[project]\nname = "notes"\napps = ["notes_app"]\n'
+    (tmp_path / "apps" / "notes_app").mkdir(parents=True)
+    (tmp_path / "apps" / "notes_app" / "app.toml").write_text('[app]\nname = "notes-app"\ncommand = "notes-app"\n')
+    (tmp_path / "project.toml").write_text(head + '[ui]\ndashboards = ["main"]\n')
+    s = setup.dashboard_serve(cwd=tmp_path / "apps" / "notes_app")
     assert s == checks.DashboardServe("notes", "/run/mes/notes-web.sock", 443)
-    (tmp_path / "project.toml").write_text('[project]\nname = "notes"\n')  # no dashboards: nothing to serve
+    (tmp_path / "project.toml").write_text(head)  # no dashboards: nothing to serve
     assert setup.dashboard_serve(cwd=tmp_path) is None
-    (tmp_path / "project.toml").write_text('[project]\nname = "notes"\ncolour = 1\n')  # broken: setup still works
+    (tmp_path / "project.toml").write_text(head + "colour = 1\n")  # broken: setup still works
     assert setup.dashboard_serve(cwd=tmp_path) is None
 
 

@@ -9,6 +9,8 @@ from mes import App, protocol
 from mes.app import allowed_level, check_allowed
 from mes.errors import NotAllowed, NotFound, Refused
 
+import projects as helpers
+
 
 def make_app(root):
     app = App("myapp", root=root)
@@ -184,22 +186,30 @@ def test_guide_generated_and_from_agents_md(app, tmp_path, capsys):
     assert capsys.readouterr().out == "# Use myapp carefully\n"
 
 
+def _in_project(tmp_path, project='[project]\nname = "myproj"\napps = ["myapp"]\n', app_toml=None, more=None):
+    apps = {"myapp": app_toml or '[app]\nname = "myapp"\ncommand = "myapp"\n', **(more or {})}
+    helpers.write(tmp_path, project, apps)
+    return make_app(tmp_path)
+
+
 def test_manifest_gives_title_version_and_jobs(tmp_path, capsys):
-    (tmp_path / "project.toml").write_text(
-        '[project]\nname = "myapp"\ntitle = "My App"\nversion = "1.2.3"\n'
-        '[jobs.sync]\nrun = "myapp summary --days 1"\nschedule = "daily"\n'
-    )
-    app = make_app(tmp_path)
+    app = _in_project(tmp_path, '[project]\nname = "myproj"\ntitle = "My project"\nversion = "1.2.3"\napps = ["myapp"]\n',
+                      '[app]\nname = "myapp"\ntitle = "My App"\nversion = "2.0.0"\ncommand = "myapp"\n'
+                      '[jobs.sync]\nrun = "summary --days 1"\nschedule = "daily"\n')
     code, data = run_json(app, capsys, "--json", "describe")
-    assert data["title"] == "My App" and data["version"] == "1.2.3" and data["project"] == "myapp"
+    assert code == 0, data
+    assert data["title"] == "My App" and data["version"] == "2.0.0" and data["project"] == "myproj"
+    assert data["short"] == "myapp"
     job = data["jobs"][0]
-    assert job["name"] == "sync" and job["app"] == "myapp" and job["argv"] == ["summary", "--days", "1"]
+    assert job["id"] == "myapp.sync" and job["name"] == "sync" and job["app"] == "myapp"
+    assert job["argv"] == ["summary", "--days", "1"]
     assert app.run(["describe"]) == 0
-    assert 'runs "myapp summary --days 1"' in capsys.readouterr().out
+    assert "myapp.sync" in capsys.readouterr().out
 
 
 def test_app_not_in_project_is_an_error(tmp_path, capsys):
-    (tmp_path / "project.toml").write_text('[project]\nname = "other"\n')
+    helpers.write(tmp_path, '[project]\nname = "other"\napps = ["other_x"]\n',
+                  {"other_x": '[app]\nname = "other-x"\ncommand = "other-x"\n'})
     app = make_app(tmp_path)
     code, data = run_json(app, capsys, "--json", "describe")
     assert code == 1 and data["error"]["code"] == "manifest_invalid"
@@ -207,35 +217,52 @@ def test_app_not_in_project_is_an_error(tmp_path, capsys):
 
 
 def test_one_of_several_apps_sees_only_its_jobs(tmp_path, capsys, mes_home):
-    (tmp_path / "project.toml").write_text(
-        '[project]\nname = "fitness"\n[apps.myapp]\n[apps.other]\n'
-        '[jobs.mine]\nrun = "myapp summary"\nmanual = true\n'
-        '[jobs.theirs]\nrun = "other sync"\nmanual = true\n'
-    )
-    app = make_app(tmp_path)
+    app = _in_project(tmp_path, '[project]\nname = "fitness"\napps = ["myapp", "fitness_other"]\n',
+                      '[app]\nname = "myapp"\ncommand = "myapp"\n[jobs.mine]\nrun = "summary"\nmanual = true\n',
+                      {"fitness_other": '[app]\nname = "fitness-other"\ncommand = "fitness-other"\n'
+                                        '[jobs.theirs]\nrun = "sync"\nmanual = true\n'})
     code, data = run_json(app, capsys, "--json", "describe")
     assert code == 0 and data["app"] == "myapp" and data["project"] == "fitness"
-    assert [j["name"] for j in data["jobs"]] == ["mine"]
-    # Data belongs to the project, not to the app.
+    assert [j["id"] for j in data["jobs"]] == ["myapp.mine"]
+    # The data folder belongs to the project; each app also has its own folder inside it.
     code, data = run_json(app, capsys, "--json", "add-note", "hi")
     assert code == 0 and data["saved"] == str(mes_home["data"] / "fitness" / "notes.txt")
 
 
+def test_app_data_dir_and_shared_database(tmp_path, capsys, mes_home):
+    app = _in_project(tmp_path, '[project]\nname = "fitness"\napps = ["myapp"]\n[tables.days]\nkey = ["date"]\n'
+                      'columns = { date = "text", n = "integer" }\n',
+                      '[app]\nname = "myapp"\ncommand = "myapp"\n[data]\nwrites = ["days"]\n')
+
+    @app.command("fill", kind="write")
+    def fill(ctx):
+        with ctx.db() as db:
+            db.replace_rows("days", [{"date": "2026-01-01", "n": 1}])
+        return {"folder": str(ctx.app_data_dir), "db": str(ctx.db_path)}
+
+    code, data = run_json(app, capsys, "--json", "fill")
+    assert code == 0, data
+    assert data["folder"] == str(mes_home["data"] / "fitness" / "myapp")
+    assert data["db"] == str(mes_home["data"] / "fitness" / "fitness.sqlite")
+    import sqlite3
+
+    rows = sqlite3.connect(data["db"]).execute("SELECT source, date, n FROM days").fetchall()
+    assert rows == [("myapp", "2026-01-01", 1)]
+
+
 def test_mes_project_mismatch_is_refused(tmp_path, capsys, monkeypatch):
-    (tmp_path / "project.toml").write_text('[project]\nname = "myapp"\n')
     monkeypatch.setenv("MES_PROJECT", "someone-else")
-    app = make_app(tmp_path)
+    app = _in_project(tmp_path)
     code, data = run_json(app, capsys, "--json", "describe")
     assert code != 0 and data["error"]["code"] == "wrong_project"
 
 
 def test_session_dirs_only_for_own_project(tmp_path, capsys, monkeypatch, mes_home):
-    (tmp_path / "project.toml").write_text('[project]\nname = "myapp"\n')
     own = tmp_path / "own-data"
     own.mkdir()
-    monkeypatch.setenv("MES_PROJECT", "myapp")
+    monkeypatch.setenv("MES_PROJECT", "myproj")
     monkeypatch.setenv("MES_DATA_DIR", str(own))
-    app = make_app(tmp_path)
+    app = _in_project(tmp_path)
     code, data = run_json(app, capsys, "--json", "add-note", "x")
     assert code == 0 and data["saved"] == str(own / "notes.txt")
 
@@ -254,9 +281,20 @@ def test_data_dir_override_from_machine_config(tmp_path, capsys, mes_home, monke
     assert code == 0 and data["saved"] == str(elsewhere / "notes.txt")
 
 
-def test_root_discovered_from_caller_file():
-    app = App("myapp")
-    assert app.root == Path(__file__).resolve().parent.parent  # the repo root (pyproject.toml)
+def test_root_discovered_from_caller_file(monkeypatch):
+    monkeypatch.delenv("MES_PROJECT_DIR", raising=False)
+    app = App("myapp")  # tests/ is in no project and no app folder
+    assert app.app_dir is None
+
+
+def test_app_finds_its_folder_and_project_from_its_file(tmp_path, monkeypatch):
+    monkeypatch.delenv("MES_PROJECT_DIR", raising=False)
+    helpers.write(tmp_path, '[project]\nname = "myproj"\napps = ["myapp"]\n',
+                  {"myapp": '[app]\nname = "myapp"\ncommand = "myapp"\n'})
+    code = compile('from mes import App\napp = App("myapp")\n', str(tmp_path / "apps" / "myapp" / "cli.py"), "exec")
+    ns = {"__file__": str(tmp_path / "apps" / "myapp" / "cli.py")}
+    exec(code, ns)
+    assert ns["app"].app_dir == (tmp_path / "apps" / "myapp").resolve() and ns["app"].root == tmp_path.resolve()
 
 
 def test_registration_errors(tmp_path):
@@ -300,7 +338,8 @@ def test_context_config(tmp_path, capsys, mes_home):
 
 
 def test_broken_manifest_only_blocks_commands_that_need_it(tmp_path, capsys):
-    (tmp_path / "project.toml").write_text('[project]\nname = "myapp"\ncolour = "red"\n')
+    helpers.write(tmp_path, '[project]\nname = "myproj"\napps = ["myapp"]\ncolour = "red"\n',
+                  {"myapp": '[app]\nname = "myapp"\ncommand = "myapp"\n'})
     app = make_app(tmp_path)
     assert run_json(app, capsys, "--json", "summary") == (0, {"days": 7, "json": True})
     code, data = run_json(app, capsys, "--json", "describe")

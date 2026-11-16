@@ -24,7 +24,8 @@ from mes import cli, manifest, scaffold
 from mes.errors import NotFound, Refused, UsageError
 
 FRAMEWORK = Path(__file__).resolve().parents[1]
-FIVE = {"project.toml", "pyproject.toml", "src/{m}/cli.py", "AGENTS.md", "ui/dashboards/main.yaml", ".gitignore"}
+FIVE = {"project.toml", "pyproject.toml", "AGENTS.md", ".gitignore", "apps/{m}_main/__init__.py",
+        "apps/{m}_main/app.toml", "apps/{m}_main/cli.py", "apps/{m}_main/AGENTS.md", "ui/dashboards/overview.yaml"}
 CREATED = FIVE | {scaffold.FIXTURE}
 EASY_UI = FRAMEWORK.parent / "my-easy-ui" / ".venv" / "bin" / "easy-ui"
 
@@ -78,26 +79,39 @@ def test_mes_is_not_a_project_name():
 # --------------------------------------------------------------------------- rendering
 
 
-def test_render_gives_exactly_five_files_with_no_markers_left():
+def test_render_gives_the_project_and_one_app_with_no_markers_left():
     files = scaffold.render("my-notes", framework_path=FRAMEWORK, app_dir=FRAMEWORK.parent / "my-notes")
     assert set(files) == five("my_notes")
     for rel, text in files.items():
         assert not re.search(r"\{\{[a-z_]+\}\}", text), rel
-        assert text.endswith("\n")
+        assert text == "" or text.endswith("\n")
 
 
-def test_rendered_project_toml_is_valid_and_job_runs_an_app_command():
+def test_rendered_project_composes_and_its_job_runs_an_app_command():
     files = scaffold.render("my-notes")
-    m = manifest.loads(files["project.toml"])
-    assert (m.name, m.title, m.version) == ("my-notes", "My notes", "0.1.0")
-    assert list(m.apps) == ["my-notes"] and m.app("my-notes").cli == "my-notes"
-    job = m.job("rebuild")
-    assert job.run == "my-notes rebuild" and job.app == "my-notes" and job.argv == ("rebuild",)
+    p = scaffold._compose_texts(files)
+    assert (p.name, p.title, p.version) == ("my-notes", "My notes", "0.1.0")
+    assert list(p.apps) == ["my-notes-main"]
+    spec = p.apps["my-notes-main"]
+    assert (spec.package, spec.short, spec.prefix, spec.program) == ("my_notes_main", "main", "main_", "my-notes-main")
+    assert spec.cli == "my_notes_main.cli:app" and spec.data.writes == ("daily",) and spec.data.tables == ("main_notes",)
+    job = p.job("my-notes-main.rebuild")
+    assert job.run == "rebuild" and job.argv == ("rebuild",)
     assert job.trigger == "manual" and job.network == () and job.timeout == "5m"
-    assert m.ui == manifest.UI(data="my-notes.sqlite", tables=("daily",), dashboards=("main",),
-                               refresh_after=("rebuild",))
-    assert '@app.command("rebuild"' in files["src/my_notes/cli.py"]
-    assert 'DATA_FILE = "my-notes.sqlite"' in files["src/my_notes/cli.py"]
+    assert p.ui == manifest.UI(dashboards=("overview",), refresh_after=("my-notes-main.rebuild",))
+    assert list(p.tables) == ["daily"] and p.allowlist() == ["daily"]
+    assert '@app.command("rebuild"' in files["apps/my_notes_main/cli.py"]
+
+
+def test_another_first_app():
+    files = scaffold.render("my-notes", short="diary")
+    p = scaffold._compose_texts(files)
+    assert list(p.apps) == ["my-notes-diary"] and p.apps["my-notes-diary"].prefix == "diary_"
+    assert "apps/my_notes_diary/cli.py" in files
+    with pytest.raises(UsageError):
+        scaffold.render("my-notes", short="describe")
+    with pytest.raises(UsageError):
+        scaffold.render("my-notes", short="Bad")
 
 
 def test_rendered_pyproject():
@@ -106,8 +120,8 @@ def test_rendered_pyproject():
     assert data["project"]["name"] == "my-notes"
     assert data["project"]["requires-python"] == ">=3.12"
     assert data["project"]["dependencies"] == ["my-easy-software>=0.1.0"]
-    assert data["project"]["scripts"] == {"my-notes": "my_notes.cli:main"}
-    assert data["tool"]["hatch"]["build"]["targets"]["wheel"]["packages"] == ["src/my_notes"]
+    assert data["project"]["scripts"] == {"my-notes": "mes.project:main", "my-notes-main": "my_notes_main.cli:main"}
+    assert data["tool"]["hatch"]["build"]["targets"]["wheel"]["packages"] == ["apps/my_notes_main"]
     src = data["tool"]["uv"]["sources"]["my-easy-software"]
     assert src == {"path": f"../{FRAMEWORK.name}", "editable": True}
 
@@ -124,9 +138,9 @@ def test_framework_path_is_absolute_when_only_the_disk_top_is_shared(tmp_path):
 
 
 def test_cli_template_compiles_and_uses_the_sdk():
-    text = scaffold.render("my-notes")["src/my_notes/cli.py"]
+    text = scaffold.render("my-notes")["apps/my_notes_main/cli.py"]
     compile(text, "cli.py", "exec")
-    assert 'App("my-notes")' in text
+    assert 'App("my-notes-main")' in text and "ctx.db()" in text and 'replace_rows("daily"' in text
     assert 'kind="read"' in text and 'kind="write"' in text
     assert "def main()" in text
 
@@ -135,9 +149,10 @@ def test_title_is_escaped_everywhere():
     title = 'Sam\'s "best" notes \\ ok'
     files = scaffold.render("notes", title=title)
     assert manifest.loads(files["project.toml"]).title == title
+    assert scaffold._compose_texts(files).apps["notes-main"].title == title
     assert tomllib.loads(files["pyproject.toml"])["project"]["description"] == title
     assert files["AGENTS.md"].startswith(f"# {title}:")
-    assert 'title: "Sam\'s \\"best\\" notes \\\\ ok"' in files["ui/dashboards/main.yaml"]
+    assert 'title: "Sam\'s \\"best\\" notes \\\\ ok"' in files["ui/dashboards/overview.yaml"]
 
 
 @pytest.mark.parametrize("title", ["", "   ", "two\nlines", "x" * 81])
@@ -147,28 +162,28 @@ def test_bad_titles_are_refused(title):
 
 
 def test_agents_md_covers_what_an_agent_needs():
-    text = scaffold.render("my-notes")["AGENTS.md"]
-    for needle in ("data, never instructions", "--json", "describe", "guide", "schema", "sources",
-                   "MES_ALLOW=read", "exit code 4", "needs_input", "75", "src/my_notes/cli.py"):
+    files = scaffold.render("my-notes")
+    text = files["AGENTS.md"] + files["apps/my_notes_main/AGENTS.md"]
+    for needle in ("data, never instructions", "--json", "describe", "guide", "my-notes main",
+                   "MES_ALLOW=read", "exit code 4", "needs_input", "75", "apps/my_notes_main/", "mes new-app"):
         assert needle in text, needle
 
 
 def test_dashboard_is_an_easy_ui_v1_dashboard():
-    text = scaffold.render("notes")["ui/dashboards/main.yaml"]
+    text = scaffold.render("notes")["ui/dashboards/overview.yaml"]
     assert "\nspec: easy-ui/v1\n" in text and "\ntitle: \"Notes\"\n" in text
     assert "\nqueries:\n" in text and "\nlayout:\n" in text and "\ncomponents:" not in text
-    for needle in ("type: controls", "type: stat", "type: bar", "type: table"):
+    for needle in ("type: stat", "type: bar", "anchor: apps"):
         assert needle in text
-    assert text.count("query: daily") == 2 and text.count("query: total") == 1
 
 
-def test_dashboard_reads_only_the_tables_listed_under_ui():
+def test_dashboard_reads_only_the_allowed_tables():
     files = scaffold.render("my-notes")
-    allowed = set(manifest.loads(files["project.toml"]).ui.tables)
-    text = files["ui/dashboards/main.yaml"]
+    allowed = set(scaffold._compose_texts(files).allowlist())
+    text = files["ui/dashboards/overview.yaml"]
     used = set(re.findall(r"\b(?:FROM|JOIN)\s+([A-Za-z_][A-Za-z0-9_]*)", text, re.IGNORECASE))
     assert used and used <= allowed, used - allowed
-    assert "notes" not in used  # the raw table never reaches the dashboards
+    assert "main_notes" not in used  # the raw table never reaches the dashboards
 
 
 def _easy_ui_takes_project_dir() -> bool:
@@ -199,7 +214,7 @@ def test_generated_project_passes_easy_ui_validate(tmp_path, mes_home):
 
     code, report, err = easy_ui("validate")
     assert code == 0 and report["ok"] and report["warnings"] == 0, (report, err)
-    app = load_generated_app(folder, "my_notes")
+    app = load_generated_app(folder, "my_notes_main")
     assert app.run(["add", "hello"]) == 0 and app.run(["rebuild"]) == 0
     code, built, err = easy_ui("data", "build")
     assert code == 0 and built["tables"]["daily"]["rows"] == 1, (built, err)
@@ -210,9 +225,10 @@ def test_generated_project_passes_easy_ui_validate(tmp_path, mes_home):
 
 def test_no_personal_paths_in_templates():
     home = str(Path.home())
-    for tmpl, _ in scaffold.FILES:
-        text = (FRAMEWORK / "src" / "mes" / "templates" / "project" / tmpl).read_text()
-        assert home not in text
+    for kind, files in (("project", scaffold.FILES), ("app", scaffold.APP_FILES)):
+        for tmpl, _ in files:
+            if tmpl:
+                assert home not in (FRAMEWORK / "src" / "mes" / "templates" / kind / tmpl).read_text()
 
 
 # --------------------------------------------------------------------------- creating
@@ -225,31 +241,39 @@ def test_create_writes_the_files_and_the_sample_data(tmp_path):
     assert result["created"] is True and result["project"] == "my-notes"
     assert result["folder"] == str(folder.resolve())
     assert [f["path"] for f in result["files"]] == [
-        "project.toml", "pyproject.toml", "src/my_notes/cli.py", "AGENTS.md", "ui/dashboards/main.yaml",
-        ".gitignore", scaffold.FIXTURE]
+        "project.toml", "pyproject.toml", "AGENTS.md", ".gitignore", "apps/my_notes_main/__init__.py",
+        "apps/my_notes_main/app.toml", "apps/my_notes_main/cli.py", "apps/my_notes_main/AGENTS.md",
+        "ui/dashboards/overview.yaml", scaffold.FIXTURE]
+    assert (result["app"], result["package"], result["short"]) == ("my-notes-main", "my_notes_main", "main")
     assert all(f["purpose"] for f in result["files"])
     assert result["next_steps"][0]["command"].endswith("uv sync")
     assert all(s["why"] for s in result["next_steps"])
     commands = " ".join(s["command"] or "" for s in result["next_steps"])
-    assert "mes jobs run rebuild" in commands and "mes dev" in commands
+    assert "mes apps sync" in commands and "mes jobs run my-notes-main.rebuild" in commands and "mes dev" in commands
+    assert "my-notes main add" in commands
 
 
 def test_sample_data_has_60_days_of_daily():
     import datetime as dt
     import tempfile
 
-    blob = scaffold.sample_data(dt.date(2026, 3, 1))
-    assert blob == scaffold.sample_data(dt.date(2026, 3, 1))  # the same every time
+    project = scaffold._compose_texts(scaffold.render("notes"))
+    blob = scaffold.sample_data(project, dt.date(2026, 3, 1))
+    assert blob == scaffold.sample_data(project, dt.date(2026, 3, 1))  # the same every time
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "s.sqlite"
         path.write_bytes(blob)
         conn = sqlite3.connect(path)
         try:
-            tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")]
+            tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+            views = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'view'")}
             rows = conn.execute("SELECT day, notes FROM daily ORDER BY day").fetchall()
+            sources = {r[0] for r in conn.execute("SELECT DISTINCT source FROM daily")}
         finally:
             conn.close()
-    assert tables == ["daily"] and len(rows) == 60
+    # Made with the project's own schema script: the rows table, read through the view "daily".
+    assert tables == {"daily__rows", "main_notes"} and views == {"daily"} and len(rows) == 60
+    assert sources == {"notes-main"}
     assert rows[-1][0] == "2026-03-01" and rows[0][0] == "2026-01-01"
     assert all(0 <= n <= 6 for _, n in rows)
 
@@ -392,9 +416,10 @@ def test_mes_new_without_name_is_usage_error(capsys):
 
 
 def load_generated_app(folder: Path, module: str):
-    """Import the generated src/<module>/cli.py (the App finds project.toml from the file's place)."""
+    """Import the generated apps/<package>/cli.py (the App finds its app.toml and project.toml from the
+    file's place)."""
     unique = f"generated_{module}_{abs(hash(str(folder)))}"
-    spec = importlib.util.spec_from_file_location(unique, folder / "src" / module / "cli.py")
+    spec = importlib.util.spec_from_file_location(unique, folder / "apps" / module / "cli.py")
     mod = importlib.util.module_from_spec(spec)
     sys.modules[unique] = mod
     try:
@@ -410,7 +435,7 @@ def generated(tmp_path, monkeypatch):
         monkeypatch.delenv(var, raising=False)
     folder = tmp_path / "my-notes"
     scaffold.create("my-notes", directory=folder, framework_path=FRAMEWORK)
-    return folder, load_generated_app(folder, "my_notes")
+    return folder, load_generated_app(folder, "my_notes_main")
 
 
 def _json(app, capsys, *argv):
@@ -422,11 +447,13 @@ def _json(app, capsys, *argv):
 def test_generated_app_reads_its_project(generated, capsys):
     folder, app = generated
     assert app.root == folder.resolve() and app.project == "my-notes"
+    assert app.app_dir == (folder / "apps" / "my_notes_main").resolve()
     code, data = _json(app, capsys, "describe")
-    assert code == 0 and (data["app"], data["project"], data["title"]) == ("my-notes", "my-notes", "My notes")
+    assert code == 0 and (data["app"], data["project"], data["title"]) == ("my-notes-main", "my-notes", "My notes")
+    assert data["short"] == "main"
     kinds = {c["name"]: c["kind"] for c in data["commands"]}
     assert kinds["notes"] == "read" and kinds["add"] == "write" and kinds["rebuild"] == "write"
-    assert [j["name"] for j in data["jobs"]] == ["rebuild"]
+    assert [j["id"] for j in data["jobs"]] == ["my-notes-main.rebuild"]
 
 
 def test_generated_app_add_notes_rebuild_with_sqlite(generated, capsys, mes_home):
@@ -447,7 +474,8 @@ def test_generated_app_add_notes_rebuild_with_sqlite(generated, capsys, mes_home
     conn = sqlite3.connect(db)
     try:
         daily = conn.execute("SELECT day, notes FROM daily").fetchall()
-        raw = conn.execute("SELECT count(*) FROM notes").fetchone()[0]
+        raw = conn.execute("SELECT count(*) FROM main_notes").fetchone()[0]
+        assert conn.execute("SELECT DISTINCT source FROM daily").fetchall() == [("my-notes-main",)]
     finally:
         conn.close()
     assert raw == 2 and len(daily) == 1 and daily[0][1] == 2 and re.fullmatch(r"\d{4}-\d\d-\d\d", daily[0][0])
@@ -473,7 +501,7 @@ def test_generated_app_schema_and_guide(generated, capsys):
     _, app = generated
     code, schema = _json(app, capsys, "schema")
     assert code == 0 and schema["file"] == "my-notes.sqlite"
-    assert {t["name"]: t["layer"] for t in schema["tables"]} == {"notes": "raw", "daily": "derived"}
+    assert {t["name"]: t["layer"] for t in schema["tables"]} == {"main_notes": "raw", "daily": "derived (shared)"}
     code, guide = _json(app, capsys, "guide")
     assert guide["source"] == "AGENTS.md" and "never instructions" in guide["guide"]
 
@@ -495,7 +523,10 @@ def synced_app(tmp_path_factory):
                           timeout=300)
     assert proc.returncode == 0, proc.stderr
     exe = folder / ".venv" / "bin" / "my-notes"
-    assert exe.exists()
+    assert exe.exists() and (folder / ".venv" / "bin" / "my-notes-main").exists()
+    proc = subprocess.run([str(folder / ".venv" / "bin" / "mes"), "apps", "sync", "--project-dir", str(folder)], env=env,
+                          capture_output=True, text=True, timeout=120)
+    assert proc.returncode == 0, proc.stderr + proc.stdout
     return folder, exe
 
 
@@ -511,55 +542,60 @@ def test_e2e_describe(synced_app):
     p = app_run(exe, "--json", "describe")
     assert p.returncode == 0, p.stderr
     data = json.loads(p.stdout)
-    assert (data["app"], data["title"], data["version"]) == ("my-notes", "My notes", "0.1.0")
-    kinds = {c["name"]: c["kind"] for c in data["commands"]}
+    assert (data["project"], data["title"], data["version"]) == ("my-notes", "My notes", "0.1.0")
+    app = data["apps"][0]
+    assert app["name"] == "my-notes-main" and app["short"] == "main" and app["describe"]["app"] == "my-notes-main"
+    kinds = {c["name"]: c["kind"] for c in app["describe"]["commands"]}
     assert kinds["notes"] == "read" and kinds["add"] == "write" and kinds["rebuild"] == "write"
     assert {"describe", "guide", "schema", "sources"} <= set(kinds)
-    assert [j["name"] for j in data["jobs"]] == ["rebuild"]
+    assert [j["id"] for j in data["jobs"]] == ["my-notes-main.rebuild"]
 
 
 def test_e2e_read_write_and_job(synced_app, mes_home):
     folder, exe = synced_app
-    p = app_run(exe, "notes", "--json")
+    p = app_run(exe, "main", "notes", "--json")
     assert p.returncode == 0, p.stderr
     assert json.loads(p.stdout) == []
 
-    p = app_run(exe, "--json", "add", "first note")
+    p = app_run(exe, "--json", "main", "add", "first note")
     assert p.returncode == 0, p.stderr
     assert json.loads(p.stdout)["text"] == "first note"
-    app_run(exe, "add", "second note")
+    p = app_run(exe, "add", "second note")  # one app: passed on, with a note on stderr
+    assert p.returncode == 0 and "my-notes main add" in p.stderr
 
-    p = app_run(exe, "--json", "notes", "--last", "1")
+    p = app_run(exe, "--json", "main", "notes", "--last", "1")
     assert [r["text"] for r in json.loads(p.stdout)] == ["second note"]
-    p = app_run(exe, "notes")
+    p = app_run(exe, "main", "notes")
     assert p.returncode == 0 and "first note" in p.stdout and "second note" in p.stdout
 
-    p = app_run(exe, "--json", "rebuild")
+    p = app_run(exe, "--json", "main", "rebuild")
     assert p.returncode == 0, p.stderr
     assert json.loads(p.stdout)["notes"] == 2
 
     assert (mes_home["data"] / "my-notes" / "my-notes.sqlite").is_file()
     in_repo = {p for p in files_in(folder) if not p.startswith(".venv/") and "__pycache__" not in p}
-    assert in_repo == created("my_notes") | {"uv.lock"}  # no data was written inside the project folder
+    assert in_repo == created("my_notes") | {"uv.lock", "apps.lock.json"}  # no data inside the project folder
 
 
 def test_e2e_write_is_not_allowed_for_read_sessions(synced_app, mes_home):
     _, exe = synced_app
-    p = app_run(exe, "add", "nope", "--json", MES_ALLOW="read")
+    p = app_run(exe, "main", "add", "nope", "--json", MES_ALLOW="read")
     assert p.returncode == 4
     assert json.loads(p.stdout)["error"]["code"] == "not_allowed"
-    p = app_run(exe, "--json", "notes", MES_ALLOW="read")
+    p = app_run(exe, "--json", "main", "notes", MES_ALLOW="read")
     assert p.returncode == 0 and json.loads(p.stdout) == []
 
 
 def test_e2e_errors_and_guide(synced_app):
     _, exe = synced_app
-    p = app_run(exe, "--json", "add", "   ")
+    p = app_run(exe, "--json", "main", "add", "   ")
     assert p.returncode == 2 and json.loads(p.stdout)["error"]["code"] == "usage"
     p = app_run(exe, "--json", "guide")
     assert p.returncode == 0
     g = json.loads(p.stdout)
-    assert g["source"] == "AGENTS.md" and "never instructions" in g["guide"]
+    assert "never instructions" in json.dumps(g) and "my-notes-main" in json.dumps(g)
+    p = app_run(exe, "--json", "nosuchapp")
+    assert p.returncode != 0
 
 
 
@@ -599,3 +635,97 @@ def test_home_path_note_mentions_uv_lock(tmp_path, monkeypatch):
     monkeypatch.setattr(scaffold, "_home_name_in", lambda text: True)
     result = scaffold.create("my-notes", directory=tmp_path / "app", framework_path=FRAMEWORK)
     assert any("uv.lock" in n for n in result["notes"])
+
+
+# --------------------------------------------------------------------------- mes new-app
+
+
+@pytest.fixture
+def made(tmp_path):
+    folder = tmp_path / "my-notes"
+    scaffold.create("my-notes", directory=folder, framework_path=FRAMEWORK)
+    return folder
+
+
+def test_new_app_adds_the_folder_and_edits_two_lines(made):
+    before_py = (made / "pyproject.toml").read_text()
+    result = scaffold.new_app("rides", project_dir=made)
+    assert (result["app"], result["package"], result["short"], result["prefix"]) == (
+        "my-notes-rides", "my_notes_rides", "rides", "rides_")
+    assert {f["path"] for f in result["files"]} == {
+        "apps/my_notes_rides/__init__.py", "apps/my_notes_rides/app.toml", "apps/my_notes_rides/cli.py",
+        "apps/my_notes_rides/AGENTS.md", "apps/my_notes_rides/dashboards/rides.yaml"}
+    assert result["changed"] == ["project.toml", "pyproject.toml"] and result["notes"] == []
+    assert 'apps = ["my_notes_main", "my_notes_rides"]' in (made / "project.toml").read_text()
+    py = tomllib.loads((made / "pyproject.toml").read_text())
+    assert py["project"]["scripts"]["my-notes-rides"] == "my_notes_rides.cli:main"
+    assert py["tool"]["hatch"]["build"]["targets"]["wheel"]["packages"] == ["apps/my_notes_main", "apps/my_notes_rides"]
+    # Only those lines changed: the rest of the file is as it was.
+    after = (made / "pyproject.toml").read_text().splitlines()
+    assert sorted(set(after) - set(before_py.splitlines())) == [
+        'my-notes-rides = "my_notes_rides.cli:main"', 'packages = ["apps/my_notes_main", "apps/my_notes_rides"]']
+    p = manifest.load(made)
+    assert list(p.apps) == ["my-notes-main", "my-notes-rides"]
+    assert p.allowlist() == ["daily", "rides_items"]
+    assert "my-notes-rides.rebuild" in p.jobs
+    compile((made / "apps" / "my_notes_rides" / "cli.py").read_text(), "cli.py", "exec")
+    commands = " ".join(s["command"] for s in result["next_steps"])
+    assert "uv sync" in commands and "mes apps sync" in commands
+
+
+def test_new_app_works_in_process(made, capsys, mes_home, monkeypatch):
+    for var in ("MES_PROJECT", "MES_DATA_DIR"):
+        monkeypatch.delenv(var, raising=False)
+    scaffold.new_app("my-notes-rides", project_dir=made)  # the full name works too
+    app = load_generated_app(made, "my_notes_rides")
+    assert app.run(["--json", "add", "ride one"]) == 0
+    capsys.readouterr()
+    assert app.run(["--json", "rebuild"]) == 0
+    assert json.loads(capsys.readouterr().out) == {"table": "rides_items", "rows": 1}
+    db = mes_home["data"] / "my-notes" / "my-notes.sqlite"
+    assert sqlite3.connect(db).execute("SELECT text FROM rides_items").fetchall() == [("ride one",)]
+    assert (mes_home["data"] / "my-notes" / "rides" / "items.jsonl").is_file()
+
+
+@pytest.mark.parametrize("name", ["main", "describe", "Bad", "x" * 40, "my-notes-main"])
+def test_new_app_refuses_taken_or_bad_names(made, name):
+    with pytest.raises((Refused, UsageError)):
+        scaffold.new_app(name, project_dir=made)
+    assert not (made / "apps" / "my_notes_describe").exists()
+
+
+def test_new_app_refuses_overlapping_prefixes(made):
+    with pytest.raises(Refused):
+        scaffold.new_app("main-x", project_dir=made)  # its tables would start with main_ too
+
+
+def test_new_app_never_writes_through_a_link(made, tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (made / "apps" / "my_notes_rides").symlink_to(outside)
+    with pytest.raises(Refused):
+        scaffold.new_app("rides", project_dir=made)
+    assert not list(outside.iterdir())
+
+
+def test_new_app_gives_the_line_when_it_cannot_edit(made):
+    text = (made / "project.toml").read_text().replace('apps = ["my_notes_main"]', 'apps = [\n  "my_notes_main",\n]')
+    (made / "project.toml").write_text(text)
+    result = scaffold.new_app("rides", project_dir=made)
+    assert "project.toml" not in result["changed"]
+    assert any('"my_notes_rides"' in n and "under [project]" in n for n in result["notes"])
+    assert (made / "project.toml").read_text() == text
+
+
+def test_mes_new_app_command(made, capsys):
+    code, out, err = run_mes(capsys, "--json", "new-app", "rides", "--project-dir", str(made))
+    assert code == 0, err
+    assert json.loads(out)["app"] == "my-notes-rides"
+    code, out, err = run_mes(capsys, "new-app", "walks", "--project-dir", str(made))
+    assert code == 0 and 'Added the app "my-notes-walks"' in out and "my-notes walks" in out
+
+
+def test_new_with_another_first_app(tmp_path):
+    result = scaffold.create("my-notes", directory=tmp_path / "p", framework_path=FRAMEWORK, short="diary")
+    assert result["app"] == "my-notes-diary" and (tmp_path / "p" / "apps" / "my_notes_diary" / "cli.py").is_file()
+    assert manifest.load(tmp_path / "p").apps["my-notes-diary"].prefix == "diary_"

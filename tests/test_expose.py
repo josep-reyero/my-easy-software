@@ -19,6 +19,8 @@ from pathlib import Path
 
 import pytest
 
+import projects as helpers
+
 from mes import cli
 from mes.errors import MesError, NeedsPerson, NotAvailableYet, NotFound, Refused, UsageError
 from mes.expose import adapters, blake3, expose, fingerprint
@@ -31,15 +33,28 @@ PROJECT = """
 [project]
 name = "notes"
 title = "Notes"
+apps = ["notes_app"]
 
-[jobs.rebuild]
-run = "notes rebuild"
-manual = true
+[tables.daily]
+key = ["day"]
+columns = { day = "text", notes = "integer" }
 
 [ui]
-data = "notes.sqlite"
-tables = ["daily", "secret"]
 dashboards = ["main", "other"]
+"""
+
+APP = """
+[app]
+name = "notes-app"
+command = "notes-app"
+
+[data]
+writes = ["daily"]
+tables = ["app_secret"]
+
+[jobs.rebuild]
+run = "rebuild"
+manual = true
 """
 
 FAKE_EASY_UI = r'''#!{python}
@@ -81,7 +96,7 @@ print(json.dumps(answer))
 def project(tmp_path, monkeypatch):
     root = tmp_path / "notes"
     (root / "ui" / "dashboards").mkdir(parents=True)
-    (root / "project.toml").write_text(PROJECT)
+    helpers.write(root, PROJECT, {"notes_app": APP})
     (root / "ui" / "dashboards" / "main.yaml").write_text("spec: easy-ui/v1\n")
     (root / "ui" / "dashboards" / "other.yaml").write_text("spec: easy-ui/v1\n")
     fake = tmp_path / "bin" / "easy-ui"
@@ -517,7 +532,10 @@ def test_easy_ui_missing_gives_a_plain_message(project, monkeypatch):
 
 
 def test_project_without_ui_is_refused(project):
-    (project / "project.toml").write_text('[project]\nname = "notes"\n')
+    (project / "project.toml").write_text('[project]\nname = "notes"\napps = ["notes_app"]\n'
+                                          '[tables.daily]\nkey = ["day"]\ncolumns = { day = "text" }\n')
+    for f in (project / "ui" / "dashboards").iterdir():
+        f.unlink()
     with pytest.raises(Refused) as e:
         _run(project)
     assert e.value.code == "no_dashboards"

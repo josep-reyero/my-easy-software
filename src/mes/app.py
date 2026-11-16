@@ -574,6 +574,7 @@ class App:
         self._project_file: ProjectFile | None = None
         self._lock_error: ManifestError | None = None
         self._manifest_loaded = False
+        self._load_failure: MesError | None = None
         self.commands: dict[str, Command] = {}
         self._providers: dict[str, Callable[[Context], Any]] = {}
         self._add_builtin("describe", "What this app is and which commands it has, with their kinds and arguments.",
@@ -584,8 +585,17 @@ class App:
 
     def _load(self) -> None:
         if self._manifest_loaded:
+            if self._load_failure is not None:
+                raise self._load_failure  # every later use reports the same problem, never a half-loaded app
             return
         self._manifest_loaded = True
+        try:
+            self._load_once()
+        except MesError as e:
+            self._load_failure = e
+            raise
+
+    def _load_once(self) -> None:
         if self._root_error is not None:
             raise self._root_error
         if self.root is None or not (self.root / MANIFEST_FILE).is_file():

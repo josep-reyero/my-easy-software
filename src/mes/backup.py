@@ -227,12 +227,13 @@ def _snapshot_store(store: Path, workdir: Path) -> Path:
     return snap
 
 
-def _snapshot_db(source: Path, target: Path) -> None:
+def _snapshot_db(source: Path, target: Path) -> bool:
     """A consistent copy of the project's shared database (SQLite's own backup, which waits for a
-    writer to finish), so a backup never holds half of a transaction."""
+    writer to finish), so a backup never holds half of a transaction. False when the file is not a
+    SQLite database at all: it is then kept as it is, byte for byte."""
     import sqlite3
 
-    src = sqlite3.connect(source, timeout=30)
+    src = sqlite3.connect(source, timeout=30)  # read-write, so a journal left by a crash is rolled back first
     try:
         src.execute("PRAGMA busy_timeout = 30000")
         dst = sqlite3.connect(target)
@@ -240,13 +241,20 @@ def _snapshot_db(source: Path, target: Path) -> None:
             src.backup(dst)
         finally:
             dst.close()
-    except sqlite3.Error as e:
-        raise TemporaryFailure("The project's database could not be copied consistently (it may be busy), so no "
-                               "backup was written.", hint="Run the backup again in a moment.", code="db_busy",
-                               detail=str(e)) from None
+    except sqlite3.OperationalError as e:
+        if "locked" in str(e) or "busy" in str(e):
+            raise TemporaryFailure("The project's database could not be copied consistently because it is busy, so "
+                                   "no backup was written.", hint="Run the backup again in a moment.", code="db_busy",
+                                   detail=str(e)) from None
+        target.unlink(missing_ok=True)
+        return False
+    except sqlite3.DatabaseError:
+        target.unlink(missing_ok=True)
+        return False
     finally:
         src.close()
     os.chmod(target, 0o600)
+    return True
 
 
 def _has_contents(folder: Path) -> bool:
@@ -274,9 +282,12 @@ def backup(target: Target, *, dest: str | os.PathLike[str] | None = None, includ
         db_file = target.data / f"{target.name}.sqlite"
         if any(p == db_file for _, p in entries):
             snap_db = work / db_file.name
-            _snapshot_db(db_file, snap_db)
-            journal = target.data / f"{target.name}.sqlite-journal"
-            entries = [(rel, snap_db if p == db_file else p) for rel, p in entries if p != journal]
+            if _snapshot_db(db_file, snap_db):
+                journal = target.data / f"{target.name}.sqlite-journal"
+                entries = [(rel, snap_db if p == db_file else p) for rel, p in entries if p != journal]
+            else:
+                notes.append(f"{db_file.name} is not a readable SQLite database, so it was copied as it is. "
+                             "Check it with: mes db check")
         entries += _walk(target.state, "state", skip, skipped)
         store_used = False
         if has_store and include_store:

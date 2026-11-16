@@ -17,7 +17,7 @@ import pytest
 from mes import archive, backup, cli, paths
 from mes.errors import NotFound, Refused
 
-PROJECT_TOML = '[project]\nname = "keeper"\n'
+PROJECT_TOML = '[project]\nname = "keeper"\napps = ["keeper_app"]\n'
 STORE_TOML = PROJECT_TOML + '\n[storage]\nbucket = "archive"\n'
 
 FAKE_MYBUCKET = """\
@@ -198,7 +198,7 @@ def test_backup_default_destination_and_skips_links(project, tmp_path):
 def test_nothing_to_back_up(tmp_path):
     root = tmp_path / "empty"
     root.mkdir()
-    (root / "project.toml").write_text('[project]\nname = "nada"\n')
+    (root / "project.toml").write_text('[project]\nname = "nada"\napps = ["nada_app"]\n')
     code, out = run("backup", "--project-dir", str(root), "--to", str(tmp_path / "b"))
     assert code == 3 and out["error"]["code"] == "nothing_to_back_up"
 
@@ -290,3 +290,31 @@ def test_verify_archive_refuses_missing_info(tmp_path):
 def test_restore_missing_archive(project, tmp_path):
     code, out = run("restore", str(tmp_path / "nope.tar.gz"), "--project-dir", str(project), "--yes")
     assert code == 3
+
+
+def test_the_shared_database_is_copied_with_sqlite_and_its_journal_left_out(project, tmp_path):
+    import sqlite3
+
+    data = paths.project_data_dir("keeper")
+    db_file = data / "keeper.sqlite"
+    db_file.unlink()
+    conn = sqlite3.connect(db_file)
+    conn.execute("CREATE TABLE t (x INTEGER)")
+    conn.executemany("INSERT INTO t VALUES (?)", [(i,) for i in range(100)])
+    conn.commit()
+    conn.close()
+    (data / "keeper.sqlite-journal").write_bytes(b"left over")
+    code, out = run("backup", "--project-dir", str(project), "--to", str(tmp_path / "b"))
+    assert code == 0, out
+    with tarfile.open(out["archive"]) as t:
+        names = t.getnames()
+        assert "data/keeper.sqlite" in names and "data/keeper.sqlite-journal" not in names
+        copy = tmp_path / "copy.sqlite"
+        copy.write_bytes(t.extractfile("data/keeper.sqlite").read())
+    assert sqlite3.connect(copy).execute("SELECT count(*) FROM t").fetchone() == (100,)
+
+
+def test_a_damaged_database_file_is_kept_as_it_is(project, tmp_path):
+    code, out = run("backup", "--project-dir", str(project), "--to", str(tmp_path / "b"))
+    assert code == 0, out
+    assert any("not a readable SQLite database" in n for n in out["notes"])

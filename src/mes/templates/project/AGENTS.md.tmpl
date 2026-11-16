@@ -30,8 +30,9 @@ exit code 4 before it runs. Ask the user before running a write or admin command
 - Error: with `--json`, `{"error": {"code": "...", "message": "...", "hint": "..."}}` on stdout
   and a non-zero exit code. Tell the user the message and the hint in plain words.
 - Exit codes: 0 ok, 1 error, 2 the command line was not understood, 3 not found, 4 not allowed,
-  5 refused for safety, 6 needs the person (show the question or action, then run its `rerun`
-  command), 75 temporary failure (try again later).
+  5 refused for safety, 6 needs the person (the answer has `"status": "needs_input"` or
+  `"needs_action"`: show the question or action, then run its `rerun` command), 75 temporary
+  failure (try again later).
 
 ## Data
 
@@ -44,7 +45,9 @@ exit code 4 before it runs. Ask the user before running a write or admin command
 
 ## Changing this project
 
-- Add an app: `mes new-app <name>` (see `mes guide add-app`).
+- Each app is a folder in `apps/` (the first one is `apps/{{package}}/`): its commands in `cli.py`,
+  its tables, jobs and dashboards in `app.toml`, its guide in `AGENTS.md`.
+- Add an app: `mes new-app <name>` (see `mes guide add-app`), then `uv sync` and `mes apps sync`.
 - Jobs are declared in each app's `app.toml`; `mes jobs list` shows them all. See `mes guide jobs`.
 - Dashboards: `ui/dashboards/*.yaml` (the project's), plus what the apps ship or contribute.
   `mes dev` shows them on this computer. See `mes guide dashboards`.

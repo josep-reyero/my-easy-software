@@ -20,6 +20,8 @@ import pytest
 from mes import cli, paths, webhook
 from mes.errors import NotFound, Refused
 
+import projects as helpers
+
 SECRET = bytes(range(32))
 NOW = 1_800_000_000
 
@@ -69,7 +71,7 @@ def server(tmp_path):
     for d in (layout.base, layout.etc, layout.state, layout.current_project):
         d.mkdir(parents=True, exist_ok=True)
     os.chmod(layout.state, 0o700)
-    (layout.current_project / "project.toml").write_text(PROJECT_TOML)
+    helpers.write_old(layout.current_project, PROJECT_TOML)
     layout.webhook_key.write_text(SECRET.hex() + "\n")
     os.chmod(layout.webhook_key, 0o640)
     return layout
@@ -140,11 +142,15 @@ def test_missing_headers_are_refused():
 def test_job_problem():
     from mes import manifest
 
-    project = manifest.loads(PROJECT_TOML)
-    assert webhook.job_problem(project, "build") is None
-    assert webhook.job_problem(project, "nightly") == "not_webhook"
-    assert webhook.job_problem(project, "missing") == "unknown_job"
-    for bad in ("../build", "build/../x", "Build", "", "a" * 40, "build\n"):
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        project = manifest.load(helpers.write_old(Path(d), PROJECT_TOML))
+    assert webhook.job_problem(project, "hooky-app.build") is None
+    assert webhook.job_problem(project, "hooky-app.nightly") == "not_webhook"
+    assert webhook.job_problem(project, "hooky-app.missing") == "unknown_job"
+    for bad in ("../build", "build/../x", "Build", "", "a" * 40, "build\n", "build", "hooky-app.build\n",
+                "hooky-app..build", "a.b.c"):
         assert webhook.job_problem(project, bad) == "bad_job"
 
 
@@ -215,7 +221,7 @@ class Running:
         head, _, body = got.partition(b"\r\n\r\n")
         return int(head.split(b" ")[1]), json.loads(body)
 
-    def post(self, job="build", body=b'{"ref":"main"}', ts=None, sig=None, extra=b""):
+    def post(self, job="hooky-app.build", body=b'{"ref":"main"}', ts=None, sig=None, extra=b""):
         ts = str(int(time.time())) if ts is None else ts
         sig = webhook.sign(SECRET, ts, body) if sig is None else sig
         req = (f"POST /hooks/{job} HTTP/1.1\r\nHost: x\r\nContent-Length: {len(body)}\r\n"
@@ -231,8 +237,8 @@ def test_receiver_accepts_and_writes_trigger(server):
     r = Running(server, idle=1.0)
     try:
         status, body = r.post()
-        assert (status, body) == (202, {"accepted": True, "job": "build"})
-        trigger = server.triggers / "build"
+        assert (status, body) == (202, {"accepted": True, "job": "hooky-app.build"})
+        trigger = server.triggers / "hooky-app.build"
         record = json.loads(trigger.read_text())
         assert set(record) == {"time", "body_sha256"} and "main" not in trigger.read_text()
         assert oct(server.triggers.stat().st_mode & 0o777) == "0o700"
@@ -261,7 +267,8 @@ def test_receiver_refuses_replay_also_after_restart(server):
 @pytest.mark.parametrize("kwargs, expected", [
     ({"sig": "sha256=" + "0" * 64}, (401, {"error": "bad_signature"})),
     ({"ts": str(int(time.time()) - 1000)}, (401, {"error": "stale"})),
-    ({"job": "nightly"}, (404, {"error": "unknown_job"})),
+    ({"job": "hooky-app.nightly"}, (404, {"error": "unknown_job"})),
+    ({"job": "build"}, (404, {"error": "unknown_job"})),
     ({"job": "missing"}, (404, {"error": "unknown_job"})),
     ({"job": "..%2fbuild"}, (404, {"error": "unknown_job"})),
     ({"job": "a/../build"}, (404, {"error": "not_found"})),
@@ -270,7 +277,7 @@ def test_receiver_refusals(server, kwargs, expected):
     r = Running(server, idle=1.0)
     try:
         assert r.post(**kwargs) == expected
-        assert not (server.triggers / "build").exists()
+        assert not (server.triggers / "hooky-app.build").exists()
     finally:
         r.stop()
 

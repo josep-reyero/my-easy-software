@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Any, TextIO
 
 from mes import manifest as manifest_mod
-from mes import paths, protocol, siblings
+from mes import apps, paths, protocol, siblings
 from mes.app import check_allowed
 from mes.errors import MesError, NotFound, TemporaryFailure, UsageError
 
@@ -93,7 +93,6 @@ def _build_data(root: Path) -> str | None:
 
 def run_dev(project_dir: str | None = None, *, port: int | None = None, stop_after: float | None = None,
             json_mode: bool = False, out: TextIO | None = None, err: TextIO | None = None) -> int:
-    from mes import apps
     from mes.jobs import project_root
 
     out = out or sys.stdout

@@ -24,6 +24,8 @@ from pathlib import Path
 import pytest
 
 from mes import cli, server, units
+
+import projects as helpers
 from mes.errors import Refused, UsageError
 
 PROJECT_TOML = """
@@ -66,7 +68,7 @@ def _keygen(path: Path, comment: str = "someone@example.invalid") -> Path:
 def proj(tmp_path, monkeypatch):
     d = tmp_path / "demo"
     d.mkdir()
-    (d / "project.toml").write_text(PROJECT_TOML)
+    helpers.write_old(d, PROJECT_TOML)
     monkeypatch.setenv("MES_EASY_UI", str(tmp_path / "no-easy-ui"))  # not installed unless a test adds it
     return d
 
@@ -116,7 +118,7 @@ def test_script_text_golden(proj, keys, tmp_path):
     assert 'demo namespaces="mes-deploy" ssh-ed25519 ' in script
     for name in plan.units:
         assert f"put_file {q(f'{tmp_path}/units/{name}')} 0644 root:root <<'MES_END_" in script
-    assert "mes-demo.job.sync.timer" in script and "systemctl enable --now -- " in script
+    assert "mes-demo.job.demo-app.sync.timer" in script and "systemctl enable --now -- " in script
     assert "webhook.key" in script and "od -An -tx1 -N32 /dev/urandom" in script
 
 
@@ -431,7 +433,7 @@ def test_dashboard_units_come_from_easy_ui(proj, keys, tmp_path, monkeypatch):
     {"units": {"sshd.service": GOOD_SERVICE}},
     {"units": {"mes-demo2-web.service": GOOD_SERVICE}},
     {"units": {"mes-other-web.service": GOOD_SERVICE}},
-    {"units": {"mes-demo.job.sync.service": GOOD_SERVICE}},
+    {"units": {"mes-demo.job.demo-app.sync.service": GOOD_SERVICE}},
     {"units": {"../../etc/x-demo.service": GOOD_SERVICE}},
     {"units": {"mes-demo-web.service": GOOD_SERVICE + "\x00"}},
 ])
@@ -593,3 +595,18 @@ def test_empty_capability_lines_are_fine(proj, keys, tmp_path, monkeypatch):
     service = GOOD_SERVICE + "AmbientCapabilities=\nCapabilityBoundingSet=\n"
     monkeypatch.setenv("MES_EASY_UI", str(_fake_easy_ui(tmp_path, {"units": {"mes-demo-web.service": service}})))
     assert "mes-demo-web.service" in _plan(proj, keys, tmp_path).web_units
+
+
+# --------------------------------------------------------------------------- per app
+
+
+def test_plan_shows_network_and_limits_per_app(proj, keys, tmp_path):
+    plan = _plan(proj, keys, tmp_path)
+    apps = server.per_app(plan.project)
+    assert [a["app"] for a in apps] == ["demo-app"] and apps[0]["network"] == ["api.example.com"]
+    assert [j["id"] for j in apps[0]["jobs"]] == ["demo-app.sync", "demo-app.build", "demo-app.hook"]
+    sync = apps[0]["jobs"][0]
+    assert sync["network"] == ["api.example.com"] and sync["memory"] and sync["timeout"]
+    script = server.render_script(plan)
+    assert "demo-app (in-project): api.example.com" in script
+    assert "demo-app.build: memory" in script and "internet: none" in script
