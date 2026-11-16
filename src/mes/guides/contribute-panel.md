@@ -42,7 +42,8 @@ Queries read only the allowlist: the shared tables and views, plus the app table
 apps' `[ui] tables` (`mes db schema` prints it). Sections are placed in `[project] apps` order; an
 unknown anchor puts the section at the end, with a warning.
 
-The project decides in the end: `ui/sections/<app>.<slug>.yaml` replaces an app's sections for that
+The project decides in the end: `ui/sections/<app name>.<slug>.yaml` (the app's full name, for
+example `ui/sections/fitlab-walks.overview.yaml`) replaces an app's sections for that
 dashboard (`sections: []` removes them), and `ui/dashboards/<slug>.yaml` replaces an app's whole
 dashboard of the same name. `easy-ui compose --project-dir . --json` shows the final order and where
 every section came from; `mes dev` previews it. See `mes guide dashboards`.

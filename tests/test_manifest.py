@@ -785,3 +785,11 @@ def test_a_lock_made_stale_by_editing_project_toml_is_ignored_when_every_app_is_
     with pytest.raises(ManifestError) as e:
         manifest.load(root)
     assert e.value.code == "apps_lock_stale"
+
+
+def test_a_job_can_be_named_with_the_apps_short_name(tmp_path):
+    p = helpers.load(tmp_path / "trail", '[project]\nname = "trail"\napps = ["trail_rides"]\n', {
+        "trail_rides": '[app]\nname = "trail-rides"\ncommand = "trail-rides"\n[jobs.rebuild]\nrun = "rebuild"\n'
+                       'manual = true\n'})
+    assert p.job("rides.rebuild").id == "trail-rides.rebuild"
+    assert p.job("trail-rides.rebuild").id == "trail-rides.rebuild"

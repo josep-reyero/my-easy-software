@@ -475,6 +475,10 @@ class Project:
                 hint="Remove the enabled = false line (or set it to true) to switch it on again.",
                 code="job_disabled",
             )
+        word, dot, job = name.partition(".")
+        by_short = next((a for a in self.apps.values() if a.short == word and a.name != word), None) if dot else None
+        if by_short is not None and f"{by_short.name}.{job}" in self.jobs:
+            return self.jobs[f"{by_short.name}.{job}"]  # typed with the app's short name: rides.rebuild
         matches = [j for j in self.jobs.values() if j.name == name]
         if len(matches) == 1:
             return matches[0]
