@@ -134,12 +134,30 @@ def test_agents_md_covers_what_an_agent_needs():
         assert needle in text, needle
 
 
-def test_dashboard_placeholder_shape():
+def test_dashboard_is_an_easy_ui_v1_dashboard():
     text = scaffold.render("notes")["ui/dashboards/main.yaml"]
-    assert "NOT AVAILABLE YET" in text
-    assert "title:" in text and "queries:" in text and "components:" in text
-    assert "type: stat" in text and "type: table" in text
-    assert text.count("query: daily") == 2
+    assert "\nspec: easy-ui/v1\n" in text and "\ntitle: \"Notes\"\n" in text
+    assert "\nqueries:\n" in text and "\nlayout:\n" in text and "\ncomponents:" not in text
+    for needle in ("type: controls", "type: stat", "type: bar", "type: table"):
+        assert needle in text
+    assert text.count("query: daily") == 2 and text.count("query: total") == 1
+
+
+def test_dashboard_passes_easy_ui_validate(tmp_path):
+    """When my-easy-ui is checked out (and installed) next to this repository, `easy-ui validate` accepts the file."""
+    import json
+    import subprocess
+
+    easy_ui = FRAMEWORK.parent / "my-easy-ui" / ".venv" / "bin" / "easy-ui"
+    if not easy_ui.is_file():
+        pytest.skip("my-easy-ui is not installed next to my-easy-software")
+    path = tmp_path / "main.yaml"
+    path.write_text(scaffold.render("notes", title='Sam\'s "best" notes')["ui/dashboards/main.yaml"])
+    out = subprocess.run([str(easy_ui), "--json", "validate", str(path)], capture_output=True, text=True,
+                         cwd=tmp_path, check=False, timeout=60)
+    report = json.loads(out.stdout)
+    assert out.returncode == 0 and report["ok"], report
+    assert report["warnings"] == 0
 
 
 def test_no_personal_paths_in_templates():

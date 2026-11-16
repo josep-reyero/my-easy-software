@@ -16,13 +16,21 @@ Example::
     run = "build"
     after = "sync"                   # runs when sync has finished
 
+    [ui]                             # what the dashboards (my-easy-ui) may show
+    data = "app.sqlite"              # the app's SQLite file, inside its data folder
+    tables = ["days"]                # only these tables/views reach dashboards
+    accent = "#2f6fdf"               # optional colour
+    dashboards = ["overview"]        # optional menu order; the first opens at the start
+
 Every job has exactly one trigger: ``schedule``, ``after`` or ``manual = true``.
 Unknown keys are an error (a typo must never silently drop a safety limit).
+``[ui]`` belongs to the dashboard server (my-easy-ui), which reads it itself;
+mes checks it with the same rules so a mistake shows up in ``mes`` too.
 
 Public API
 ----------
 Constants: ``MANIFEST_FILE`` (``"app.toml"``), ``APP_NAME_RE``, ``JOB_NAME_RE``,
-``TOP_KEYS``, ``APP_KEYS``, ``JOB_KEYS``, ``DEFAULT_MEMORY`` (``"256M"``),
+``TOP_KEYS``, ``APP_KEYS``, ``JOB_KEYS``, ``UI_KEYS``, ``DEFAULT_MEMORY`` (``"256M"``),
 ``DEFAULT_TIMEOUT`` (``"15m"``), ``DEFAULT_WRITES`` (``("data", "state")``),
 ``WRITE_TARGETS``.
 
@@ -51,9 +59,13 @@ Constants: ``MANIFEST_FILE`` (``"app.toml"``), ``APP_NAME_RE``, ``JOB_NAME_RE``,
     ``network_allowed``. ``to_dict()`` gives the JSON form (``network`` is
     ``false`` or a list).
 
+``UI`` (frozen dataclass)
+    ``data`` (str | None), ``tables`` (tuple), ``accent`` (str | None, lower case),
+    ``dashboards`` (tuple of dashboard names). ``to_dict()``.
+
 ``Manifest`` (frozen dataclass)
     ``name``, ``title``, ``version``, ``jobs`` (dict name -> Job, file order),
-    ``path`` (Path | None). Methods: ``job(name)`` (raises ``NotFound``),
+    ``path`` (Path | None), ``ui`` (``UI | None``, None without a ``[ui]`` table). Methods: ``job(name)`` (raises ``NotFound``),
     ``dependents(name)`` (jobs with ``after = name``), ``to_dict()``.
 """
 
@@ -74,7 +86,12 @@ APP_NAME_RE = re.compile(r"^[a-z][a-z0-9-]{1,30}\Z")
 JOB_NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,30}\Z")
 # The first word of a job's run line: one of the app's own command names.
 COMMAND_WORD_RE = re.compile(r"^[a-z][a-z0-9-]{0,40}\Z")
-TOP_KEYS = ("app", "jobs")
+TOP_KEYS = ("app", "jobs", "ui")
+UI_KEYS = ("data", "tables", "accent", "dashboards")
+UI_TABLE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}\Z")
+UI_DASHBOARD_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}\Z")
+UI_ACCENT_RE = re.compile(r"^#[0-9a-fA-F]{6}\Z")
+UI_MAX_ITEMS = 100
 APP_KEYS = ("name", "title", "version")
 JOB_KEYS = ("run", "schedule", "after", "manual", "memory", "timeout", "network", "writes")
 TRIGGER_KEYS = ("schedule", "after", "manual")
@@ -146,12 +163,24 @@ class Job:
 
 
 @dataclass(frozen=True)
+class UI:
+    data: str | None = None
+    tables: tuple[str, ...] = ()
+    accent: str | None = None
+    dashboards: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"data": self.data, "tables": list(self.tables), "accent": self.accent, "dashboards": list(self.dashboards)}
+
+
+@dataclass(frozen=True)
 class Manifest:
     name: str
     title: str
     version: str
     jobs: dict[str, Job] = field(default_factory=dict)
     path: Path | None = None
+    ui: UI | None = None
 
     def job(self, name: str) -> Job:
         try:
@@ -173,6 +202,7 @@ class Manifest:
             "version": self.version,
             "path": str(self.path) if self.path else None,
             "jobs": [j.to_dict() for j in self.jobs.values()],
+            "ui": self.ui.to_dict() if self.ui else None,
         }
 
 
@@ -439,6 +469,41 @@ def _check_after(jobs: dict[str, Job], source: str) -> None:
 # --------------------------------------------------------------------------- public
 
 
+def _name_list(value: Any, pattern: re.Pattern[str], source: str, key: str, what: str, example: str) -> tuple[str, ...]:
+    if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+        raise _fail(source, "[ui]", f'"{key}" must be a list of {what}, for example {key} = {example}.',
+                    f"Write {key} = {example}.")
+    bad = [v for v in value if not pattern.match(v)]
+    if bad:
+        raise _fail(source, "[ui]", f'"{key}" has {bad[0]!r}, which is not one of {what}.', f"Write {key} = {example}.")
+    if len(value) > UI_MAX_ITEMS or len(set(value)) != len(value):
+        raise _fail(source, "[ui]", f'"{key}" lists a name more than once (or more than {UI_MAX_ITEMS} names).',
+                    "List each one once.")
+    return tuple(value)
+
+
+def _parse_ui(table: Any, source: str) -> UI:
+    if not isinstance(table, dict):
+        raise _fail(source, "[ui]", "[ui] must be a section of settings.",
+                    'Write:\n[ui]\ndata = "app.sqlite"\ntables = ["days"]')
+    _check_keys(table, UI_KEYS, source, "[ui]")
+    data = table.get("data")
+    if data is not None:
+        ok = isinstance(data, str) and data.strip() and not data.startswith(("/", "~")) and "\\" not in data \
+            and ".." not in data.split("/")
+        if not ok:
+            raise _fail(source, "[ui]", '"data" must be the name of a file inside the app\'s data folder, '
+                        'for example data = "app.sqlite".', 'Write data = "app.sqlite" (no "/" at the start, no "..").')
+    tables = _name_list(table.get("tables", []), UI_TABLE_RE, source, "tables", "table names", '["days"]')
+    accent = table.get("accent")
+    if accent is not None and (not isinstance(accent, str) or not UI_ACCENT_RE.match(accent)):
+        raise _fail(source, "[ui]", f'"accent" is {accent!r}, which is not a colour written as # and six hex digits.',
+                    'Write for example accent = "#2f6fdf", or remove the line.')
+    dashboards = _name_list(table.get("dashboards", []), UI_DASHBOARD_RE, source, "dashboards", "dashboard names",
+                            '["overview"]')
+    return UI(data=data, tables=tables, accent=accent.lower() if accent else None, dashboards=dashboards)
+
+
 def parse(data: dict[str, Any], *, source: str = MANIFEST_FILE, path: Path | None = None) -> Manifest:
     if not isinstance(data, dict):
         raise _fail(source, "", "it is not a table of settings.", "Start the file with an [app] section.")
@@ -463,7 +528,8 @@ def parse(data: dict[str, Any], *, source: str = MANIFEST_FILE, path: Path | Non
         raise _fail(source, "[jobs]", "jobs must be written as [jobs.<name>] sections.", 'Write for example [jobs.sync] followed by run = "sync".')
     jobs = {jname: _parse_job(jname, jtable, source) for jname, jtable in jobs_table.items()}
     _check_after(jobs, source)
-    return Manifest(name=name, title=title, version=version, jobs=jobs, path=path)
+    ui = _parse_ui(data["ui"], source) if "ui" in data else None
+    return Manifest(name=name, title=title, version=version, jobs=jobs, path=path, ui=ui)
 
 
 def loads(text: str, *, source: str = MANIFEST_FILE, path: Path | None = None) -> Manifest:

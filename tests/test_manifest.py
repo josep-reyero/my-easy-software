@@ -220,3 +220,55 @@ def test_network_list_is_reported_as_not_enforced():
     assert "full internet access" in d["network_note"]
     off = manifest.loads(_job(run='"s"', manual="true")).jobs["sync"].to_dict()
     assert off["network_enforced"] is True and off["network_note"] is None
+
+
+# ---------------------------------------------------------------- [ui] (read by my-easy-ui)
+
+UI_GOOD = """
+[app]
+name = "fitness"
+title = "Fitness"
+
+[ui]
+data = "fitness.sqlite"
+tables = ["days", "activities"]
+accent = "#2A7F62"
+dashboards = ["overview", "sleep"]
+"""
+
+
+def test_ui_table_is_accepted():
+    m = manifest.loads(UI_GOOD)
+    assert m.ui == manifest.UI(data="fitness.sqlite", tables=("days", "activities"), accent="#2a7f62",
+                               dashboards=("overview", "sleep"))
+    assert m.to_dict()["ui"]["tables"] == ["days", "activities"]
+    assert manifest.loads('[app]\nname = "myapp"\n').ui is None
+    assert manifest.loads('[app]\nname = "myapp"\n[ui]\n').ui == manifest.UI()
+
+
+def test_ui_with_jobs():
+    m = manifest.loads(GOOD + '\n[ui]\ndata = "a.sqlite"\ntables = ["days"]\n')
+    assert m.ui.data == "a.sqlite" and set(m.jobs) == {"sync", "build", "export"}
+
+
+@pytest.mark.parametrize(
+    "ui, needle",
+    [
+        ('tabels = ["days"]', 'Did you mean "tables"?'),
+        ('data = "/etc/passwd"', "inside the app's data folder"),
+        ('data = "../x.sqlite"', "inside the app's data folder"),
+        ("data = 3", "inside the app's data folder"),
+        ('tables = "days"', "must be a list"),
+        ('tables = ["days; DROP"]', "not one of table names"),
+        ('tables = ["days", "days"]', "more than once"),
+        ('accent = "blue"', "not a colour"),
+        ('dashboards = ["Overview"]', "not one of dashboard names"),
+    ],
+)
+def test_bad_ui(ui, needle):
+    err = _err(f'[app]\nname = "myapp"\n[ui]\n{ui}\n')
+    assert needle in err.message + " " + (err.hint or "") and "[ui]" in err.message
+
+
+def test_ui_must_be_a_table():
+    assert "[ui] must be a section" in _err('ui = 1\n[app]\nname = "myapp"\n').message
