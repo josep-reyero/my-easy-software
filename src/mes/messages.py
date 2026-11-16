@@ -21,7 +21,8 @@ Public API
     The ``needs_human`` action for the Tailscale sign-in step.
 ``T``
     ``{check_id: {"title": ..., "why_done": ..., ...}}``: titles and explanations
-    for each checklist item, used by ``mes.checks``.
+    for each checklist item, used by ``mes.checks``. ``T["tailscale-serve"]["why_todo"]`` has a
+    ``{project}`` placeholder.
 """
 
 from __future__ import annotations
@@ -141,20 +142,11 @@ T: dict[str, dict[str, str]] = {
             "This Linux system does not use systemd, the part of Linux that mes uses to start jobs "
             "on a schedule, so scheduled jobs cannot run here. Jobs run by hand still work."
         ),
-        "why_no_session": (
-            "There is no systemd session for your account right now (common when connected over "
-            "SSH), so jobs cannot be scheduled yet. Allowing your account to keep a session fixes "
-            "this."
+        "why_not_running": (
+            "systemd, the part of Linux that starts jobs on a schedule, is not running normally on "
+            "this computer (for example inside some containers), so scheduled jobs cannot run here. "
+            "Jobs run by hand still work."
         ),
-    },
-    "systemd-linger": {
-        "title": "Jobs keep running when you are logged out",
-        "why_done": "Your account keeps its jobs running even when nobody is logged in.",
-        "why_todo": (
-            "Right now your scheduled jobs would stop whenever you log out, so on a server they "
-            "would not run at night. Allowing your account to keep running fixes this."
-        ),
-        "why_blocked": "This waits until jobs can be started automatically (the item above).",
     },
     "tailscale-installed": {
         "title": "Private network (Tailscale) is installed",
@@ -194,6 +186,29 @@ T: dict[str, dict[str, str]] = {
         "why_todo": SIGN_IN_WHY,
         "why_approve": APPROVE_WHY,
         "why_blocked": "This waits until Tailscale is running (the item above).",
+    },
+    "tailscale-serve": {
+        "title": "Serve the dashboard on your private network",
+        "why_todo": (
+            "The dashboard of {project} runs on the server behind a private local socket, so for now "
+            "no device can open it. One Tailscale command on that server makes it open on your own "
+            "devices (computer, phone) through your private network, and nowhere else: nobody "
+            "outside your private network can reach it. mes never runs these commands itself: you "
+            "(or your assistant, after you say yes) run them on the server, where they need sudo."
+        ),
+        "why_blocked": (
+            "This waits until Tailscale is installed, running and signed in on this computer (the "
+            "items above)."
+        ),
+        "why_local_only": (
+            "You chose to keep your apps on this computer only, so the dashboard is not served on a "
+            "private network. Open it on this computer with: mes dev"
+        ),
+        "why_unsupported": "Serving a dashboard needs Linux or macOS.",
+        "never_funnel": (
+            "Never use `tailscale funnel` for this: funnel would put the dashboard on the public "
+            "internet for anyone to find."
+        ),
     },
     "config": {
         "title": "Settings file for this computer exists",

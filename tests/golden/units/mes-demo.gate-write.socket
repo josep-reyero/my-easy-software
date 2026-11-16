@@ -1,0 +1,19 @@
+# Made by my-easy-software (mes). Do not edit: run 'mes server plan' again and the script it writes instead.
+# mes-project: demo
+# mes-unit: gate-write
+# Each connection gets its own sandboxed instance of mes-demo.gate-write@.service.
+# Only the account mes-demo (the gate) can connect.
+
+[Unit]
+Description=Sandboxed write requests of the mes gate for project demo (socket)
+
+[Socket]
+ListenStream=/run/mes-demo-gate-write.sock
+SocketUser=mes-demo
+SocketGroup=mes-demo
+SocketMode=0600
+Accept=yes
+MaxConnections=4
+
+[Install]
+WantedBy=sockets.target

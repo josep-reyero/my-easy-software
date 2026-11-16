@@ -39,6 +39,12 @@ Public API
 ``build_items(probe, facts, mode) -> list``  the checklist items in order.
 ``run_checks(probe=None, *, mode=None, config_file=None) -> (items, facts)``
     ``gather`` then ``build_items``.
+``DashboardServe(project, socket, port)``, ``dashboard_socket(project) -> str``,
+``check_socket_path(path) -> str``, ``serve_commands(serve, ts, plat) -> dict``,
+``check_tailscale_serve(plat, ts, mode, serve) -> item``
+    The "Serve the dashboard on your private network" item: the exact ``tailscale serve``
+    commands for the server (``--bg --https=<port> unix:<socket>``), the host name the dashboard
+    server must accept (``--allow-host``), how to check and how to stop. mes never runs them.
 """
 
 from __future__ import annotations
@@ -365,42 +371,24 @@ def check_uv(probe: Probe, plat: Platform) -> dict[str, Any]:
 
 
 def check_systemd(probe: Probe, plat: Platform) -> list[dict[str, Any]]:
+    """On a Linux server, jobs run as system units of the project's own account (made by the root
+    script of ``mes server plan``), so only the system's own systemd matters here."""
     title = _t("systemd", "title")
     if plat.kind == "macos":
         return [item("systemd", title, "skipped", _t("systemd", "why_mac"))]
     if plat.kind != "linux":
         return [item("systemd", title, "skipped", _t("tailscale-installed", "why_unsupported"))]
-    linger_title = _t("systemd-linger", "title")
-    linger_fix = 'sudo loginctl enable-linger "$USER"'
     if not probe.which("systemctl"):
-        return [
-            item("systemd", title, "blocked", _t("systemd", "why_missing")),
-            item("systemd-linger", linger_title, "blocked", _t("systemd-linger", "why_blocked")),
-        ]
-    res = probe.run(["systemctl", "--user", "is-system-running"], timeout=10)
+        return [item("systemd", title, "blocked", _t("systemd", "why_missing"))]
+    res = probe.run(["systemctl", "is-system-running"], timeout=10)
     state = res.stdout.strip().splitlines()[0] if res.stdout.strip() else ""
     if state in ("running", "degraded", "starting", "initializing"):
-        detail = "systemd user session: " + state
+        detail = "systemd: " + state
         if state == "degraded":
-            detail += " (some of your own services failed, which does not stop mes jobs)"
-        session = item("systemd", title, "done", _t("systemd", "why_done"), detail=detail)
-    else:
-        session = item(
-            "systemd", title, "todo", _t("systemd", "why_no_session"),
-            fix=linger_fix,
-            detail=(res.stderr or res.stdout).strip()[:300] or None,
-        )
-    user = probe.user or os.environ.get("USER") or ""
-    lres = probe.run(["loginctl", "show-user", user, "--property=Linger", "--value"], timeout=10)
-    if lres.ok and lres.stdout.strip() == "yes":
-        linger = item("systemd-linger", linger_title, "done", _t("systemd-linger", "why_done"))
-    else:
-        linger = item(
-            "systemd-linger", linger_title, "todo", _t("systemd-linger", "why_todo"),
-            fix=linger_fix,
-            detail=None if lres.ok else ((lres.stderr or lres.stdout).strip()[:300] or None),
-        )
-    return [session, linger]
+            detail += " (some other services failed, which does not stop mes jobs)"
+        return [item("systemd", title, "done", _t("systemd", "why_done"), detail=detail)]
+    return [item("systemd", title, "blocked", _t("systemd", "why_not_running"),
+                 detail=(res.stderr or res.stdout).strip()[:300] or None)]
 
 
 def check_tailscale(
@@ -462,6 +450,103 @@ def check_tailscale(
     return items
 
 
+# --------------------------------------------------------------------------- serving a dashboard
+
+DASHBOARD_SOCKET_DIR = "/run/mes"
+DEFAULT_SERVE_PORT = 443
+PLACEHOLDER_HOST = "<this-server>.<your-tailnet>.ts.net"
+_SOCKET_PATH_RE = re.compile(r"^(?:/[A-Za-z0-9._-]+)+\Z")
+_DNS_NAME_RE = re.compile(r"^(?=.{1,253}\Z)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+\Z")
+
+
+@dataclass(frozen=True)
+class DashboardServe:
+    """Which project's dashboard to serve, from which local socket, on which HTTPS port."""
+
+    project: str
+    socket: str
+    port: int = DEFAULT_SERVE_PORT
+
+
+def dashboard_socket(project: str) -> str:
+    """Where the dashboard server (easy-ui, units mes-<project>-web.socket/.service) of a project
+    listens on a server by default."""
+    return f"{DASHBOARD_SOCKET_DIR}/{paths.check_name(project)}-web.sock"
+
+
+def check_socket_path(path: str) -> str:
+    """A plain absolute path (letters, digits, ``._-`` and ``/``; no ``..``), or ``ValueError``.
+
+    The path ends up in a command the person pastes into a root shell, so it is kept boring."""
+    if (not isinstance(path, str) or len(path) > 200 or not _SOCKET_PATH_RE.match(path)
+            or any(part in (".", "..") for part in path.split("/"))):
+        raise ValueError("the socket must be a plain absolute path such as /run/mes/notes-web.sock")
+    return path
+
+
+def _server_host(ts: TailscaleState) -> tuple[str, bool]:
+    name = (ts.dns_name or "").lower()
+    if name and _DNS_NAME_RE.match(name):
+        return name, True
+    return PLACEHOLDER_HOST, False
+
+
+def serve_commands(serve: DashboardServe, ts: TailscaleState, plat: Platform) -> dict[str, Any]:
+    """The commands for the person to run on the server; mes never runs any of them."""
+    sudo = "" if plat.kind == "macos" else "sudo "
+    socket = check_socket_path(serve.socket)
+    port = int(serve.port)
+    host, known = _server_host(ts)
+    https = f"--https={port}"
+    url = f"https://{host}" + ("" if port == 443 else f":{port}") + "/"
+    return {
+        "serve": f"{sudo}tailscale serve --bg {https} unix:{socket}",
+        "status": "tailscale serve status",
+        "stop": f"{sudo}tailscale serve {https} off",
+        "allow_host": f"--allow-host {host}",
+        "plan": f"mes server plan {serve.project} --allow-host {host}",
+        "host": host,
+        "host_known": known,
+        "url": url,
+    }
+
+
+def check_tailscale_serve(plat: Platform, ts: TailscaleState, mode: str | None,
+                          serve: DashboardServe) -> dict[str, Any]:
+    texts = T["tailscale-serve"]
+    title = texts["title"]
+    if not plat.supported:
+        return item("tailscale-serve", title, "skipped", texts["why_unsupported"])
+    if mode == "local-only":
+        return item("tailscale-serve", title, "skipped", texts["why_local_only"], detail="local-only mode")
+    if not (ts.installed and ts.backend == "Running"):
+        return item("tailscale-serve", title, "blocked", texts["why_blocked"])
+    cmd = serve_commands(serve, ts, plat)
+    if cmd["host_known"]:
+        host_note = f"The dashboard then opens at {cmd['url']} on your own devices."
+    else:
+        host_note = (f"Replace {PLACEHOLDER_HOST} with the server's private name (shown by `tailscale status` "
+                     f"on the server). The dashboard then opens at {cmd['url']} on your own devices.")
+    why = " ".join([
+        texts["why_todo"].format(project=f'"{serve.project}"'),
+        f"Run this once on the server: `{cmd['serve']}`.",
+        f"The dashboard server only answers to names it knows, so make its units (mes-{serve.project}-web) "
+        f"with that private name: `{cmd['plan']}` (it passes `{cmd['allow_host']}` to `easy-ui units`), "
+        "then run the script it prints as before.",
+        host_note,
+        f"Check what is served with `{cmd['status']}`; stop serving it with `{cmd['stop']}`.",
+        texts["never_funnel"],
+    ])
+    detail = "\n".join([
+        f"serve: {cmd['serve']}",
+        f"dashboard units: {cmd['plan']}",
+        f"check: {cmd['status']}",
+        f"stop: {cmd['stop']}",
+        f"opens at: {cmd['url']}",
+    ])
+    return item("tailscale-serve", title, "todo", why, needs_human=True, detail=detail)
+
+
 @dataclass(frozen=True)
 class ConfigState:
     path: Path
@@ -505,13 +590,17 @@ def gather(probe: Probe, config_file: Path | None = None) -> dict[str, Any]:
     return {"platform": plat, "tailscale": ts, "config": cfg, "mode": network_mode(cfg.data)}
 
 
-def build_items(probe: Probe, facts: dict[str, Any], mode: str | None) -> list[dict[str, Any]]:
-    """The checklist items, in order, from facts already gathered."""
+def build_items(probe: Probe, facts: dict[str, Any], mode: str | None,
+                serve: DashboardServe | None = None) -> list[dict[str, Any]]:
+    """The checklist items, in order, from facts already gathered. With ``serve``, the last item
+    is how to serve that project's dashboard on the private network."""
     plat: Platform = facts["platform"]
     items = [check_platform(plat), check_python(probe), check_uv(probe, plat)]
     items += check_systemd(probe, plat)
     items += check_tailscale(probe, plat, facts["tailscale"], mode)
     items.append(check_config(facts["config"]))
+    if serve is not None:
+        items.append(check_tailscale_serve(plat, facts["tailscale"], mode, serve))
     return items
 
 

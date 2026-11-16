@@ -1,7 +1,12 @@
-"""Tests for ``mes gate`` and the per-machine app registry (``mes apps``).
+"""Tests for ``mes gate`` and the per-machine list of projects (``mes projects``).
 
-A tiny fake app built on ``mes.App`` is written into a temp folder and run as
-a real program, exactly as the gate would run an installed app.
+A tiny fake app built on ``mes.App`` is written into a project folder and run as a real program,
+exactly as the gate would run an installed app. Two places are tested:
+
+- a personal machine: the project comes from the owner's list (``mes projects add``);
+- a server: the project lives in a temporary server folder laid out like ``/var/lib/mes`` (with
+  ``code/current -> releases/1``), and the per-request sandboxes are stood in for by a real unix
+  socket served by ``gate.child_main`` (what systemd's ``Accept=yes`` instance runs).
 """
 
 from __future__ import annotations
@@ -9,14 +14,19 @@ from __future__ import annotations
 import io
 import json
 import os
+import shutil
+import socket
 import stat
+import subprocess
 import sys
+import tempfile
+import threading
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 import pytest
 
-from mes import cli, gate, registry
+from mes import cli, gate, paths, registry, units
 
 FAKE_APP = '''\
 #!{python}
@@ -80,6 +90,10 @@ if __name__ == "__main__":
     app.main()
 '''
 
+PROJECT_TOML = '[project]\nname = "fakeproj"\n\n[apps.fakeapp]\ncli = "fakeapp"\n'
+# The program "fakeapp" is installed for the app "otherapp" (the app "fakeapp" exists, under another program).
+WRONG_TOML = '[project]\nname = "wrong"\n[apps.otherapp]\ncli = "fakeapp"\n[apps.fakeapp]\ncli = "fake-other"\n'
+
 
 def _write_program(folder: Path, name: str, body: str) -> Path:
     folder.mkdir(parents=True, exist_ok=True)
@@ -89,20 +103,32 @@ def _write_program(folder: Path, name: str, body: str) -> Path:
     return p
 
 
+def make_project(folder: Path, toml: str = PROJECT_TOML) -> Path:
+    """A project folder with project.toml and its installed program; returns the program."""
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "project.toml").write_text(toml)
+    return _write_program(folder / ".venv" / "bin", "fakeapp", FAKE_APP.format(python=sys.executable, root=str(folder)))
+
+
 @pytest.fixture
 def fake_app(tmp_path) -> Path:
-    root = tmp_path / "fakeapp"
-    return _write_program(root, "fakeapp", FAKE_APP.format(python=sys.executable, root=str(root)))
+    return make_project(tmp_path / "fakeproj")
 
 
 @pytest.fixture
-def registered(fake_app) -> Path:
-    registry.add("fakeapp", fake_app)
+def project_dir(fake_app) -> Path:
+    return fake_app.parent.parent.parent
+
+
+@pytest.fixture
+def registered(fake_app, project_dir) -> Path:
+    registry.add(project_dir)
     return fake_app
 
 
 def _run(request, allow="read", **kw) -> gate.Outcome:
     raw = request if isinstance(request, str) else json.dumps(request)
+    kw.setdefault("project", "fakeproj")
     return gate.handle(raw, allow, **kw)
 
 
@@ -110,47 +136,58 @@ def _json(outcome: gate.Outcome) -> dict:
     return json.loads(outcome.stdout.decode())
 
 
-def _log_lines() -> list[dict]:
-    p = gate.log_path()
+def _log_lines(server_root=None) -> list[dict]:
+    p = gate.log_path(gate.locate("fakeproj", server_root))
     if not p.exists():
         return []
     return [json.loads(line) for line in p.read_text().splitlines()]
 
 
-# --------------------------------------------------------------------------- registry
+def _data(mes_home) -> Path:
+    return mes_home["data"] / "fakeproj"
 
 
-def test_registry_add_list_remove(fake_app, mes_home):
-    result = registry.add("fakeapp", fake_app)
-    assert result["status"] == "added"
-    assert "summary" in result["commands"]["read"]
-    assert result["commands"]["admin"] == ["reset"]
+# --------------------------------------------------------------------------- the list of projects
+
+
+def test_registry_add_list_remove(project_dir, fake_app, mes_home):
+    result = registry.add(project_dir)
+    assert result["status"] == "added" and result["project"] == "fakeproj"
+    assert "summary" in result["apps"]["fakeapp"]["read"]
+    assert result["apps"]["fakeapp"]["admin"] == ["reset"]
     path = registry.registry_path()
-    assert path == mes_home["config"].parent / "apps.toml"
+    assert path == mes_home["config"].parent / "projects.toml"
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
-    assert registry.load() == {"fakeapp": str(fake_app)}
-    assert registry.list_apps() == [
-        {"app": "fakeapp", "program": str(fake_app), "usable": True, "problem": None}
+    assert registry.load() == {"fakeproj": str(project_dir)}
+    assert registry.list_projects() == [
+        {"project": "fakeproj", "folder": str(project_dir), "usable": True, "problem": None}
     ]
-    assert registry.add("fakeapp", fake_app)["status"] == "updated"
-    assert registry.remove("fakeapp")["status"] == "removed"
+    assert registry.add(project_dir)["status"] == "updated"
+    assert registry.remove("fakeproj")["status"] == "removed"
     assert registry.load() == {}
     with pytest.raises(registry.NotFound):
-        registry.remove("fakeapp")
+        registry.remove("fakeproj")
 
 
-def test_registry_add_refuses_wrong_or_broken_program(tmp_path, fake_app):
-    with pytest.raises(registry.Refused):  # the program says it is "fakeapp"
-        registry.add("otherapp", fake_app)
-    not_mes = _write_program(tmp_path / "bin", "notmes", "#!/bin/sh\necho hello\n")
+def test_registry_add_refuses_wrong_or_broken_program(tmp_path):
+    wrong = tmp_path / "wrong"
+    make_project(wrong, WRONG_TOML)
+    with pytest.raises(registry.Refused) as e:  # the program says it is "fakeapp"
+        registry.add(wrong)
+    assert e.value.code == "wrong_app"
+    notmes = tmp_path / "notmes"
+    make_project(notmes, '[project]\nname = "notmes"\n[apps.notmes]\ncli = "notmes"\n')
+    _write_program(notmes / ".venv" / "bin", "notmes", "#!/bin/sh\necho hello\n")
     with pytest.raises(registry.MesError) as e:
-        registry.add("notmes", not_mes)
+        registry.add(notmes)
     assert e.value.code == "not_an_app" and "is not an app made with mes" in e.value.message
     with pytest.raises(registry.MesError):
-        registry.add("missing", tmp_path / "does-not-exist")
-    for bad in ("mes", "../x", "Fake", "a", "fake\n", "fake app"):
-        with pytest.raises(registry.UsageError):
-            registry.add(bad, fake_app)
+        registry.add(tmp_path / "does-not-exist")
+    uninstalled = tmp_path / "uninstalled"
+    uninstalled.mkdir()
+    (uninstalled / "project.toml").write_text('[project]\nname = "uninstalled"\n')
+    with pytest.raises(registry.MesError):
+        registry.add(uninstalled)
     assert registry.load() == {}
 
 
@@ -165,31 +202,52 @@ def test_registry_refuses_writable_by_others(registered):
         registry.check_program(registered)
 
 
+def test_project_file_writable_by_others_is_refused(registered, project_dir):
+    (project_dir / "project.toml").chmod(0o666)
+    out = _run(["fakeapp", "summary", "--json"])
+    assert out.exit_code == 5 and _json(out)["error"]["code"] == "untrusted_file"
+    assert str(project_dir) not in out.stdout.decode()
+
+
 def test_registry_broken_file_fails_closed(mes_home):
     path = registry.registry_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    for text in ("not toml [", "[other]\nx = 1\n", "[apps]\nfakeapp = \"relative/path\"\n",
-                 "[apps]\nmes = \"/bin/sh\"\n", "[apps]\n\"../x\" = \"/bin/sh\"\n", "apps = 3\n"):
+    for text in ("not toml [", "[other]\nx = 1\n", "[projects]\nfakeproj = \"relative/path\"\n",
+                 "[projects]\n\"../x\" = \"/bin\"\n", "projects = 3\n", "[projects]\nfakeproj = 3\n"):
         path.write_text(text)
         path.chmod(0o600)
         with pytest.raises(registry.ConfigError):
             registry.load()
     out = _run(["fakeapp", "summary"])
     assert out.exit_code == 1
-    assert b"list of installed apps" in out.stderr
+    assert b"list of projects" in out.stderr
 
 
-def test_mes_apps_commands(fake_app, capsys):
-    assert cli.run(["apps", "add", "fakeapp", str(fake_app), "--json"]) == 0
+def test_mes_projects_commands(project_dir, fake_app, capsys):
+    assert cli.run(["projects", "add", str(project_dir), "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["status"] == "added"
-    assert cli.run(["--json", "apps", "list"]) == 0
+    assert cli.run(["--json", "projects", "list"]) == 0
     data = json.loads(capsys.readouterr().out)
-    assert [a["app"] for a in data["apps"]] == ["fakeapp"]
-    assert cli.run(["apps", "remove", "fakeapp"]) == 0
+    assert [p["project"] for p in data["projects"]] == ["fakeproj"]
+    assert cli.run(["projects", "remove", "fakeproj"]) == 0
     capsys.readouterr()
-    assert cli.run(["apps", "remove", "fakeapp", "--json"]) == 3
+    assert cli.run(["projects", "remove", "fakeproj", "--json"]) == 3
     assert json.loads(capsys.readouterr().out)["error"]["code"] == "not_found"
-    assert cli.run(["apps"]) == 2
+    assert cli.run(["projects"]) == 2
+
+
+def test_projects_add_and_remove_need_admin(project_dir, fake_app, capsys, monkeypatch):
+    monkeypatch.setenv("MES_ALLOW", "read")
+    assert cli.run(["--json", "projects", "add", str(project_dir)]) == 4
+    assert registry.load() == {}
+    monkeypatch.setenv("MES_ALLOW", "admin")
+    assert cli.run(["--json", "projects", "add", str(project_dir)]) == 0
+    monkeypatch.setenv("MES_ALLOW", "write")
+    assert cli.run(["--json", "projects", "remove", "fakeproj"]) == 4
+    monkeypatch.setenv("MES_ALLOW", "read")
+    assert cli.run(["--json", "projects", "list"]) == 0
+    capsys.readouterr()
+    assert "fakeproj" in registry.load()
 
 
 # --------------------------------------------------------------------------- allowed requests
@@ -216,45 +274,52 @@ def test_write_needs_write_key(registered, mes_home):
     out = _run(["fakeapp", "add", "hello", "--json"], allow="read")
     assert out.exit_code == 4
     assert _json(out)["error"]["code"] == "not_allowed"
-    assert not (mes_home["data"] / "fakeapp" / "added.txt").exists()
+    assert not (_data(mes_home) / "added.txt").exists()
     ok = _run(["fakeapp", "add", "hello", "--json"], allow="write")
     assert ok.exit_code == 0 and _json(ok) == {"added": "hello"}
-    assert (mes_home["data"] / "fakeapp" / "added.txt").read_text() == "hello"
+    assert (_data(mes_home) / "added.txt").read_text() == "hello"
 
 
 def test_admin_never_runs_through_gate(registered, mes_home):
-    for allow in ("read", "write"):
+    for allow in ("read", "write", "deploy"):
         out = _run(["fakeapp", "reset", "--json"], allow=allow)
         assert out.exit_code == 4
         assert "admin" in _json(out)["error"]["message"]
     refused = _run(["fakeapp", "summary", "--json"], allow="admin")
     assert refused.exit_code == 5
-    for bad in ("", "root", "READ", None):
+    for bad in ("", "root", "READ", None, "deploy\n"):
         assert _run(["fakeapp", "summary"], allow=bad).exit_code == 2
-    assert not (mes_home["data"] / "fakeapp" / "reset.txt").exists()
+    assert not (_data(mes_home) / "reset.txt").exists()
 
 
 def test_builtin_commands_are_read(registered):
     out = _run(["fakeapp", "describe", "--json"])
     assert out.exit_code == 0
-    assert _json(out)["allowed"] == "read"
+    assert _json(out)["allowed"] == "read" and _json(out)["project"] == "fakeproj"
     write = _run(["fakeapp", "describe", "--json"], allow="write")
     assert _json(write)["allowed"] == "write"
     assert _run(["fakeapp", "guide"]).exit_code == 0
 
 
-def test_clean_environment(registered, monkeypatch):
+def test_clean_environment(registered, monkeypatch, mes_home):
     for name in ("SSH_AUTH_SOCK", "GITHUB_TOKEN", "AWS_SECRET_ACCESS_KEY", "PYTHONPATH",
-                 "PYTHONSTARTUP", "MES_DEBUG", "LD_PRELOAD", "TERM", "LC_ALL"):
+                 "PYTHONSTARTUP", "MES_DEBUG", "LD_PRELOAD", "TERM", "LC_ALL", "CLOUDFLARE_API_TOKEN"):
         monkeypatch.setenv(name, "secret-value")
     monkeypatch.setenv("MES_ALLOW", "admin")
     monkeypatch.setenv("PATH", "/tmp/evil:" + os.environ["PATH"])
     env = _json(_run(["fakeapp", "env", "--json"]))
     assert env["PATH"] == gate.SAFE_PATH
     assert env["MES_ALLOW"] == "read"
+    assert env["MES_VIA_GATE"] == "1"
     assert env["PYTHONNOUSERSITE"] == "1"
     assert "secret-value" not in json.dumps(env)
+    assert env["MES_PROJECT"] == "fakeproj"
+    assert env["MES_DATA_DIR"] == str(_data(mes_home))
     assert env["MES_DATA_HOME"] == os.environ["MES_DATA_HOME"]
+    # A gate started inside another project's session never reaches this project's folders.
+    monkeypatch.setenv("MES_PROJECT", "otherproj")
+    out = _run(["fakeapp", "env", "--json"])
+    assert out.exit_code == 2 and _json(out)["error"]["code"] == "wrong_project"
 
 
 def test_runs_without_shell_stdin_or_cwd(registered):
@@ -263,7 +328,7 @@ def test_runs_without_shell_stdin_or_cwd(registered):
     assert out.exit_code == 0
     assert _json(out)["words"] == hostile
     assert not Path("/tmp/mes-gate-pwned").exists()
-    where = _json(_run(["fakeapp", "where", "--json"]))
+    where = _json(_run(["fakeapp", "where", "--json"], stdin=io.BytesIO(b"sneaky input")))
     assert where["cwd"] == "/"
     assert where["stdin"] == ""
     assert where["argv"] == ["where", "--json"]  # exactly the request, nothing added
@@ -283,6 +348,7 @@ def test_runs_without_shell_stdin_or_cwd(registered):
         '{"app": "fakeapp", "command": "summary"}',
         '"fakeapp summary"',
         '["fakeapp"]',
+        '["mes"]',
         "[]",
         '["fakeapp", 1]',
         '["fakeapp", ["summary"]]',
@@ -303,6 +369,8 @@ def test_runs_without_shell_stdin_or_cwd(registered):
         '["fakeapp", "summary\\n"]',
         '["fakeapp", "Summary"]',
         '["fakeapp", ""]',
+        '["mes", "--deploy"]',
+        '["mes", "Deploy"]',
     ],
 )
 def test_malformed_requests_are_refused(registered, raw):
@@ -332,11 +400,15 @@ def test_size_limits(registered):
     assert _run("[" * 100_000 + "]" * 100_000).exit_code == 2
 
 
-def test_unknown_app_or_command(registered):
+def test_unknown_project_app_or_command(registered):
     out = _run(["nosuchapp", "summary", "--json"])
     assert out.exit_code == 3 and _json(out)["error"]["code"] == "not_found"
     out = _run(["fakeapp", "nosuch", "--json"])
     assert out.exit_code == 3 and _json(out)["error"]["code"] == "not_found"
+    out = _run(["fakeapp", "summary", "--json"], project="otherproj")
+    assert out.exit_code == 3
+    for bad in ("../x", "Fake", "x\n", None):
+        assert _run(["fakeapp", "summary", "--json"], project=bad).exit_code == 2
 
 
 def test_option_injection_stays_with_the_app_command(registered):
@@ -357,18 +429,16 @@ def test_program_writable_by_others_is_refused(registered):
     assert out.exit_code == 5
 
 
-def test_registry_pointing_at_other_program(registered, tmp_path):
-    impostor = _write_program(tmp_path / "imp", "impostor", "#!/bin/sh\necho '{\"app\": \"other\", \"commands\": []}'\n")
-    registry._save({"fakeapp": str(impostor)})
+def test_installed_program_that_is_another_app(registered, tmp_path):
+    bin_dir = registered.parent
+    _write_program(bin_dir, "fakeapp", "#!/bin/sh\necho '{\"app\": \"other\", \"commands\": []}'\n")
     assert _run(["fakeapp", "summary"]).exit_code == 5
-    liar = _write_program(tmp_path / "imp", "liar",
-                          "#!/bin/sh\necho '{\"app\": \"fakeapp\", \"commands\": [{\"name\": \"x\", \"kind\": \"root\"}]}'\n")
-    registry._save({"fakeapp": str(liar)})
+    _write_program(bin_dir, "fakeapp",
+                   "#!/bin/sh\necho '{\"app\": \"fakeapp\", \"commands\": [{\"name\": \"x\", \"kind\": \"root\"}]}'\n")
     assert _run(["fakeapp", "x"]).exit_code == 1
-    shell = _write_program(tmp_path / "imp", "notjson", "#!/bin/sh\necho hello\n")
-    registry._save({"fakeapp": str(shell)})
+    _write_program(bin_dir, "fakeapp", "#!/bin/sh\necho hello\n")
     assert _run(["fakeapp", "summary"]).exit_code == 1
-    registry._save({"fakeapp": str(tmp_path / "gone")})
+    registered.unlink()
     assert _run(["fakeapp", "summary"]).exit_code == 1
 
 
@@ -397,11 +467,14 @@ def test_every_request_is_logged(registered):
     first, done, refused, garbage = lines
     assert first["app"] == "fakeapp" and first["command"] == "summary" and first["kind"] == "read"
     assert first["allow"] == "read" and first["time"].endswith("Z") and first["args"] == 3
+    assert first["project"] == "fakeproj"
+    assert first["isolation"] == "limits" and done["isolation"] == "limits"  # no sandbox sockets here
     assert done["exit_code"] == 0 and "duration_ms" in done
     assert refused["kind"] == "write" and refused["reason"] == "not_allowed"
     assert garbage["app"] is None and garbage["reason"] == "bad_request"
-    assert "secret-word" not in gate.log_path().read_text()  # arguments are not logged
-    assert stat.S_IMODE(gate.log_path().stat().st_mode) == 0o600
+    log = gate.log_path(gate.locate("fakeproj", None))
+    assert "secret-word" not in log.read_text()  # arguments are not logged
+    assert stat.S_IMODE(log.stat().st_mode) == 0o600
 
 
 def test_unwritable_log_runs_nothing(registered, mes_home, monkeypatch):
@@ -411,7 +484,7 @@ def test_unwritable_log_runs_nothing(registered, mes_home, monkeypatch):
     out = _run(["fakeapp", "add", "x", "--json"], allow="write")
     assert out.exit_code == 1
     assert _json(out)["error"]["code"] == "log_unavailable"
-    assert not (mes_home["data"] / "fakeapp" / "added.txt").exists()
+    assert not (_data(mes_home) / "added.txt").exists()
 
 
 # --------------------------------------------------------------------------- mes gate command
@@ -427,65 +500,50 @@ def _mes(argv, env_command=None, monkeypatch=None):
 
 
 def test_mes_gate_reads_ssh_original_command(registered, monkeypatch):
-    code, out, _ = _mes(["gate", "--allow", "read"], '["fakeapp", "summary", "--json"]', monkeypatch)
+    code, out, _ = _mes(["gate", "--project", "fakeproj", "--allow", "read"],
+                        '["fakeapp", "summary", "--json"]', monkeypatch)
     assert code == 0 and json.loads(out) == {"days": 7}
     assert _log_lines()[0]["source"] == "ssh"
 
 
 def test_mes_gate_command_option_and_conflict(registered, monkeypatch):
     monkeypatch.delenv("SSH_ORIGINAL_COMMAND", raising=False)
-    code, out, _ = _mes(["gate", "--allow", "write", '--command=["fakeapp", "add", "v", "--json"]'])
+    code, out, _ = _mes(["gate", "--project", "fakeproj", "--allow", "write",
+                         '--command=["fakeapp", "add", "v", "--json"]'])
     assert code == 0 and json.loads(out) == {"added": "v"}
-    code, _, err = _mes(["gate", "--allow", "read"])
+    code, _, err = _mes(["gate", "--project", "fakeproj", "--allow", "read"])
     assert code == 2 and "No command was given" in err
     monkeypatch.setenv("SSH_ORIGINAL_COMMAND", '["fakeapp", "summary"]')
-    code, _, err = _mes(["gate", "--allow", "read", '--command=["fakeapp", "summary"]'])
+    code, _, err = _mes(["gate", "--project", "fakeproj", "--allow", "read", '--command=["fakeapp", "summary"]'])
     assert code == 2 and "both" in err
 
 
-def test_mes_gate_requires_allow(capsys):
+def test_mes_gate_requires_project_and_allow(capsys):
     assert cli.run(["gate", "--json"]) == 2
     assert json.loads(capsys.readouterr().out)["error"]["code"] == "usage"
+    assert cli.run(["gate", "--json", "--allow", "read"]) == 2
+    capsys.readouterr()
+    assert cli.run(["gate", "--json", "--project", "fakeproj"]) == 2
 
 
 def test_mes_gate_as_real_ssh_forced_command(registered, monkeypatch):
     """The whole path as sshd would run it: a separate process with SSH_ORIGINAL_COMMAND set."""
-    import subprocess
-
     env = dict(os.environ, SSH_ORIGINAL_COMMAND='["fakeapp", "summary", "--days", "4", "--json"]')
-    done = subprocess.run([sys.executable, "-m", "mes.cli", "gate", "--allow", "read"],
-                          capture_output=True, env=env, timeout=60)
+    argv = [sys.executable, "-m", "mes.cli", "gate", "--project", "fakeproj"]
+    done = subprocess.run([*argv, "--allow", "read"], capture_output=True, env=env, timeout=60)
     assert done.returncode == 0, done.stderr
     assert json.loads(done.stdout) == {"days": 4}
     env["SSH_ORIGINAL_COMMAND"] = '["fakeapp", "reset"]'
-    done = subprocess.run([sys.executable, "-m", "mes.cli", "gate", "--allow", "write"],
-                          capture_output=True, env=env, timeout=60)
+    done = subprocess.run([*argv, "--allow", "write"], capture_output=True, env=env, timeout=60)
     assert done.returncode == 4 and done.stdout == b""
     assert b"admin" in done.stderr
 
 
 def test_parse_request_unit():
     assert gate.parse_request('["fakeapp", "summary", "--days", "3"]') == ["fakeapp", "summary", "--days", "3"]
+    assert gate.parse_request('["mes", "status"]') == ["mes", "status"]
     with pytest.raises(gate.UsageError):
         gate.parse_request(None)
-
-
-
-# --------------------------------------------------------------------------- review fixes
-
-
-def test_apps_add_and_remove_need_admin(fake_app, capsys, monkeypatch):
-    monkeypatch.setenv("MES_ALLOW", "read")
-    assert cli.run(["--json", "apps", "add", "fakeapp", str(fake_app)]) == 4
-    assert registry.load() == {}
-    monkeypatch.setenv("MES_ALLOW", "admin")
-    assert cli.run(["--json", "apps", "add", "fakeapp", str(fake_app)]) == 0
-    monkeypatch.setenv("MES_ALLOW", "write")
-    assert cli.run(["--json", "apps", "remove", "fakeapp"]) == 4
-    monkeypatch.setenv("MES_ALLOW", "read")
-    assert cli.run(["--json", "apps", "list"]) == 0
-    capsys.readouterr()
-    assert "fakeapp" in registry.load()
 
 
 def test_writable_folders_are_not_trusted(registered, mes_home):
@@ -563,20 +621,342 @@ def test_gate_sets_resource_limits(registered):
 
 def test_gate_caps_parallel_requests(registered, monkeypatch):
     monkeypatch.setattr(gate, "MAX_PARALLEL", 1)
-    with gate._slot():
+    with gate._slot(gate.locate("fakeproj", None).gate_dir / gate.SLOTS_DIR):
         out = _run(["fakeapp", "summary", "--json"])
     assert out.exit_code == 75 and _json(out)["error"]["code"] == "busy"
     assert _run(["fakeapp", "summary", "--json"]).exit_code == 0  # free again afterwards
 
 
-def test_apps_add_plain_messages(fake_app, tmp_path):
+def test_projects_add_plain_messages(tmp_path):
+    wrong = tmp_path / "wrong"
+    make_project(wrong, WRONG_TOML)
     with pytest.raises(registry.Refused) as e:
-        registry.add("otherapp", fake_app)
-    assert 'This program is the app "fakeapp", not "otherapp". Nothing was added.' in e.value.message
-    assert e.value.hint.startswith("Register it under its own name: mes apps add fakeapp ")
+        registry.add(wrong)
+    assert 'does not say it is the app "otherapp", so the project was not added. Nothing changed.' in e.value.message
+    assert 'App("otherapp")' in e.value.hint
 
 
 def test_gate_examples_use_a_neutral_name(registered):
     out = _run(["Bad Name", "x"])
     text = out.stdout.decode() + out.stderr.decode()
     assert "fitness" not in text and "mes guide gate" in gate._bad_request("x").hint
+
+
+# --------------------------------------------------------------------------- deploy level
+
+
+def test_mes_operations_need_a_deploy_key(registered):
+    for allow in ("read", "write"):
+        out = _run(["mes", "deploy"], allow=allow)
+        assert out.exit_code == 4, allow
+        err = _json(out)["error"]  # mes operations always answer in JSON
+        assert err["code"] == "not_allowed" and "--allow deploy" in err["hint"]
+    lines = _log_lines()
+    assert [(r["kind"], r["reason"]) for r in lines] == [(None, "not_allowed")] * 2
+
+
+def test_deploy_key_on_a_personal_machine_installs_nothing(registered):
+    out = _run(["mes", "status"], allow="deploy")
+    assert out.exit_code == 5 and _json(out)["error"]["code"] == "not_a_server"
+    out = _run(["mes", "shell"], allow="deploy")
+    assert out.exit_code == 3 and "deploy, rollback, releases, status" in _json(out)["error"]["hint"]
+
+
+def test_deploy_key_runs_app_commands_as_write(registered, mes_home):
+    env = _json(_run(["fakeapp", "env", "--json"], allow="deploy"))
+    assert env["MES_ALLOW"] == "write"
+    ok = _run(["fakeapp", "add", "v", "--json"], allow="deploy")
+    assert ok.exit_code == 0 and (_data(mes_home) / "added.txt").read_text() == "v"
+
+
+# --------------------------------------------------------------------------- on a server
+
+
+@pytest.fixture
+def server(tmp_path):
+    """A server folder like /var/lib/mes with fakeproj deployed as release 1."""
+    root = tmp_path / "srv"
+    layout = paths.server_layout("fakeproj", root)
+    release = layout.releases / "1"
+    make_project(release / paths.RELEASE_PROJECT_DIR)
+    os.symlink("releases/1", layout.code / "current")
+    for d in (layout.data, layout.state, layout.store):
+        d.mkdir(parents=True, mode=0o700)
+    return root
+
+
+def test_server_runs_the_current_release(server):
+    layout = paths.server_layout("fakeproj", server)
+    out = _run(["fakeapp", "where", "--json"], server_root=server)
+    assert out.exit_code == 0, out
+    assert Path(_json(out)["cwd"]).resolve() == (layout.releases / "1" / "project").resolve()
+    assert _log_lines(server)[0]["isolation"] == "limits"  # no sandbox sockets in this folder
+    assert gate.log_path(gate.locate("fakeproj", server)) == layout.state / "gate" / "gate-log.jsonl"
+
+
+def test_server_environment_has_only_the_project_folders(server, monkeypatch):
+    monkeypatch.setenv("HOME", "/home/owner")
+    layout = paths.server_layout("fakeproj", server)
+    env = _json(_run(["fakeapp", "env", "--json"], server_root=server))
+    assert env["HOME"] == str(layout.state)
+    assert env["MES_DATA_DIR"] == str(layout.data) and env["MES_STORE_DIR"] == str(layout.store)
+    assert env["MES_STATE_DIR"] == str(layout.state) and env["MES_PROJECT"] == "fakeproj"
+    for k in ("MES_DATA_HOME", "MES_STATE_HOME", "MES_CONFIG", "XDG_CONFIG_HOME"):
+        assert k not in env
+    ok = _run(["fakeapp", "add", "srv", "--json"], allow="write", server_root=server)
+    assert ok.exit_code == 0 and (layout.data / "added.txt").read_text() == "srv"
+
+
+def test_server_without_a_release_runs_nothing(tmp_path):
+    root = tmp_path / "srv"
+    layout = paths.server_layout("fakeproj", root)
+    out = _run(["fakeapp", "summary", "--json"], server_root=root)
+    assert out.exit_code == 3  # not set up at all
+    layout.code.mkdir(parents=True)
+    layout.state.mkdir(parents=True)
+    out = _run(["fakeapp", "summary", "--json"], server_root=root)
+    assert out.exit_code == 3 and "Nothing has been deployed" in _json(out)["error"]["message"]
+
+
+def test_server_refuses_another_project_or_account(server, monkeypatch):
+    layout = paths.server_layout("fakeproj", server)
+    (layout.current_project / "project.toml").write_text('[project]\nname = "other"\n[apps.fakeapp]\ncli = "fakeapp"\n')
+    out = _run(["fakeapp", "summary", "--json"], server_root=server)
+    assert out.exit_code == 5 and _json(out)["error"]["code"] == "wrong_project"
+    real = os.getuid()
+    monkeypatch.setattr(gate.os, "getuid", lambda: real + 4242)
+    out = _run(["fakeapp", "summary", "--json"], server_root=server)
+    assert out.exit_code == 5 and _json(out)["error"]["code"] == "wrong_account"
+
+
+def test_server_deploy_operations_go_to_mes_deploy(server, monkeypatch):
+    from mes import deploy
+
+    seen = {}
+
+    def fake_operation(where, command, args, *, stdin, timeout, run_child):
+        seen.update(where=where, command=command, args=args, stdin=stdin)
+        return {"ok": True, "operation": command}
+
+    monkeypatch.setattr(deploy, "operation", fake_operation)
+    body = io.BytesIO(b"archive bytes")
+    out = _run(["mes", "releases", "--limit", "3"], allow="deploy", server_root=server, stdin=body)
+    assert out.exit_code == 0 and _json(out) == {"ok": True, "operation": "releases"}
+    assert seen["command"] == "releases" and seen["args"] == ["--limit", "3"] and seen["stdin"] is body
+    assert seen["where"].server and seen["where"].name == "fakeproj"
+    lines = _log_lines(server)
+    assert [(r["event"], r["kind"], r["decision"]) for r in lines] == [
+        ("request", "deploy", "allowed"), ("finished", "deploy", "done")]
+    out = _run(["mes", "deploy"], allow="write", server_root=server, stdin=io.BytesIO(b"x"))
+    assert out.exit_code == 4 and seen["command"] == "releases"  # not called again
+
+
+def test_server_deploy_operation_errors_are_json(server, monkeypatch):
+    from mes import deploy
+    from mes.errors import Refused
+
+    def refusing(*a, **k):
+        raise Refused("The archive's signature is not valid, so nothing was installed.", hint="Sign it.",
+                      code="bad_signature")
+
+    monkeypatch.setattr(deploy, "operation", refusing)
+    out = _run(["mes", "deploy"], allow="deploy", server_root=server, stdin=io.BytesIO(b"x"))
+    assert out.exit_code == 5 and _json(out)["error"]["code"] == "bad_signature"
+    assert _log_lines(server)[-1]["reason"] == "bad_signature"
+
+
+# --------------------------------------------------------------------------- per-request sandboxes
+
+
+@pytest.fixture
+def short_dir():
+    d = tempfile.mkdtemp(prefix="mesg", dir="/tmp")  # unix socket paths must be short
+    yield Path(d)
+    shutil.rmtree(d, ignore_errors=True)
+
+
+class FakeInstances:
+    """Stands in for systemd's socket-activated instances: every connection to a level's socket
+    is answered by gate.child_main for that level, as ``mes gate child`` would."""
+
+    def __init__(self, folder: Path, server_root: Path, levels=("read", "write", "deploy")):
+        self.server_root = server_root
+        self.socks = {}
+        self.connections = {lvl: 0 for lvl in levels}
+        for level in levels:
+            path = str(folder / f"{level}.sock")
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.bind(path)
+            s.listen(4)
+            self.socks[level] = (path, s)
+            threading.Thread(target=self._serve, args=(level, s), daemon=True).start()
+
+    def path(self, project, level):
+        assert project == "fakeproj"
+        return self.socks[level][0]
+
+    def _serve(self, level, s):
+        while True:
+            try:
+                conn, _ = s.accept()
+            except OSError:
+                return
+            self.connections[level] += 1
+            with conn, conn.makefile("rb") as rf, conn.makefile("wb") as wf:
+                gate.child_main("fakeproj", str(self.server_root), level, rf, wf)
+
+    def close(self):
+        for _, s in self.socks.values():
+            s.close()
+
+
+@pytest.fixture
+def instances(server, short_dir, monkeypatch):
+    fake = FakeInstances(short_dir, server)
+    monkeypatch.setattr(units, "gate_socket_path", fake.path)
+    yield fake
+    fake.close()
+
+
+def test_requests_go_to_their_own_sandbox_instance(server, instances):
+    layout = paths.server_layout("fakeproj", server)
+    out = _run(["fakeapp", "summary", "--days", "5", "--json"], server_root=server)
+    assert out.exit_code == 0 and _json(out) == {"days": 5}
+    assert instances.connections["read"] == 1
+    out = _run(["fakeapp", "add", "boxed", "--json"], allow="write", server_root=server)
+    assert out.exit_code == 0 and (layout.data / "added.txt").read_text() == "boxed"
+    assert instances.connections["write"] == 1
+    failed = _run(["fakeapp", "fail"], server_root=server)
+    assert failed.exit_code == 9 and failed.stderr == b"plain failure\n"
+    lines = _log_lines(server)
+    assert {r["isolation"] for r in lines if r["decision"] in ("allowed", "done")} == {"systemd"}
+
+
+def test_deploy_key_app_commands_use_the_write_sandbox(server, instances):
+    out = _run(["fakeapp", "add", "x", "--json"], allow="deploy", server_root=server)
+    assert out.exit_code == 0
+    assert instances.connections == {"read": 0, "write": 1, "deploy": 0}
+
+
+def test_sandbox_checks_the_kind_again(server, instances):
+    out = _run(["fakeapp", "reset", "--json"], allow="write", server_root=server)
+    assert out.exit_code == 4
+    assert instances.connections["write"] == 0  # refused before anything was handed over
+
+
+def test_sandbox_limits_apply_inside_the_instance(server, instances):
+    out = _run(["fakeapp", "slow", "--seconds", "30", "--json"], server_root=server, timeout=1.5)
+    assert out.exit_code == 75
+    big = _run(["fakeapp", "big", "--size", "100000", "--json"], server_root=server, max_output=10_000)
+    assert big.exit_code == 5 and b"xxxx" not in big.stdout
+
+
+def test_socket_that_exists_but_does_not_answer_refuses(server, short_dir, monkeypatch):
+    path = str(short_dir / "dead.sock")
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.bind(path)  # the file exists, but nothing listens
+    s.close()
+    monkeypatch.setattr(units, "gate_socket_path", lambda project, level: path)
+    layout = paths.server_layout("fakeproj", server)
+    out = _run(["fakeapp", "add", "x", "--json"], allow="write", server_root=server)
+    assert out.exit_code == 75 and _json(out)["error"]["code"] == "sandbox_unavailable"
+    assert not (layout.data / "added.txt").exists()  # never run with less protection
+    assert _log_lines(server)[-1]["reason"] == "sandbox_unavailable"
+
+
+def test_sandbox_that_answers_garbage_is_refused(server, short_dir, monkeypatch):
+    path = str(short_dir / "liar.sock")
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.bind(path)
+    s.listen(1)
+
+    def liar():
+        conn, _ = s.accept()
+        with conn:
+            conn.recv(65536)
+            conn.sendall(b'{"exit_code": 0, "stdout_bytes": 999999999999, "stderr_bytes": 0}\n')
+
+    threading.Thread(target=liar, daemon=True).start()
+    monkeypatch.setattr(units, "gate_socket_path", lambda project, level: path)
+    out = _run(["fakeapp", "summary", "--json"], server_root=server)
+    s.close()
+    assert out.exit_code == 75 and _json(out)["error"]["code"] == "sandbox_failed"
+
+
+def _child(server, level, request) -> tuple[dict, bytes, bytes]:
+    line = request if isinstance(request, bytes) else json.dumps(request).encode() + b"\n"
+    stdout = io.BytesIO()
+    assert gate.child_main("fakeproj", str(server), level, io.BytesIO(line), stdout) == 0
+    stdout.seek(0)
+    return gate.read_answer(stdout, gate.DEFAULT_MAX_OUTPUT)
+
+
+def _child_error(answer) -> dict:
+    head, out, _ = answer
+    return {"exit_code": head["exit_code"], **json.loads(out)["error"]}
+
+
+def test_child_runs_one_checked_request(server):
+    head, out, err = _child(server, "read", {"kind": "app", "request": ["fakeapp", "summary", "--json"],
+                                             "timeout": 30, "max_output": 10_000})
+    assert head["exit_code"] == 0 and json.loads(out) == {"days": 7} and err == b""
+
+
+@pytest.mark.parametrize("level,request_", [
+    ("read", {"kind": "app", "request": ["fakeapp", "add", "x", "--json"]}),           # write at read
+    ("write", {"kind": "app", "request": ["fakeapp", "reset", "--json"]}),             # admin never
+    ("deploy", {"kind": "app", "request": ["fakeapp", "summary", "--json"]}),          # no app commands
+    ("write", {"kind": "app", "request": ["mes", "deploy", "--json"]}),                # no mes operations
+    ("read", {"kind": "app", "request": "fakeapp summary"}),                           # not a list
+    ("read", {"kind": "app", "request": ["../bin/sh", "-c", "--json"]}),
+    ("read", {"kind": "shell", "request": ["fakeapp", "summary", "--json"]}),
+    ("write", {"kind": "sync"}),                                                       # deploy steps: deploy only
+    ("read", {"kind": "app", "request": ["fakeapp", "summary"], "timeout": 99999}),
+    ("read", {"kind": "app", "request": ["fakeapp", "summary"], "timeout": -1}),
+    ("read", {"kind": "app", "request": ["fakeapp", "summary"], "timeout": "nan"}),
+    ("read", {"kind": "app", "request": ["fakeapp", "summary"], "max_output": 10**12}),
+    ("read", {"kind": "app", "request": ["nosuchapp", "summary", "--json"]}),
+    ("admin", {"kind": "app", "request": ["fakeapp", "summary", "--json"]}),
+    ("read", b"not json\n"),
+    ("read", b"[1, 2]\n"),
+    ("read", b"\xff\xfe\n"),
+])
+def test_child_refuses(server, level, request_):
+    data_file = paths.server_layout("fakeproj", server).data / "added.txt"
+    head, out, err = _child(server, level, request_)
+    assert head["exit_code"] != 0
+    assert out or err
+    assert not data_file.exists()
+
+
+def test_child_refusals_are_plain_errors(server):
+    e = _child_error(_child(server, "read", {"kind": "app", "request": ["fakeapp", "add", "x", "--json"]}))
+    assert e["exit_code"] == 4 and e["code"] == "not_allowed"
+    e = _child_error(_child(server, "deploy", {"kind": "app", "request": ["fakeapp", "summary", "--json"]}))
+    assert e["exit_code"] == 2 and e["code"] == "bad_request"
+
+
+def test_child_through_the_real_command(server):
+    """``mes gate child`` as systemd runs it: the connection is stdin and stdout."""
+    line = json.dumps({"kind": "app", "request": ["fakeapp", "summary", "--days", "2", "--json"]}).encode() + b"\n"
+    done = subprocess.run([sys.executable, "-m", "mes.cli", "gate", "child", "--project", "fakeproj",
+                           "--server-root", str(server), "--level", "read"],
+                          input=line, capture_output=True, timeout=60)
+    assert done.returncode == 0, done.stderr
+    head, out, _ = gate.read_answer(io.BytesIO(done.stdout), gate.DEFAULT_MAX_OUTPUT)
+    assert head["exit_code"] == 0 and json.loads(out) == {"days": 2}
+
+
+@pytest.mark.parametrize("answer", [
+    b"",
+    b"not json\n",
+    b"[1]\n",
+    b'{"exit_code": 0}\n',
+    b'{"exit_code": 0, "stdout_bytes": -1, "stderr_bytes": 0}\n',
+    b'{"exit_code": 0, "stdout_bytes": 5, "stderr_bytes": 0}\nabc',              # ends early
+    b'{"exit_code": 0, "stdout_bytes": 0, "stderr_bytes": 99999999}\n',
+    b'{"exit_code": 0, "stdout_bytes": "5", "stderr_bytes": 0}\nabcde',
+])
+def test_read_answer_refuses_broken_answers(answer):
+    with pytest.raises(gate.TemporaryFailure):
+        gate.read_answer(io.BytesIO(answer), 1000)

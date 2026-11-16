@@ -19,12 +19,18 @@ the person through the next step, one at a time:
    is left for the agent to fix, 6 when what is left needs the person). Missing
    tools come with the install command from official package sources; mes
    itself never installs anything and never uses sudo.
+5. With ``--project <name>`` (or when run inside a project folder whose
+   ``project.toml`` has ``[ui]``), the checklist ends with "Serve the dashboard
+   on your private network": the ``tailscale serve`` commands to run on the
+   server (``--socket`` and ``--port`` change the socket and the HTTPS port).
+   It is always ``needs_human``: mes never runs them, and never ``funnel``.
 
 Public API
 ----------
 ``ANSWERS``  ``{question_id: {value: saved_mode}}``: the answers setup accepts.
 ``parse_answers(raw) -> dict``  ``["tailscale=install"] -> {"tailscale": "install"}``.
-``run_setup(answers=None, *, probe=None, json_mode=False) -> dict``
+``run_setup(answers=None, *, probe=None, json_mode=False, serve=None) -> dict``
+``dashboard_serve(project=None, socket=None, port=None, *, cwd=None) -> DashboardServe | None``
 ``run_doctor(*, probe=None) -> dict``
 ``toml_value(v) -> str``, ``toml_table(name, values) -> str``
     A tiny TOML writer for flat tables of strings, booleans and integers.
@@ -46,8 +52,9 @@ from pathlib import Path
 from typing import Any
 
 from mes import checks, messages, paths, protocol
+from mes import manifest as manifest_mod
 from mes.app import check_allowed
-from mes.errors import ConfigError, UsageError
+from mes.errors import ConfigError, MesError, UsageError
 
 ANSWERS: dict[str, dict[str, str]] = {
     "tailscale": {"install": "tailscale", "local-only": "local-only"},
@@ -221,6 +228,49 @@ def _ensure_config(cfg: checks.ConfigState, mode: str | None) -> None:
 # --------------------------------------------------------------------------- setup and doctor
 
 
+def dashboard_serve(project: str | None = None, socket: str | None = None, port: int | None = None, *,
+                    cwd: str | Path | None = None) -> checks.DashboardServe | None:
+    """Which dashboard ``mes setup`` explains how to serve: ``project`` when given, otherwise the
+    project of the folder it runs in when its project.toml has [ui]; None when there is none."""
+    if port is not None and not 1 <= port <= 65535:
+        raise UsageError(f"--port {port} is not a port number.", hint="Leave it out to use 443, or give for example --port 8443.")
+    if project is None:
+        found = manifest_mod.find(Path(cwd) if cwd else None)
+        loaded = None
+        if found is not None:
+            try:
+                loaded = manifest_mod.load(found)
+            except MesError:
+                loaded = None
+        if loaded is not None and loaded.ui is not None:
+            project = loaded.name
+    if project is None:
+        if socket is not None or port is not None:
+            raise UsageError(
+                "--socket and --port say how to serve a project's dashboard, but no project was named.",
+                hint="Add --project <name>, or run mes setup inside the project's folder.",
+            )
+        return None
+    try:
+        project = paths.check_name(project)
+        sock = checks.check_socket_path(socket) if socket is not None else checks.dashboard_socket(project)
+    except ValueError as e:
+        raise UsageError(f'"{socket}" cannot be used as the dashboard socket: {e}.',
+                         hint="Leave --socket out to use " + checks.dashboard_socket(project)) from None
+    return checks.DashboardServe(project, sock, port or checks.DEFAULT_SERVE_PORT)
+
+
+def _serve_args(serve: checks.DashboardServe | None) -> str:
+    if serve is None:
+        return ""
+    out = f" --project {serve.project}"
+    if serve.socket != checks.dashboard_socket(serve.project):
+        out += f" --socket {serve.socket}"
+    if serve.port != checks.DEFAULT_SERVE_PORT:
+        out += f" --port {serve.port}"
+    return out
+
+
 def _tailscale_question(prefix: str) -> dict[str, Any]:
     options = [
         protocol.option(value, label, meaning)
@@ -262,9 +312,11 @@ def run_setup(
     *,
     probe: checks.Probe | None = None,
     json_mode: bool = False,
+    serve: checks.DashboardServe | None = None,
 ) -> dict[str, Any]:
     probe = probe or checks.Probe()
-    prefix = "mes --json" if json_mode else "mes"
+    prefix = ("mes --json" if json_mode else "mes")
+    rerun_args = _serve_args(serve)
     facts = checks.gather(probe)
     cfg: checks.ConfigState = facts["config"]
     if cfg.data is None:
@@ -284,7 +336,10 @@ def run_setup(
 
     if plat.supported:
         if mode is None and not ts.installed:
-            return _tailscale_question(prefix)
+            question = _tailscale_question(prefix)
+            if rerun_args:
+                question["rerun"] = f"{prefix} setup{rerun_args} --answer tailscale=<value>"
+            return question
         if mode is None:
             mode = "tailscale"  # already installed: keep using it
     _ensure_config(cfg, mode)
@@ -293,8 +348,10 @@ def run_setup(
     if plat.supported and mode == "tailscale" and ts.installed:
         person = _sign_in(probe, facts, prefix)
         if person:
+            if rerun_args:
+                person["rerun"] = f"{prefix} setup{rerun_args}"
             return person
-    return protocol.checklist(checks.build_items(probe, facts, mode))
+    return protocol.checklist(checks.build_items(probe, facts, mode, serve))
 
 
 def run_doctor(*, probe: checks.Probe | None = None) -> dict[str, Any]:
@@ -307,7 +364,8 @@ def run_doctor(*, probe: checks.Probe | None = None) -> dict[str, Any]:
 
 def _handle_setup(args: argparse.Namespace) -> Any:
     check_allowed("admin")  # it saves choices in this computer's settings file
-    return run_setup(parse_answers(args.answer), json_mode=bool(getattr(args, "json", False)))
+    serve = dashboard_serve(args.project, args.socket, args.port)
+    return run_setup(parse_answers(args.answer), json_mode=bool(getattr(args, "json", False)), serve=serve)
 
 
 def _handle_doctor(args: argparse.Namespace) -> Any:
@@ -330,6 +388,13 @@ def register(subparsers: Any) -> None:
         metavar="ID=VALUE",
         help="answer a question setup asked, for example tailscale=install or tailscale=local-only",
     )
+    p.add_argument("--project", default=None, metavar="NAME",
+                   help="also explain how to serve this project's dashboard on your private network "
+                   "(default: the project of this folder, when it has dashboards)")
+    p.add_argument("--socket", default=None, metavar="PATH",
+                   help="the dashboard server's local socket on the server (default: /run/mes/<project>-web.sock)")
+    p.add_argument("--port", type=int, default=None,
+                   help="the HTTPS port on the private network (default: 443; use another one per project)")
     p.set_defaults(func=_handle_setup)
 
     d = subparsers.add_parser(

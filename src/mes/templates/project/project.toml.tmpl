@@ -1,0 +1,27 @@
+# What this project is. Read by mes, by the project's own command-line tool and by the dashboard
+# server (easy-ui). See: mes guide new-project
+[project]
+name = "{{name}}"
+title = {{title_toml}}
+version = "0.1.0"
+
+# The project's apps: command-line tools, each a console script in pyproject.toml.
+[apps.{{name}}]
+cli = "{{name}}"
+
+# Jobs: short runs of an app command that mes starts for you and that stop when they are done.
+# Each job has exactly one trigger: schedule = "...", after = "<another job>", manual = true or
+# webhook = true. See: mes guide jobs
+[jobs.rebuild]
+run = "{{name}} rebuild"   # the app, then its command
+manual = true              # only when someone asks: mes jobs run rebuild
+# schedule = "*-*-* 06:00:00"   # use this instead of manual to run it every day at 06:00 (on a server)
+timeout = "5m"             # stopped if it takes longer than 5 minutes
+network = false            # it never needs the internet
+
+# What the dashboards may show: only these tables of the project's SQLite file reach them.
+[ui]
+data = "{{name}}.sqlite"
+tables = ["daily"]
+dashboards = ["main"]
+refresh_after = ["rebuild"]   # on a server, the dashboard data is rebuilt after this job succeeds

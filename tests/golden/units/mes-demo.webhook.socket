@@ -1,0 +1,19 @@
+# Made by my-easy-software (mes). Do not edit: run 'mes server plan' again and the script it writes instead.
+# mes-project: demo
+# mes-unit: webhook
+# The socket belongs to root (mode 0600): only a local proxy running as root, such as
+# 'tailscale serve', can pass requests to it. See: mes guide webhooks
+
+[Unit]
+Description=Signed webhooks of project demo (socket)
+
+[Socket]
+ListenStream=/run/mes-demo-webhook.sock
+SocketUser=root
+SocketGroup=root
+SocketMode=0600
+Accept=no
+Service=mes-demo.webhook.service
+
+[Install]
+WantedBy=sockets.target

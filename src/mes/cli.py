@@ -5,8 +5,9 @@ own commands through a ``register(subparsers)`` function. The modules are
 imported one by one; a module that is not installed is skipped, so ``mes``
 keeps working with whatever parts are present.
 
-Contract for a feature module (``mes.scaffold``, ``mes.setup``, ``mes.jobs``,
-``mes.gate``, ``mes.guide``)
+Contract for a feature module (``mes.scaffold``, ``mes.dev``, ``mes.setup``, ``mes.jobs``,
+``mes.server``, ``mes.deploy``, ``mes.gate``, ``mes.expose``, ``mes.webhook``, ``mes.backup``,
+``mes.guide``)
 ---------------------------------------------------------------------------
 - Define ``register(subparsers)``. ``subparsers`` is the top-level
   ``add_subparsers(dest="command")`` action; call ``subparsers.add_parser(...)``.
@@ -44,45 +45,20 @@ from mes import __version__, protocol
 from mes.app import ArgumentParser, parse_json_aware
 from mes.errors import MesError, NotAvailableYet, UsageError
 
-COMMAND_MODULES = ("mes.scaffold", "mes.setup", "mes.jobs", "mes.gate", "mes.guide")
+COMMAND_MODULES = (
+    "mes.scaffold", "mes.dev", "mes.setup", "mes.jobs", "mes.server", "mes.deploy", "mes.gate",
+    "mes.expose", "mes.webhook", "mes.backup", "mes.guide",
+)
 
-NOT_AVAILABLE: dict[str, tuple[str, str, str]] = {
-    "dev": (
-        "Preview an app's dashboards on this computer (not available yet).",
-        "Previewing dashboards is not available yet in this version of mes, because the dashboard "
-        "server (my-easy-ui) is not released. Your app's command-line tool and jobs already work.",
-        "For now, use the app's own commands (for example: <app> --json describe) and run its jobs "
-        "with: mes jobs run <job>",
-    ),
-    "deploy": (
-        "Install an app on a server you own (not available yet).",
-        "Installing apps on a server is not available yet in this version of mes. For now apps run "
-        "only on the computer where they are, and nothing is sent anywhere.",
-        "",  # depends on this computer, see _deploy_hint
-    ),
-    "expose": (
-        "Share chosen dashboards with other people (not available yet).",
-        "Sharing dashboards is not available yet in this version of mes. Nothing is shared: your "
-        "apps and data stay private on your own devices.",
-        "No action is needed. Sharing will ask for your approval of exactly what leaves the "
-        "machine once it exists.",
-    ),
-}
-
-
-def _deploy_hint() -> str:
-    if sys.platform.startswith("linux"):
-        return ("Keep using the app on this computer; switch on its scheduled jobs here with: "
-                "mes jobs install")
-    return ("Keep using the app on this computer and run its jobs by hand with: mes jobs run <job>. "
-            "Scheduled jobs need a Linux server, which 'mes deploy' will set up once it exists.")
+# Planned commands that only explain they are not available yet: (help, message, hint).
+NOT_AVAILABLE: dict[str, tuple[str, str, str]] = {}
 
 
 def _not_available(name: str):
     _, message, hint = NOT_AVAILABLE[name]
 
     def handler(args: argparse.Namespace) -> Any:
-        raise NotAvailableYet(message, hint=hint or (_deploy_hint() if name == "deploy" else None))
+        raise NotAvailableYet(message, hint=hint or None)
 
     return handler
 
@@ -94,7 +70,7 @@ def _warn(text: str) -> None:
 def build_parser() -> tuple[ArgumentParser, list[str]]:
     parser = ArgumentParser(
         prog="mes",
-        description="Create, run and look after small personal apps that keep your data yours. "
+        description="Create, run, deploy and share small personal projects that keep your data yours. "
         "Add --json (anywhere) to get pure JSON on stdout, for AI agents.",
         epilog="Start with 'mes guide' for instructions written for AI agents.",
     )

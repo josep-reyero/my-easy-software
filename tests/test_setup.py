@@ -87,8 +87,7 @@ def linux(**over) -> Fake:
     which = {"uv": "/usr/bin/uv", "systemctl": "/usr/bin/systemctl", "tailscale": "/usr/bin/tailscale"}
     commands = {
         ("uv", "--version"): (0, "uv 0.6.6 (abc 2025-03-12)\n", ""),
-        ("systemctl", "--user", "is-system-running"): (0, "running\n", ""),
-        ("loginctl", "show-user"): (0, "yes\n", ""),
+        ("systemctl", "is-system-running"): (0, "running\n", ""),
         ("tailscale", "status", "--json"): (0, status("Running"), ""),
     }
     which.update(over.pop("which", {}))
@@ -248,33 +247,27 @@ def test_systemd_on_mac_is_skipped_and_fine():
     assert "systemd-linger" not in items
 
 
-def test_systemd_running_with_linger():
-    items = items_for(linux())
-    assert items["systemd"]["status"] == "done" and items["systemd-linger"]["status"] == "done"
+def test_systemd_running():
+    fake = linux()
+    items = items_for(fake)
+    assert items["systemd"]["status"] == "done" and "systemd-linger" not in items
+    assert fake.ran("systemctl", "is-system-running")
 
 
 def test_systemd_degraded_still_works():
-    items = items_for(linux(commands={("systemctl", "--user", "is-system-running"): (1, "degraded\n", "")}))
+    items = items_for(linux(commands={("systemctl", "is-system-running"): (1, "degraded\n", "")}))
     assert items["systemd"]["status"] == "done" and "degraded" in items["systemd"]["detail"]
 
 
-def test_systemd_no_user_session():
-    fake = linux(commands={("systemctl", "--user", "is-system-running"): (1, "", "Failed to connect to bus: No medium found")})
+def test_systemd_not_running():
+    fake = linux(commands={("systemctl", "is-system-running"): (1, "", "System has not been booted with systemd")})
     it = items_for(fake)["systemd"]
-    assert it["status"] == "todo" and it["fix"] == 'sudo loginctl enable-linger "$USER"'
-    assert "Failed to connect to bus" in it["detail"]
-
-
-def test_systemd_linger_off():
-    fake = linux(commands={("loginctl", "show-user"): (0, "no\n", "")})
-    it = items_for(fake)["systemd-linger"]
-    assert it["status"] == "todo" and "log out" in it["why"] and "enable-linger" in it["fix"]
-    assert fake.ran("loginctl", "show-user", "someone", "--property=Linger", "--value")
+    assert it["status"] == "blocked" and not it.get("fix") and "booted with systemd" in it["detail"]
 
 
 def test_no_systemd_at_all():
     items = items_for(linux(missing=("systemctl",)))
-    assert items["systemd"]["status"] == "blocked" and items["systemd-linger"]["status"] == "blocked"
+    assert items["systemd"]["status"] == "blocked" and "systemd-linger" not in items
 
 
 # --------------------------------------------------------------------------- Tailscale checks
@@ -737,7 +730,7 @@ def test_cli_doctor_json(use_fake, capsys):
     out = json.loads(capsys.readouterr().out)
     assert code == 1 and out["ok"] is False
     assert [i["id"] for i in out["items"]] == [
-        "platform", "python", "uv", "systemd", "systemd-linger",
+        "platform", "python", "uv", "systemd",
         "tailscale-installed", "tailscale-running", "tailscale-signed-in", "config",
     ]
 
@@ -757,3 +750,138 @@ def test_setup_needs_admin_doctor_needs_read(use_fake, capsys, monkeypatch):
     from mes import paths
     assert not paths.config_path().exists()
     assert cli.run(["--json", "doctor"]) in (0, 1, 6)
+
+
+# --------------------------------------------------------------------------- serving a dashboard privately
+
+
+def serve(project="notes", **over):
+    return setup.dashboard_serve(project, **over)
+
+
+def test_serve_item_with_project_gives_exact_server_commands(mes_home):
+    fake = linux()
+    result = setup.run_setup({}, probe=fake.probe(), serve=serve())
+    it = by_id(result)["tailscale-serve"]
+    assert it["title"] == "Serve the dashboard on your private network"
+    assert it["status"] == "todo" and it["needs_human"] is True and it["fix"] is None
+    cmd = "sudo tailscale serve --bg --https=443 unix:/run/mes/notes-web.sock"
+    assert f"`{cmd}`" in it["why"] and f"serve: {cmd}" in it["detail"]
+    assert "--allow-host my-server.example-net.ts.net" in it["why"]
+    assert "`mes server plan notes --allow-host my-server.example-net.ts.net`" in it["why"]
+    assert "easy-ui units" in it["why"] and "mes-notes-web" in it["why"]
+    assert "dashboard units: mes server plan notes --allow-host my-server.example-net.ts.net" in it["detail"]
+    assert "`tailscale serve status`" in it["why"]
+    assert "`sudo tailscale serve --https=443 off`" in it["why"]
+    assert "opens at: https://my-server.example-net.ts.net/" in it["detail"]
+    assert "never runs these commands" in it["why"] and "private network" in it["why"]
+    # Never offers funnel, and says why not.
+    assert "Never use `tailscale funnel`" in it["why"] and "public" in it["why"]
+    assert "funnel" not in it["detail"]
+    # Nothing was run: only the status was looked at.
+    assert not fake.ran("tailscale", "serve") and not fake.ran("tailscale", "funnel")
+    assert result["ok"] is False and protocol.exit_code_for(result) == 6
+    assert list(by_id(result))[-1] == "tailscale-serve"
+
+
+def test_serve_item_socket_and_port_can_be_changed(mes_home):
+    s = serve(socket="/run/notes-ui/web.sock", port=8443)
+    it = by_id(setup.run_setup({}, probe=linux().probe(), serve=s))["tailscale-serve"]
+    assert "sudo tailscale serve --bg --https=8443 unix:/run/notes-ui/web.sock" in it["why"]
+    assert "sudo tailscale serve --https=8443 off" in it["why"]
+    assert "https://my-server.example-net.ts.net:8443/" in it["why"]
+
+
+def test_serve_item_without_a_known_name_uses_a_placeholder(mes_home):
+    no_name = json.dumps({"BackendState": "Running", "Self": {}})
+    fake = linux(commands={("tailscale", "status", "--json"): (0, no_name, "")})
+    it = by_id(setup.run_setup({}, probe=fake.probe(), serve=serve()))["tailscale-serve"]
+    assert "--allow-host <this-server>.<your-tailnet>.ts.net" in it["why"]
+    assert "Replace <this-server>.<your-tailnet>.ts.net" in it["why"]
+
+
+def test_serve_item_ignores_a_strange_dns_name(mes_home):
+    odd = json.dumps({"BackendState": "Running", "Self": {"DNSName": "x; rm -rf /.ts.net."}})
+    fake = linux(commands={("tailscale", "status", "--json"): (0, odd, "")})
+    it = by_id(setup.run_setup({}, probe=fake.probe(), serve=serve()))["tailscale-serve"]
+    assert "rm -rf" not in it["why"] and checks.PLACEHOLDER_HOST in it["why"]
+
+
+def test_serve_item_on_mac_has_no_sudo(mes_home):
+    it = by_id(setup.run_setup({}, probe=mac().probe(), serve=serve()))["tailscale-serve"]
+    assert "`tailscale serve --bg --https=443 unix:/run/mes/notes-web.sock`" in it["why"]
+    assert "sudo" not in it["detail"]
+
+
+def test_serve_item_waits_for_tailscale_and_skips_in_local_only(mes_home):
+    stopped = linux(commands={("tailscale", "status", "--json"): (0, status("Stopped"), "")})
+    it = by_id(setup.run_setup({}, probe=stopped.probe(), serve=serve()))["tailscale-serve"]
+    assert it["status"] == "blocked" and "tailscale serve" not in it["why"]
+    result = setup.run_setup({"tailscale": "local-only"}, probe=linux(**NO_TAILSCALE).probe(), serve=serve())
+    it = by_id(result)["tailscale-serve"]
+    assert it["status"] == "skipped" and "mes dev" in it["why"]
+    unsupported = Fake(system="Windows", which={"uv": "uv"}, commands={("uv", "--version"): (0, "uv 0.6.6", "")})
+    assert by_id(setup.run_setup({}, probe=unsupported.probe(), serve=serve()))["tailscale-serve"]["status"] == "skipped"
+
+
+def test_no_project_means_no_serve_item(mes_home, tmp_path):
+    assert setup.dashboard_serve(cwd=tmp_path) is None
+    result = setup.run_setup({}, probe=linux().probe())
+    assert "tailscale-serve" not in by_id(result) and result["ok"] is True
+
+
+def test_project_folder_with_ui_is_found(tmp_path):
+    (tmp_path / "project.toml").write_text('[project]\nname = "notes"\n[ui]\ndata = "notes.sqlite"\n')
+    (tmp_path / "src").mkdir()
+    s = setup.dashboard_serve(cwd=tmp_path / "src")
+    assert s == checks.DashboardServe("notes", "/run/mes/notes-web.sock", 443)
+    (tmp_path / "project.toml").write_text('[project]\nname = "notes"\n')  # no dashboards: nothing to serve
+    assert setup.dashboard_serve(cwd=tmp_path) is None
+    (tmp_path / "project.toml").write_text('[project]\nname = "notes"\ncolour = 1\n')  # broken: setup still works
+    assert setup.dashboard_serve(cwd=tmp_path) is None
+
+
+@pytest.mark.parametrize("socket", ["relative.sock", "/run/../etc/shadow", "/run/a b.sock", "/run/x;id",
+                                    "/run/$(id).sock", "/run/x.sock\n", "/run/`id`", "/", "/run/./x"])
+def test_hostile_socket_paths_are_refused(socket):
+    with pytest.raises(UsageError):
+        setup.dashboard_serve("notes", socket=socket)
+
+
+@pytest.mark.parametrize("project", ["../etc", "Notes", "a", "notes\n", "notes;id"])
+def test_hostile_project_names_are_refused(project):
+    with pytest.raises(UsageError):
+        setup.dashboard_serve(project)
+
+
+@pytest.mark.parametrize("port", [0, -1, 65536])
+def test_bad_ports_are_refused(port):
+    with pytest.raises(UsageError):
+        setup.dashboard_serve("notes", port=port)
+
+
+def test_socket_without_a_project_is_a_usage_error(tmp_path):
+    with pytest.raises(UsageError):
+        setup.dashboard_serve(socket="/run/mes/x-web.sock", cwd=tmp_path)
+
+
+def test_reruns_keep_the_project(mes_home):
+    q = setup.run_setup({}, probe=linux(**NO_TAILSCALE).probe(), json_mode=True, serve=serve(port=8443))
+    assert q["rerun"] == "mes --json setup --project notes --port 8443 --answer tailscale=<value>"
+    fake = linux(commands={("tailscale", "status", "--json"): (0, status("NeedsLogin", AuthURL=SIGN_IN_URL), "")})
+    person = setup.run_setup({}, probe=fake.probe(), serve=serve())
+    assert person["status"] == "needs_human" and person["rerun"] == "mes setup --project notes"
+
+
+def test_cli_setup_with_project(use_fake, capsys):
+    use_fake(linux())
+    code = cli.run(["--json", "setup", "--project", "notes", "--socket", "/run/mes/notes-web.sock"])
+    out = json.loads(capsys.readouterr().out)
+    assert code == 6 and out["items"][-1]["id"] == "tailscale-serve"
+    code = cli.run(["setup", "--project", "notes"])
+    text = capsys.readouterr().out
+    assert code == 6 and "[todo] Serve the dashboard on your private network" in text
+    assert "sudo tailscale serve --bg --https=443 unix:/run/mes/notes-web.sock" in text
+    assert "(this step needs you)" in text and "Your assistant can do this" not in text.split("Serve the")[1]
+    code = cli.run(["--json", "setup", "--project", "notes", "--socket", "/tmp/../x"])
+    assert code == 2 and json.loads(capsys.readouterr().out)["error"]["code"] == "usage"

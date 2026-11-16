@@ -4,7 +4,7 @@ Example::
 
     from mes import App
 
-    app = App("myapp")          # reads app.toml / AGENTS.md from the app's folder when present
+    app = App("myapp")          # reads project.toml / AGENTS.md from the project's folder
 
     @app.command("summary", kind="read", help="Key numbers for the last days.")
     def summary(ctx, days: int = 7):
@@ -33,11 +33,13 @@ Public API
     Raises ``NotAllowed`` (exit 4) when ``kind`` is above ``level``.
 
 ``App(name, *, title=None, version=None, root=None)``
-    ``root`` is the app's folder (holding ``app.toml`` / ``AGENTS.md``). When
-    omitted it is found by walking up from the file that created the ``App``.
+    ``name`` is the app's name (one of the ``[apps]`` of its project). ``root`` is the
+    project's folder (holding ``project.toml`` / ``AGENTS.md``). When omitted it is found by
+    walking up from the file that created the ``App``.
     Attributes: ``name``, ``root``, ``commands`` (dict name -> ``Command``).
-    Properties: ``manifest`` (``Manifest | None``, loaded on first use),
-    ``title``, ``version``.
+    Properties: ``manifest`` (the ``Project`` or ``None``, loaded on first use),
+    ``project`` (the project's name: from project.toml, else ``MES_PROJECT``, else the app
+    name), ``title``, ``version``.
     ``@app.command(name=None, *, kind="read", help=None)``  register a command
         (name defaults to the function name with ``_`` -> ``-``).
     ``@app.schema`` / ``@app.sources``  register a provider ``fn(ctx) -> data``
@@ -50,10 +52,10 @@ Public API
 
 ``Context`` (passed as the first argument to every command)
     ``ctx.app`` (the App), ``ctx.json`` (bool), ``ctx.allow`` (level),
-    ``ctx.command`` (name), ``ctx.data_dir`` / ``ctx.state_dir`` (Path, created on
-    first access, under the per-machine folders of ``mes.paths``),
-    ``ctx.config`` (the ``[apps.<name>]`` table of the per-machine config),
-    ``ctx.manifest``.
+    ``ctx.command`` (name), ``ctx.project`` (the project's name),
+    ``ctx.data_dir`` / ``ctx.state_dir`` (Path, created on first access: the project's folders,
+    see ``mes.paths``; every app of a project shares them), ``ctx.config`` (the
+    ``[projects.<name>]`` table of the per-machine config), ``ctx.manifest``.
 
 ``Command`` (dataclass): ``name``, ``kind``, ``help``, ``func``, ``params``
     (list of ``Param``); ``to_dict()``.
@@ -89,7 +91,7 @@ from typing import Annotated, Any, Literal, NoReturn, Union, get_args, get_origi
 
 from mes import paths, protocol
 from mes.errors import ManifestError, MesError, NotAllowed, UsageError
-from mes.manifest import APP_NAME_RE, MANIFEST_FILE, Manifest
+from mes.manifest import APP_NAME_RE, MANIFEST_FILE, Project
 from mes.manifest import load as load_manifest
 
 KINDS = ("read", "write", "admin")
@@ -418,23 +420,27 @@ class Context:
     @property
     def data_dir(self) -> Path:
         if self._data_dir is None:
-            self._data_dir = paths.app_data_dir(self.app.name, create=True)
+            self._data_dir = paths.project_data_dir(self.app.project, create=True)
         return self._data_dir
 
     @property
     def state_dir(self) -> Path:
         if self._state_dir is None:
-            self._state_dir = paths.app_state_dir(self.app.name, create=True)
+            self._state_dir = paths.project_state_dir(self.app.project, create=True)
         return self._state_dir
 
     @property
     def config(self) -> dict[str, Any]:
         if self._config is None:
-            self._config = paths.app_config(self.app.name)
+            self._config = paths.project_config(self.app.project)
         return self._config
 
     @property
-    def manifest(self) -> Manifest | None:
+    def project(self) -> str:
+        return self.app.project
+
+    @property
+    def manifest(self) -> Project | None:
         return self.app.manifest
 
 
@@ -470,7 +476,7 @@ class App:
         self.root = Path(root).resolve() if root is not None else _caller_root()
         self._title = title
         self._version = version
-        self._manifest: Manifest | None = None
+        self._manifest: Project | None = None
         self._manifest_loaded = False
         self.commands: dict[str, Command] = {}
         self._providers: dict[str, Callable[[Context], Any]] = {}
@@ -481,19 +487,36 @@ class App:
     # -- metadata
 
     @property
-    def manifest(self) -> Manifest | None:
+    def manifest(self) -> Project | None:
         if not self._manifest_loaded:
             if self.root is not None and (self.root / MANIFEST_FILE).is_file():
                 m = load_manifest(self.root / MANIFEST_FILE)
-                if m.name != self.name:
+                if self.name not in m.apps:
                     raise ManifestError(
-                        f'app.toml says the app is called "{m.name}", but its command-line tool says '
-                        f'"{self.name}". They must match, or data could end up in the wrong folder.',
-                        hint="Use the same name in app.toml [app] name and in App(...).",
+                        f'The command-line tool says it is the app "{self.name}", but project.toml of the project '
+                        f'"{m.name}" has no such app (its apps: {", ".join(m.apps)}). They must match, or data '
+                        "could end up in the wrong folder.",
+                        hint=f'Add [apps.{self.name}] to project.toml, or use one of its app names in App(...).',
+                    )
+                session = os.environ.get("MES_PROJECT")
+                if session is not None and session != m.name:
+                    raise ManifestError(
+                        f'This session belongs to the project "{session[:40]}", but this app is part of "{m.name}". '
+                        "Projects cannot read each other, so it was not started.",
+                        hint="Run the app in its own project's session or account.",
+                        code="wrong_project",
                     )
                 self._manifest = m
             self._manifest_loaded = True
         return self._manifest
+
+    @property
+    def project(self) -> str:
+        m = self.manifest
+        if m is not None:
+            return m.name
+        session = os.environ.get("MES_PROJECT")
+        return session if session else self.name
 
     @property
     def title(self) -> str:
@@ -555,6 +578,7 @@ class App:
         manifest = self.manifest
         return {
             "app": self.name,
+            "project": self.project,
             "title": self.title,
             "version": self.version,
             "mes_version": __version__,
@@ -563,7 +587,7 @@ class App:
             "exit_codes": {"0": "ok", "1": "error", "2": "usage", "3": "not found", "4": "not allowed",
                            "5": "refused for safety", "6": "needs a person", "75": "temporary failure, retry"},
             "commands": [c.to_dict() for c in self.commands.values()],
-            "jobs": [j.to_dict() for j in manifest.jobs.values()] if manifest else [],
+            "jobs": [j.to_dict() for j in manifest.jobs.values() if j.app == self.name] if manifest else [],
         }
 
     def describe_text(self) -> str:
@@ -577,9 +601,10 @@ class App:
         lines = [f"{self.title} ({self.name}), version {self.version}", f"This session may run {may}.", "",
                  protocol.format_text(rows)]
         manifest = self.manifest
-        if manifest and manifest.jobs:
+        mine = [j for j in manifest.jobs.values() if j.app == self.name] if manifest else []
+        if mine:
             lines += ["", "Jobs (see: mes jobs list):"]
-            lines += [f"- {j.name}: runs \"{self.name} {j.run}\"" for j in manifest.jobs.values()]
+            lines += [f"- {j.name}: runs \"{j.run}\"" for j in mine]
         lines += ["", f"For the arguments of a command, run: {self.name} <command> --help "
                   f"(or {self.name} --json describe for everything as data)."]
         return "\n".join(lines)
@@ -619,7 +644,7 @@ class App:
     def build_parser(self) -> ArgumentParser:
         try:
             title = self.title
-        except MesError:  # a broken app.toml is reported by the commands that need it
+        except MesError:  # a broken project.toml is reported by the commands that need it
             title = self.name
         parser = ArgumentParser(
             prog=self.name,

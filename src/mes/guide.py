@@ -74,7 +74,7 @@ def _handle(args: argparse.Namespace) -> Any:
 def register(subparsers: Any) -> None:
     p = subparsers.add_parser(
         "guide",
-        help="Short instructions for AI agents (topics: setup, new-app, jobs, gate, security).",
+        help="Short instructions for AI agents (run without a topic to list them).",
         description="Print instructions for AI agents. Without a topic, list the topics.",
     )
     p.add_argument("topic", nargs="?", help="the topic to show")

@@ -182,10 +182,11 @@ def test_error_classes_exit_codes():
 
 def test_paths_follow_env(mes_home):
     assert paths.data_home() == mes_home["data"]
-    assert paths.app_data_dir("myapp") == mes_home["data"] / "myapp"
+    assert paths.project_data_dir("myapp") == mes_home["data"] / "myapp"
     assert not (mes_home["data"] / "myapp").exists()
-    d = paths.app_state_dir("myapp", create=True)
+    d = paths.project_state_dir("myapp", create=True)
     assert d == mes_home["state"] / "myapp" and d.is_dir()
+    assert paths.project_store_dir("myapp") == mes_home["data"] / "myapp" / "store"
     assert paths.config_path() == mes_home["config"]
 
 
@@ -198,17 +199,18 @@ def test_paths_defaults_without_env(monkeypatch, tmp_path):
     assert paths.config_path() == tmp_path / ".config/mes/config.toml"
 
 
-def test_paths_reject_bad_app_names():
-    with pytest.raises(UsageError):
-        paths.app_data_dir("../escape")
+def test_paths_reject_bad_project_names():
+    for bad in ("../escape", "myapp\n", "My"):
+        with pytest.raises(UsageError):
+            paths.project_data_dir(bad)
 
 
 def test_config_loading(mes_home):
     assert paths.load_config() == {}
     mes_home["config"].parent.mkdir(parents=True)
-    mes_home["config"].write_text('[apps.myapp]\nunits = "metric"\n')
-    assert paths.app_config("myapp") == {"units": "metric"}
-    assert paths.app_config("other") == {}
+    mes_home["config"].write_text('[projects.myapp]\nunits = "metric"\n')
+    assert paths.project_config("myapp") == {"units": "metric"}
+    assert paths.project_config("other") == {}
     mes_home["config"].write_text("[broken")
     with pytest.raises(ConfigError):
         paths.load_config()
@@ -227,7 +229,7 @@ def test_project_root_and_is_inside(tmp_path):
 
 def test_guide_topics():
     names = [t["name"] for t in guide.topics()]
-    assert {"setup", "new-app", "jobs", "security"} <= set(names)
+    assert {"setup", "new-project", "jobs", "security", "deploy", "share"} <= set(names)
     assert all(t["summary"] for t in guide.topics())
     assert "checklist" in guide.read_topic("setup")
     with pytest.raises(NotFound):
@@ -255,9 +257,11 @@ def test_cli_guide_json_after_command(capsys):
     assert json.loads(capsys.readouterr().out)["error"]["code"] == "not_found"
 
 
-@pytest.mark.parametrize("name", ["dev", "deploy", "expose"])
-def test_cli_not_available_yet(capsys, name):
-    assert cli.run(["--json", name, "my-server", "--anything"]) == 1
+def test_cli_not_available_yet(capsys, monkeypatch):
+    # Every planned command is built now; the mechanism stays for the next ones.
+    assert cli.NOT_AVAILABLE == {}
+    monkeypatch.setattr(cli, "NOT_AVAILABLE", {"later": ("Coming later.", "This is not available yet.", "Wait.")})
+    assert cli.run(["--json", "later", "my-server", "--anything"]) == 1
     err = json.loads(capsys.readouterr().out)["error"]
     assert err["code"] == "not_available_yet" and "not available yet" in err["message"] and err["hint"]
 

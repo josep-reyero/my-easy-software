@@ -1,0 +1,14 @@
+# Files that stay on this computer and must never be shared with the project's code.
+# .venv/ holds the app's private Python setup, full of this computer's paths.
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+dist/
+*.egg-info/
+# The project's data lives outside this folder (see AGENTS.md); these keep stray copies out too.
+*.sqlite
+*.db
+.env
+# The made-up sample data for the dashboard preview is part of the project, so it is kept.
+!ui/fixtures/*.sqlite

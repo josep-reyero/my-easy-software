@@ -1,4 +1,4 @@
-"""my-easy-software: the framework behind small personal apps, and the ``mes`` command.
+"""my-easy-software: the framework behind small personal projects, and the ``mes`` command.
 
 Public API (re-exported here for apps)
 --------------------------------------
@@ -9,9 +9,13 @@ Errors (see ``mes.errors``): ``MesError``, ``UsageError``, ``NotFound``, ``NotAl
 ``Refused``, ``NeedsPerson``, ``TemporaryFailure``, ``ExitCode``.
 
 Modules: ``mes.app`` (App SDK), ``mes.protocol`` (agent protocol and output),
-``mes.manifest`` (app.toml), ``mes.paths`` (per-machine folders and config),
-``mes.errors`` (errors and exit codes), ``mes.cli`` (the ``mes`` command),
-``mes.guide`` (``mes guide``).
+``mes.manifest`` (project.toml), ``mes.paths`` (per-machine folders, config, server layout),
+``mes.errors`` (errors and exit codes), ``mes.cli`` (the ``mes`` command), ``mes.scaffold``
+(``mes new``), ``mes.dev`` (``mes dev``), ``mes.jobs`` (jobs and the run log), ``mes.units``
+(system units), ``mes.server`` (``mes server``), ``mes.deploy`` (``mes deploy``), ``mes.archive``
+(packing and hardened unpacking), ``mes.gate`` (the SSH gate), ``mes.registry`` (projects the
+personal gate may run), ``mes.expose`` (sharing), ``mes.webhook``, ``mes.backup``,
+``mes.siblings`` (calling easy-ui and mybucket), ``mes.guide`` (``mes guide``).
 """
 
 __version__ = "0.1.0"

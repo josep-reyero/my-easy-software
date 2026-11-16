@@ -26,16 +26,30 @@ own devices unless you choose to share them.
 
 ## Status
 
-Version 0.1: everything that works on **one computer**. You can create an app, use its
-command-line tool, run its jobs by hand, schedule them on a Linux machine with systemd, and let
-AI agents on other computers reach it through one safe SSH entry point (`mes gate`). Not
-available yet: the dashboard server and `mes dev` previews, `mes deploy`, sharing (`mes expose`),
-storage buckets, signed code and webhooks. These commands exist and say so.
+Version 1 round (in progress). A **project** (`project.toml`) holds one or more apps, their
+jobs and their dashboards. What works:
+
+- `mes new` creates a project whose app stores data in SQLite and whose dashboard works at once;
+  `mes dev` shows it on this computer with one link (needs my-easy-ui).
+- `mes server plan` writes one readable root script that sets a project up on a Linux server with
+  its own two accounts, folders and sandboxed system units; you run it once with sudo, and
+  `mes server check` verifies it. mes itself never uses sudo.
+- `mes deploy` sends signed releases (OpenSSH signatures, checked before anything is unpacked)
+  through the server's SSH gate, with rollback.
+- Jobs on a server have no network unless they list hosts, and then reach only those hosts.
+- Agents reach apps through one SSH entry point (`mes gate`), each request in its own sandbox.
+- `mes expose` shares chosen dashboards (Cloudflare Pages, Netlify, Vercel) with named people,
+  anyone with the link (encrypted), or everyone, always after your explicit yes.
+- Signed webhooks as job triggers, `mes backup` / `mes restore`, agent skills in `skills/`.
+
+The server parts are tested on this computer with fakes; see `docs/design.md` for what still
+needs a real Linux server to be confirmed.
 
 ## Quick start
 
-You need [uv](https://docs.astral.sh/uv/) (it installs Python and the apps). Your AI agent can do
-every step below for you; `mes` answers in plain words and, with `--json`, in data an agent can read.
+You need [uv](https://docs.astral.sh/uv/) (it installs Python and the projects). Your AI agent can
+do every step below for you; `mes` answers in plain words and, with `--json`, in data an agent
+can read.
 
 ```sh
 # 1. Get mes (it is not published yet): download this repository, then
@@ -44,22 +58,27 @@ uv tool install --editable ./my-easy-software      # "mes" now works in any fold
 # 2. Check this computer and set it up, one step at a time
 mes setup
 
-# 3. Create an app next to the my-easy-software folder and try it
+# 3. Create a project next to the my-easy-software folder and try it
 mes new my-notes
 cd my-notes && uv sync
 uv run my-notes add "My first note"
-uv run my-notes notes
 uv run mes jobs run rebuild
+uv run mes dev                                     # one link to the dashboard
+
+# 4. Later: put it on your own server (see: mes guide server, mes guide deploy)
+mes server plan my-notes --out plan.sh --signer ~/.ssh/mes-deploy.pub --key deploy=~/.ssh/mes-deploy.pub
+mes deploy my-server
 ```
 
-Without installing mes, `uv run --project ./my-easy-software mes ...` works too. Inside an app,
-`uv run mes ...` always works. Guides for agents: `mes guide` (setup, new-app, jobs, gate,
-security). Instructions for agents working on this repository: [AGENTS.md](AGENTS.md).
+Without installing mes, `uv run --project ./my-easy-software mes ...` works too. Inside a
+project, `uv run mes ...` always works. Guides for agents: `mes guide` lists them. Agent skills
+(and a Claude Code plugin manifest in `.claude-plugin/`) are in `skills/`. Instructions for
+agents working on this repository: [AGENTS.md](AGENTS.md).
 
 Pieces:
 
-- **my-easy-software** (this repo): the framework and its `mes` command for creating, previewing
-  and deploying apps.
+- **my-easy-software** (this repo): the framework and its `mes` command for creating, previewing,
+  deploying and sharing projects.
 - **my-easy-ui**: the dashboard server and renderer. Dashboards are plain description files with
   no code in them.
 - **my-bucket-storage**: space-efficient storage with an SDK.

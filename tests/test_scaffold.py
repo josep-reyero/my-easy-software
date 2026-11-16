@@ -1,7 +1,8 @@
 """Tests for ``mes new`` (mes.scaffold).
 
-The last group generates an app into a temp folder, runs ``uv sync`` there and
-drives the generated command-line tool end to end as a real process.
+The generated project's cli.py is driven in-process (App.run) against SQLite; the last group
+runs ``uv sync`` in the generated folder (skipped without uv or network) and drives the tool as a
+real process; one test runs the real easy-ui when it is installed next to this repository.
 """
 
 from __future__ import annotations
@@ -11,6 +12,9 @@ import os
 import re
 import shutil
 import subprocess
+import importlib.util
+import sqlite3
+import sys
 import tomllib
 from pathlib import Path
 
@@ -20,11 +24,17 @@ from mes import cli, manifest, scaffold
 from mes.errors import NotFound, Refused, UsageError
 
 FRAMEWORK = Path(__file__).resolve().parents[1]
-FIVE = {"app.toml", "pyproject.toml", "src/{m}/cli.py", "AGENTS.md", "ui/dashboards/main.yaml", ".gitignore"}
+FIVE = {"project.toml", "pyproject.toml", "src/{m}/cli.py", "AGENTS.md", "ui/dashboards/main.yaml", ".gitignore"}
+CREATED = FIVE | {scaffold.FIXTURE}
+EASY_UI = FRAMEWORK.parent / "my-easy-ui" / ".venv" / "bin" / "easy-ui"
 
 
 def five(module: str) -> set[str]:
     return {p.format(m=module) for p in FIVE}
+
+
+def created(module: str) -> set[str]:
+    return {p.format(m=module) for p in CREATED}
 
 
 def files_in(folder: Path) -> set[str]:
@@ -53,11 +63,16 @@ def test_invalid_names(name):
     assert "letters, digits and dashes" in e.value.hint
 
 
-@pytest.mark.parametrize("name", ["json", "mes", "class", "match", "test", "my-easy-software", "os"])
+@pytest.mark.parametrize("name", ["json", "class", "match", "test", "my-easy-software", "my-easy-ui", "os"])
 def test_reserved_names(name):
     with pytest.raises(UsageError) as e:
         scaffold.validate_name(name)
     assert "already used" in e.value.message
+
+
+def test_mes_is_not_a_project_name():
+    with pytest.raises(UsageError):
+        scaffold.validate_name("mes")
 
 
 # --------------------------------------------------------------------------- rendering
@@ -71,14 +86,18 @@ def test_render_gives_exactly_five_files_with_no_markers_left():
         assert text.endswith("\n")
 
 
-def test_rendered_app_toml_is_valid_and_job_runs_an_app_command():
+def test_rendered_project_toml_is_valid_and_job_runs_an_app_command():
     files = scaffold.render("my-notes")
-    m = manifest.loads(files["app.toml"])
+    m = manifest.loads(files["project.toml"])
     assert (m.name, m.title, m.version) == ("my-notes", "My notes", "0.1.0")
+    assert list(m.apps) == ["my-notes"] and m.app("my-notes").cli == "my-notes"
     job = m.job("rebuild")
-    assert job.trigger == "manual" and job.argv == ("rebuild",)
-    assert job.network == () and job.timeout == "5m"
+    assert job.run == "my-notes rebuild" and job.app == "my-notes" and job.argv == ("rebuild",)
+    assert job.trigger == "manual" and job.network == () and job.timeout == "5m"
+    assert m.ui == manifest.UI(data="my-notes.sqlite", tables=("daily",), dashboards=("main",),
+                               refresh_after=("rebuild",))
     assert '@app.command("rebuild"' in files["src/my_notes/cli.py"]
+    assert 'DATA_FILE = "my-notes.sqlite"' in files["src/my_notes/cli.py"]
 
 
 def test_rendered_pyproject():
@@ -115,7 +134,7 @@ def test_cli_template_compiles_and_uses_the_sdk():
 def test_title_is_escaped_everywhere():
     title = 'Sam\'s "best" notes \\ ok'
     files = scaffold.render("notes", title=title)
-    assert manifest.loads(files["app.toml"]).title == title
+    assert manifest.loads(files["project.toml"]).title == title
     assert tomllib.loads(files["pyproject.toml"])["project"]["description"] == title
     assert files["AGENTS.md"].startswith(f"# {title}:")
     assert 'title: "Sam\'s \\"best\\" notes \\\\ ok"' in files["ui/dashboards/main.yaml"]
@@ -143,69 +162,139 @@ def test_dashboard_is_an_easy_ui_v1_dashboard():
     assert text.count("query: daily") == 2 and text.count("query: total") == 1
 
 
-def test_dashboard_passes_easy_ui_validate(tmp_path):
-    """When my-easy-ui is checked out (and installed) next to this repository, `easy-ui validate` accepts the file."""
-    import json
-    import subprocess
+def test_dashboard_reads_only_the_tables_listed_under_ui():
+    files = scaffold.render("my-notes")
+    allowed = set(manifest.loads(files["project.toml"]).ui.tables)
+    text = files["ui/dashboards/main.yaml"]
+    used = set(re.findall(r"\b(?:FROM|JOIN)\s+([A-Za-z_][A-Za-z0-9_]*)", text, re.IGNORECASE))
+    assert used and used <= allowed, used - allowed
+    assert "notes" not in used  # the raw table never reaches the dashboards
 
-    easy_ui = FRAMEWORK.parent / "my-easy-ui" / ".venv" / "bin" / "easy-ui"
-    if not easy_ui.is_file():
-        pytest.skip("my-easy-ui is not installed next to my-easy-software")
-    path = tmp_path / "main.yaml"
-    path.write_text(scaffold.render("notes", title='Sam\'s "best" notes')["ui/dashboards/main.yaml"])
-    out = subprocess.run([str(easy_ui), "--json", "validate", str(path)], capture_output=True, text=True,
-                         cwd=tmp_path, check=False, timeout=60)
-    report = json.loads(out.stdout)
-    assert out.returncode == 0 and report["ok"], report
-    assert report["warnings"] == 0
+
+def _easy_ui_takes_project_dir() -> bool:
+    if not EASY_UI.is_file():
+        return False
+    try:
+        out = subprocess.run([str(EASY_UI), "--help"], capture_output=True, text=True, timeout=30, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return "--project-dir" in out.stdout
+
+
+def test_generated_project_passes_easy_ui_validate(tmp_path, mes_home):
+    """When my-easy-ui is installed next to this repository (and knows --project-dir), the real
+    easy-ui accepts the generated dashboard, builds its data from the project's SQLite file and
+    checks the queries against it."""
+    if not _easy_ui_takes_project_dir():
+        pytest.skip("my-easy-ui (with --project-dir) is not installed next to my-easy-software")
+    folder = tmp_path / "p"
+    scaffold.create("my-notes", directory=folder, title='Sam\'s "best" notes', framework_path=FRAMEWORK)
+    env = {**os.environ, "EASYUI_STATE_HOME": str(tmp_path / "easy-ui-state")}
+    env.pop("VIRTUAL_ENV", None)
+
+    def easy_ui(*argv):
+        p = subprocess.run([str(EASY_UI), "--json", "--project-dir", str(folder), *argv], capture_output=True,
+                           text=True, cwd=folder, env=env, check=False, timeout=120)
+        return p.returncode, json.loads(p.stdout), p.stderr
+
+    code, report, err = easy_ui("validate")
+    assert code == 0 and report["ok"] and report["warnings"] == 0, (report, err)
+    app = load_generated_app(folder, "my_notes")
+    assert app.run(["add", "hello"]) == 0 and app.run(["rebuild"]) == 0
+    code, built, err = easy_ui("data", "build")
+    assert code == 0 and built["tables"]["daily"]["rows"] == 1, (built, err)
+    assert set(built["tables"]) == {"daily"}
+    code, report, err = easy_ui("validate")
+    assert code == 0 and report["ok"] and report["data"]["checked"], (report, err)
 
 
 def test_no_personal_paths_in_templates():
     home = str(Path.home())
     for tmpl, _ in scaffold.FILES:
-        text = (FRAMEWORK / "src" / "mes" / "templates" / "app" / tmpl).read_text()
+        text = (FRAMEWORK / "src" / "mes" / "templates" / "project" / tmpl).read_text()
         assert home not in text
 
 
 # --------------------------------------------------------------------------- creating
 
 
-def test_create_writes_exactly_five_files(tmp_path):
+def test_create_writes_the_files_and_the_sample_data(tmp_path):
     result = scaffold.create("my-notes", directory=tmp_path / "app", framework_path=FRAMEWORK)
     folder = tmp_path / "app"
-    assert files_in(folder) == five("my_notes")
-    assert result["created"] is True
+    assert files_in(folder) == created("my_notes")
+    assert result["created"] is True and result["project"] == "my-notes"
     assert result["folder"] == str(folder.resolve())
     assert [f["path"] for f in result["files"]] == [
-        "app.toml", "pyproject.toml", "src/my_notes/cli.py", "AGENTS.md", "ui/dashboards/main.yaml", ".gitignore"]
+        "project.toml", "pyproject.toml", "src/my_notes/cli.py", "AGENTS.md", "ui/dashboards/main.yaml",
+        ".gitignore", scaffold.FIXTURE]
     assert all(f["purpose"] for f in result["files"])
     assert result["next_steps"][0]["command"].endswith("uv sync")
     assert all(s["why"] for s in result["next_steps"])
+    commands = " ".join(s["command"] or "" for s in result["next_steps"])
+    assert "mes jobs run rebuild" in commands and "mes dev" in commands
+
+
+def test_sample_data_has_60_days_of_daily():
+    import datetime as dt
+    import tempfile
+
+    blob = scaffold.sample_data(dt.date(2026, 3, 1))
+    assert blob == scaffold.sample_data(dt.date(2026, 3, 1))  # the same every time
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "s.sqlite"
+        path.write_bytes(blob)
+        conn = sqlite3.connect(path)
+        try:
+            tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")]
+            rows = conn.execute("SELECT day, notes FROM daily ORDER BY day").fetchall()
+        finally:
+            conn.close()
+    assert tables == ["daily"] and len(rows) == 60
+    assert rows[-1][0] == "2026-03-01" and rows[0][0] == "2026-01-01"
+    assert all(0 <= n <= 6 for _, n in rows)
+
+
+def test_created_fixture_is_the_sample_and_kept_in_git(tmp_path):
+    scaffold.create("notes", directory=tmp_path / "n", framework_path=FRAMEWORK)
+    conn = sqlite3.connect(tmp_path / "n" / scaffold.FIXTURE)
+    try:
+        assert conn.execute("SELECT count(*) FROM daily").fetchone() == (60,)
+    finally:
+        conn.close()
+    assert "!ui/fixtures/*.sqlite" in (tmp_path / "n" / ".gitignore").read_text().splitlines()
 
 
 def test_default_folder_is_the_name_under_cwd(tmp_path):
     scaffold.create("notes", cwd=tmp_path, framework_path=FRAMEWORK)
-    assert files_in(tmp_path / "notes") == five("notes")
+    assert files_in(tmp_path / "notes") == created("notes")
 
 
 def test_relative_dir_is_under_cwd(tmp_path):
     scaffold.create("notes", directory="a/b", cwd=tmp_path, framework_path=FRAMEWORK)
-    assert files_in(tmp_path / "a" / "b") == five("notes")
+    assert files_in(tmp_path / "a" / "b") == created("notes")
 
 
 def test_existing_folder_with_other_files_is_fine(tmp_path):
     (tmp_path / "README.md").write_text("hello\n")
     scaffold.create("notes", directory=tmp_path, framework_path=FRAMEWORK)
-    assert files_in(tmp_path) == five("notes") | {"README.md"}
+    assert files_in(tmp_path) == created("notes") | {"README.md"}
 
 
 def test_refuses_to_overwrite_and_changes_nothing(tmp_path):
-    (tmp_path / "app.toml").write_text("mine\n")
+    (tmp_path / "project.toml").write_text("mine\n")
     with pytest.raises(Refused) as e:
         scaffold.create("notes", directory=tmp_path, framework_path=FRAMEWORK)
-    assert "app.toml" in e.value.message and "Nothing was changed" in e.value.message
-    assert files_in(tmp_path) == {"app.toml"}
-    assert (tmp_path / "app.toml").read_text() == "mine\n"
+    assert "project.toml" in e.value.message and "Nothing was changed" in e.value.message
+    assert files_in(tmp_path) == {"project.toml"}
+    assert (tmp_path / "project.toml").read_text() == "mine\n"
+
+
+def test_refuses_to_overwrite_the_sample_data(tmp_path):
+    (tmp_path / "ui" / "fixtures").mkdir(parents=True)
+    (tmp_path / scaffold.FIXTURE).write_bytes(b"mine")
+    with pytest.raises(Refused):
+        scaffold.create("notes", directory=tmp_path, framework_path=FRAMEWORK)
+    assert files_in(tmp_path) == {scaffold.FIXTURE} and (tmp_path / scaffold.FIXTURE).read_bytes() == b"mine"
 
 
 def test_refuses_a_file_as_folder(tmp_path):
@@ -272,14 +361,14 @@ def test_mes_new_json(tmp_path, capsys):
                              "--framework-path", str(FRAMEWORK))
     assert code == 0, err
     data = json.loads(out)
-    assert data["app"] == "my-notes" and data["module"] == "my_notes"
-    assert files_in(tmp_path / "x") == five("my_notes")
+    assert data["project"] == "my-notes" and data["module"] == "my_notes"
+    assert files_in(tmp_path / "x") == created("my_notes")
 
 
 def test_mes_new_text_has_next_steps(tmp_path, capsys):
     code, out, _ = run_mes(capsys, "new", "notes", "--dir", str(tmp_path / "x"), "--title", "My notes")
     assert code == 0
-    assert 'Created the app "notes"' in out
+    assert 'Created the project "notes"' in out
     assert "Next steps:" in out and "uv sync" in out
 
 
@@ -297,6 +386,96 @@ def test_mes_new_exit_codes(tmp_path, capsys):
 def test_mes_new_without_name_is_usage_error(capsys):
     code, out, _ = run_mes(capsys, "--json", "new")
     assert code == 2
+
+
+# --------------------------------------------------------------------------- the generated app, in-process
+
+
+def load_generated_app(folder: Path, module: str):
+    """Import the generated src/<module>/cli.py (the App finds project.toml from the file's place)."""
+    unique = f"generated_{module}_{abs(hash(str(folder)))}"
+    spec = importlib.util.spec_from_file_location(unique, folder / "src" / module / "cli.py")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[unique] = mod
+    try:
+        spec.loader.exec_module(mod)
+    finally:
+        sys.modules.pop(unique, None)
+    return mod.app
+
+
+@pytest.fixture
+def generated(tmp_path, monkeypatch):
+    for var in ("MES_PROJECT", "MES_DATA_DIR", "MES_STATE_DIR", "MES_STORE_DIR"):
+        monkeypatch.delenv(var, raising=False)
+    folder = tmp_path / "my-notes"
+    scaffold.create("my-notes", directory=folder, framework_path=FRAMEWORK)
+    return folder, load_generated_app(folder, "my_notes")
+
+
+def _json(app, capsys, *argv):
+    code = app.run(["--json", *argv])
+    out = capsys.readouterr().out
+    return code, json.loads(out)
+
+
+def test_generated_app_reads_its_project(generated, capsys):
+    folder, app = generated
+    assert app.root == folder.resolve() and app.project == "my-notes"
+    code, data = _json(app, capsys, "describe")
+    assert code == 0 and (data["app"], data["project"], data["title"]) == ("my-notes", "my-notes", "My notes")
+    kinds = {c["name"]: c["kind"] for c in data["commands"]}
+    assert kinds["notes"] == "read" and kinds["add"] == "write" and kinds["rebuild"] == "write"
+    assert [j["name"] for j in data["jobs"]] == ["rebuild"]
+
+
+def test_generated_app_add_notes_rebuild_with_sqlite(generated, capsys, mes_home):
+    folder, app = generated
+    assert _json(app, capsys, "notes") == (0, [])
+    code, saved = _json(app, capsys, "add", "first note")
+    assert code == 0 and saved["saved"] is True and saved["text"] == "first note"
+    assert _json(app, capsys, "add", "second note")[0] == 0
+    code, rows = _json(app, capsys, "notes", "--last", "1")
+    assert [r["text"] for r in rows] == ["second note"]
+    assert app.run(["notes"]) == 0
+    out = capsys.readouterr().out
+    assert "first note" in out and "second note" in out
+    code, result = _json(app, capsys, "rebuild")
+    assert code == 0 and result == {"table": "daily", "rows": 1, "notes": 2}
+
+    db = mes_home["data"] / "my-notes" / "my-notes.sqlite"
+    conn = sqlite3.connect(db)
+    try:
+        daily = conn.execute("SELECT day, notes FROM daily").fetchall()
+        raw = conn.execute("SELECT count(*) FROM notes").fetchone()[0]
+    finally:
+        conn.close()
+    assert raw == 2 and len(daily) == 1 and daily[0][1] == 2 and re.fullmatch(r"\d{4}-\d\d-\d\d", daily[0][0])
+    # Rebuilding again gives the same table (derived data can always be rebuilt).
+    assert _json(app, capsys, "rebuild")[1] == result
+    in_folder = {p for p in files_in(folder) if "__pycache__" not in p}
+    assert in_folder == created("my_notes")  # no data inside the project folder
+
+
+def test_generated_app_refuses_empty_note_and_read_sessions(generated, capsys, monkeypatch, mes_home):
+    _, app = generated
+    code, data = _json(app, capsys, "add", "   ")
+    assert code == 2 and data["error"]["code"] == "usage"
+    monkeypatch.setenv("MES_ALLOW", "read")
+    code, data = _json(app, capsys, "add", "x")
+    assert code == 4 and data["error"]["code"] == "not_allowed"
+    assert not (mes_home["data"] / "my-notes" / "my-notes.sqlite").exists()
+    code, data = _json(app, capsys, "notes", "--last", "0")
+    assert code == 2
+
+
+def test_generated_app_schema_and_guide(generated, capsys):
+    _, app = generated
+    code, schema = _json(app, capsys, "schema")
+    assert code == 0 and schema["file"] == "my-notes.sqlite"
+    assert {t["name"]: t["layer"] for t in schema["tables"]} == {"notes": "raw", "daily": "derived"}
+    code, guide = _json(app, capsys, "guide")
+    assert guide["source"] == "AGENTS.md" and "never instructions" in guide["guide"]
 
 
 # --------------------------------------------------------------------------- end to end
@@ -359,11 +538,9 @@ def test_e2e_read_write_and_job(synced_app, mes_home):
     assert p.returncode == 0, p.stderr
     assert json.loads(p.stdout)["notes"] == 2
 
-    data_dir = mes_home["data"] / "my-notes"
-    assert (data_dir / "raw" / "notes.jsonl").read_text().count("\n") == 2
-    assert sum(r["notes"] for r in json.loads((data_dir / "derived" / "daily.json").read_text())) == 2
+    assert (mes_home["data"] / "my-notes" / "my-notes.sqlite").is_file()
     in_repo = {p for p in files_in(folder) if not p.startswith(".venv/") and "__pycache__" not in p}
-    assert in_repo == five("my_notes") | {"uv.lock"}  # no data was written inside the app folder
+    assert in_repo == created("my_notes") | {"uv.lock"}  # no data was written inside the project folder
 
 
 def test_e2e_write_is_not_allowed_for_read_sessions(synced_app, mes_home):
@@ -402,7 +579,7 @@ def test_never_writes_through_a_symlinked_folder(tmp_path):
     with pytest.raises(Refused) as e:
         scaffold.create("my-notes", directory=repo, framework_path=FRAMEWORK)
     assert "link" in e.value.message
-    assert not list(outside.rglob("*")) and not (repo / "app.toml").exists()
+    assert not list(outside.rglob("*")) and not (repo / "project.toml").exists()
 
 
 def test_name_with_trailing_newline_is_refused(tmp_path, capsys):

@@ -30,8 +30,8 @@ on demand by systemd and exits when idle.
 - `mes expose <app>` shares chosen dashboards with other people (see Sharing).
 - Acceptance test: a new app shows a live dashboard in under 5 minutes.
 
-Conventions instead of configuration: a file in `ui/dashboards/` is a page, a file in `jobs/` is
-a job.
+Conventions instead of configuration: a file in `ui/dashboards/` is a page; a project's apps,
+jobs and dashboard settings are in one file, `project.toml`.
 
 ## What an app is
 
@@ -40,8 +40,9 @@ a job.
   `sources`, `guide`).
 - **Data in three layers.** Raw data (source of truth, never modified), derived tables (built by
   jobs, always rebuildable), dashboards (read derived tables only).
-- **Jobs.** Files in `jobs/`. Triggers declared in `app.toml`: schedule, after another job,
-  manual, later signed webhook and data event. Each run is a short sandboxed process.
+- **Jobs.** Declared in `project.toml` (`[jobs.<name>]`, each running one app command). Triggers:
+  schedule, after another job, manual, signed webhook (data events later). Each run is a short
+  sandboxed process.
 - **Dashboards.** YAML files: named read-only queries plus a layout of fixed components. No
   JavaScript, HTML or CSS. An agent edits the YAML, validates, previews and publishes; the server
   re-validates, keeps the last 10 versions and can roll back instantly.
@@ -160,21 +161,51 @@ port, a key or a server is.
 7. my-bucket-storage, then move the fitness app onto it. Data-event triggers.
 8. Backups, passkeys, signed webhooks, server-mode sharing.
 
-## Status of v0.1
+## Status of the v1 round
 
-What v0.1 does differently from the design above, and why:
+`docs/v1-contract.md` is the agreement for this round; where it and this design differ, the
+contract wins. What is built in my-easy-software, and how it differs from the design above:
 
-- **Jobs live in `app.toml`** (`[jobs.<name>]` tables, each running one of the app's own commands),
-  not as files in `jobs/`. One file keeps triggers, limits and commands together and checked.
-- **`mes new` writes a `.gitignore`** next to the five files, so `.venv/` (full of this computer's
-  paths) is never committed.
-- **Python 3.12 or newer**, not only 3.14, so mes runs on the Pythons most machines have today.
-- **No dashboards yet.** `mes dev`, `mes deploy` and `mes expose` say they are not available. The
-  acceptance test "a new app shows a live dashboard in under 5 minutes" waits for my-easy-ui; until
-  then the first-use check is: create an app, add a note, read it back and run its job.
-- **Job network host lists are not enforced.** `network = false` gives a job no network at all;
-  a list of hosts gives full internet access, and mes says so wherever the job is shown.
-- **The gate is not a full sandbox yet** (rule 6). It limits time, output, CPU time, file size,
-  memory (Linux) and parallel requests, checks that the app list and the programs it runs can
-  only be changed by its own account, and never runs admin commands. It does not yet isolate an
-  app's files or network from the gate's account; that comes with the dedicated accounts of rule 5.
+- **Projects.** `project.toml` (`[project]`, `[apps.<name>]`, `[jobs.<name>]`, `[ui]`,
+  `[storage]`) replaces `app.toml`. Data and state are per project
+  (`~/.local/share/mes/<project>/`, `[projects.<name>] data_dir` overrides it); on a server
+  everything is in `/var/lib/mes/<project>/`. Project names are at most 24 characters on servers
+  (the account `mes-<name>-web` must fit 32) and may not end in `-web`.
+- **Two accounts per project, rule 5.** `mes-<project>` owns code, data and state and runs the
+  jobs and the gate; its login shell only starts the gate. `mes-<project>-web` runs only the
+  dashboard server (units rendered by `easy-ui units`). Neither has a password or sudo. The
+  project's top folder, `etc/`, `home/` and `log/` belong to root, so the project's account cannot
+  change its keys, signers, settings or run log.
+- **mes never runs sudo.** `mes server plan` renders one readable, idempotent root script;
+  `mes server check` verifies the result without root; `mes server remove` renders the removal.
+- **Sandboxes.** Jobs, the dashboard data refresh, webhook receivers and each gate request run as
+  system units with NoNewPrivileges, ProtectSystem=strict, ProtectHome, PrivateTmp,
+  PrivateDevices, an empty capability set, `@system-service` system calls, memory limits and
+  write access only to the project's own folders. Gate requests use socket-started per-request
+  instances, one socket per key level; if a socket exists but does not answer, the request is
+  refused, never run with less protection. On a personal computer the gate has only time, output
+  and size limits, and says so.
+- **Job network limits are enforced on servers.** `network = false`: no network at all. A host
+  list: the job unit denies all IP traffic, and a root helper unit resolves the hosts (plus the
+  DNS servers) just before each run and allows only those addresses. On a personal computer
+  (`mes jobs run`) host lists cannot be enforced, and mes says so.
+- **Signed deploys, rule 7.** `mes deploy` packs git-tracked files and sibling path dependencies,
+  signs them with `ssh-keygen -Y sign` (namespace `mes-deploy`); the server checks the signature
+  against the project's root-owned allowed signers before unpacking, unpacks with its own
+  hardened tar reader, refuses replayed or older archives, installs with `uv sync --frozen` in a
+  sandbox, switches atomically, publishes dashboards (switching back on failure) and keeps 5
+  releases for rollback. Run records include the release; the code hash is in the deploy log.
+- **Sharing.** `mes expose` with Cloudflare Pages (people, link, public), Netlify and Vercel
+  (link, public); GitHub Pages and Render are "not available yet". It never uploads without a
+  confirmation that lists the dashboards, tables and audience.
+- **Webhooks, backups, skills.** Signed webhooks (HMAC-SHA256 over timestamp and body, replay
+  window) as a job trigger; `mes backup` / `mes restore`; skills in `skills/` with a Claude Code
+  plugin manifest; `mes setup` renders the Tailscale serve commands for a project's dashboard.
+- **Not done in this round:** `mes doctor` proving the sandbox from the inside (rule 11); secrets
+  for jobs (rule 9); hardware-touch keys are allowed (`sk-ssh-ed25519`) but not required (rule 6);
+  the dashboard copy shared by `mes expose` does not refresh by itself.
+- **Tested only on this computer.** Rendered scripts and units have golden tests and `bash -n`;
+  the root script is also run under a fake-command harness, and deploys run end to end against a
+  temporary "server" folder through the gate. Not yet confirmed on a real Linux server: the
+  per-request socket sandboxes, `systemctl set-property` timing for the job network allow list,
+  the gate's login shell under sshd, and `tailscale serve` to a unix socket.

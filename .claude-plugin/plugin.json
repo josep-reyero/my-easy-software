@@ -1,0 +1,8 @@
+{
+  "name": "my-easy-software",
+  "version": "0.1.0",
+  "description": "Skills for building, running, deploying and sharing small personal projects with my-easy-software (the mes command). Each skill is thin and delegates to 'mes guide <topic>', which always matches the installed version.",
+  "license": "MIT",
+  "keywords": ["personal-software", "cli", "dashboards", "self-hosting", "agents"],
+  "skills": "./skills/"
+}

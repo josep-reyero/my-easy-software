@@ -1,34 +1,37 @@
-"""The per-machine list of installed apps that ``mes gate`` may run.
+"""The per-machine list of projects that ``mes gate`` may run on a personal machine.
 
-The list lives next to the per-machine config file, in ``apps.toml``
-(default ``~/.config/mes/apps.toml``; it follows ``MES_CONFIG`` /
-``XDG_CONFIG_HOME``). It maps an app name to the absolute path of that app's
-command-line program::
+On a server, the gate finds its project in the server layout (``mes gate --server-root``) and
+needs no list. On a personal machine the list lives next to the per-machine config file, in
+``projects.toml`` (default ``~/.config/mes/projects.toml``; it follows ``MES_CONFIG`` /
+``XDG_CONFIG_HOME``). It maps a project name to the full path of the project's folder::
 
-    [apps]
-    myapp = "/opt/apps/myapp/.venv/bin/myapp"
+    [projects]
+    myproject = "/home/me/code/myproject"
 
-Only the owner changes it, with ``mes apps add|remove``. ``mes gate`` reads it
-on every request and never takes an app path from the caller.
+Only the owner changes it, with ``mes projects add|remove``. ``mes gate --project <name>`` reads it
+on every request and never takes a path from the caller. The apps the gate may run are the
+project's ``[apps]``; each one's program is ``<folder>/.venv/bin/<cli>``.
 
 Public API
 ----------
-``RESERVED_NAMES``                 names that can never be registered (``mes``).
+``RESERVED_NAMES``                 names that can never be an app (``mes``).
 ``registry_path() -> Path``        where the list is kept (may not exist yet).
-``load(path=None, *, public=False) -> dict[str, str]``  name -> program path. ``{}`` when the file
-    does not exist; ``ConfigError`` when it is broken; ``Refused`` when other
-    users could change it.
-``lookup(name) -> Path``           the program for one app (``NotFound`` when absent).
+``valid_name(name) -> bool``
+``load(path=None, *, public=False) -> dict[str, str]``  name -> project folder. ``{}`` when the
+    file does not exist; ``ConfigError`` when it is broken; ``Refused`` when other users could
+    change it.
+``lookup(name, *, public=False) -> Path``  the folder of one project (``NotFound`` when absent).
+``program_path(folder, cli) -> Path``  ``<folder>/.venv/bin/<cli>``.
 ``check_program(path, *, app=None) -> Path``  the path must be absolute, a regular
     file, executable, and pass ``trust_problem`` (as must the interpreter on its ``#!``
     line, with group-writable folders tolerated). ``app`` given: messages show no paths.
-``trust_problem(path, *, strict=True) -> str | None``  why another account could change
-    a file (owner, mode bits, and every folder above it), like OpenSSH StrictModes.
-``add(name, program, *, timeout=20.0) -> dict``  check the program really is that
-    app (it is asked ``--json describe``) and save it.
-``remove(name) -> dict``           take an app off the list (``NotFound`` when absent).
-``list_apps() -> list[dict]``      every registered app with whether its program is usable.
-``register(subparsers)``           adds ``mes apps add|remove|list``.
+``trust_problem(path, *, strict=True, public=False) -> str | None``  why another account could
+    change a file (owner, mode bits, and every folder above it), like OpenSSH StrictModes.
+``add(folder, *, timeout=20.0) -> dict``  check every app of the project really is that app (it
+    is asked ``--json describe``) and save the project.
+``remove(name) -> dict``           take a project off the list (``NotFound`` when absent).
+``list_projects() -> list[dict]``  every registered project with whether its apps are usable.
+``register(subparsers)``           adds ``mes projects add|remove|list``.
 """
 
 from __future__ import annotations
@@ -43,18 +46,19 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
+from mes import manifest as manifest_mod
 from mes import paths
 from mes.app import check_allowed
 from mes.errors import ConfigError, MesError, NotFound, Refused, UsageError
 from mes.manifest import APP_NAME_RE
 
-REGISTRY_FILE = "apps.toml"
-RESERVED_NAMES = ("mes",)
+REGISTRY_FILE = "projects.toml"
+RESERVED_NAMES = manifest_mod.RESERVED_APP_NAMES
 
 _HEADER = (
-    "# Apps that this computer may run for AI agents through 'mes gate'.\n"
-    "# Each line maps an app name to the full path of the app's command-line program.\n"
-    "# Change it with 'mes apps add <name> <program>' and 'mes apps remove <name>'.\n"
+    "# Projects whose apps this computer may run for AI agents through 'mes gate'.\n"
+    "# Each line maps a project name to the full path of the project's folder.\n"
+    "# Change it with 'mes projects add <folder>' and 'mes projects remove <name>'.\n"
 )
 
 
@@ -64,20 +68,6 @@ def registry_path() -> Path:
 
 def valid_name(name: Any) -> bool:
     return isinstance(name, str) and APP_NAME_RE.fullmatch(name) is not None
-
-
-def _check_name(name: str) -> None:
-    if not valid_name(name):
-        raise UsageError(
-            f"{name!r} is not a valid app name, so it cannot be added to the list of apps.",
-            hint="App names use 2 to 31 lowercase letters, digits and dashes, starting with a letter.",
-        )
-    if name in RESERVED_NAMES:
-        raise UsageError(
-            f'"{name}" is the name of mes itself, so it cannot be used for an app. Allowing it would let '
-            "agents reach mes's own commands through the gate.",
-            hint="Use the app's own name, as written in its app.toml.",
-        )
 
 
 @functools.lru_cache(maxsize=None)
@@ -162,21 +152,21 @@ def load(path: str | Path | None = None, *, public: bool = False) -> dict[str, s
         return {}
     except OSError as e:
         raise ConfigError(
-            f"The list of installed apps{where} could not be read, so no app can be run through the gate.",
+            f"The list of projects{where} could not be read, so nothing can be run through the gate.",
             hint="Check that the file belongs to this account and can be read.",
             detail=str(e),
         ) from None
     if not stat.S_ISREG(st.st_mode):
         raise ConfigError(
-            f"The list of installed apps{where} is not a normal file, so mes will not trust it.",
-            hint="Move it away and add the apps again with: mes apps add <name> <program>",
+            f"The list of projects{where} is not a normal file, so mes will not trust it.",
+            hint="Move it away and add the projects again with: mes projects add <folder>",
         )
     problem = trust_problem(p, public=public)
     if problem:
         raise Refused(
-            f"The list of installed apps{where} could be changed by someone else: {problem}. Someone "
+            f"The list of projects{where} could be changed by someone else: {problem}. Someone "
             "could then make the gate run a program of their choice, so mes refuses to use it.",
-            hint="Ask the owner to check it with: mes apps list" if public else
+            hint="Ask the owner to check it with: mes projects list" if public else
             f"Make the file and its folders private to this account (for example: chmod 600 {p} and "
             f"chmod go-w on its folders), then try again.",
             code="untrusted_file",
@@ -185,45 +175,44 @@ def load(path: str | Path | None = None, *, public: bool = False) -> dict[str, s
         data = tomllib.loads(p.read_text(encoding="utf-8"))
     except (tomllib.TOMLDecodeError, UnicodeDecodeError) as e:
         raise ConfigError(
-            f"The list of installed apps{where} is not valid TOML ({e}), so no app can be run through the gate.",
-            hint="Fix the line mentioned, or move the file away and add the apps again with: "
-            "mes apps add <name> <program>",
+            f"The list of projects{where} is not valid TOML ({e}), so nothing can be run through the gate.",
+            hint="Fix the line mentioned, or move the file away and add the projects again with: "
+            "mes projects add <folder>",
         ) from None
-    extra = sorted(set(data) - {"apps"})
+    extra = sorted(set(data) - {"projects"})
     if extra:
         raise ConfigError(
-            f"The list of installed apps{where} has an unexpected section {extra[0]!r}, so mes will not "
-            "trust it. Only an [apps] table is allowed.",
-            hint="Remove that section, or move the file away and add the apps again.",
+            f"The list of projects{where} has an unexpected section {extra[0]!r}, so mes will not "
+            "trust it. Only a [projects] table is allowed.",
+            hint="Remove that section, or move the file away and add the projects again.",
         )
-    apps = data.get("apps", {})
-    if not isinstance(apps, dict):
+    projects = data.get("projects", {})
+    if not isinstance(projects, dict):
         raise ConfigError(
-            f"In the list of installed apps{where}, 'apps' must be a table of name = \"program path\".",
-            hint="Move the file away and add the apps again with: mes apps add <name> <program>",
+            f"In the list of projects{where}, 'projects' must be a table of name = \"folder\".",
+            hint="Move the file away and add the projects again with: mes projects add <folder>",
         )
     out: dict[str, str] = {}
-    for name, program in apps.items():
-        if not valid_name(name) or name in RESERVED_NAMES or not isinstance(program, str) \
-                or not os.path.isabs(program):
+    for name, folder in projects.items():
+        if not valid_name(name) or not isinstance(folder, str) or not os.path.isabs(folder):
             raise ConfigError(
-                f"In the list of installed apps{where}, the entry {name!r} is not a valid app name with the "
-                "full path of its program, so mes will not trust the list.",
-                hint=f"Remove that entry with: mes apps remove {name}" if valid_name(name)
+                f"In the list of projects{where}, the entry {str(name)[:40]!r} is not a valid project name with "
+                "the full path of its folder, so mes will not trust the list.",
+                hint=f"Remove that entry with: mes projects remove {name}" if valid_name(name)
                 else "Remove that line from the file.",
             )
-        out[name] = program
+        out[name] = folder
     return out
 
 
-def _save(apps: dict[str, str], path: Path | None = None) -> Path:
+def _save(projects: dict[str, str], path: Path | None = None) -> Path:
     p = path or registry_path()
     p.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    lines = [_HEADER, "[apps]\n"]
-    for name in sorted(apps):
+    lines = [_HEADER, "[projects]\n"]
+    for name in sorted(projects):
         # A JSON string without control characters is also a valid TOML basic string.
-        lines.append(f"{name} = {json.dumps(apps[name], ensure_ascii=False)}\n")
-    fd, tmp = tempfile.mkstemp(prefix=".apps-", suffix=".toml", dir=p.parent)
+        lines.append(f"{name} = {json.dumps(projects[name], ensure_ascii=False)}\n")
+    fd, tmp = tempfile.mkstemp(prefix=".projects-", suffix=".toml", dir=p.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write("".join(lines))
@@ -236,6 +225,10 @@ def _save(apps: dict[str, str], path: Path | None = None) -> Path:
             pass
         raise
     return p
+
+
+def program_path(folder: str | Path, cli: str) -> Path:
+    return Path(folder) / ".venv" / "bin" / cli
 
 
 def check_program(program: str | Path, *, app: str | None = None) -> Path:
@@ -254,19 +247,19 @@ def check_program(program: str | Path, *, app: str | None = None) -> Path:
             "The program path contains invisible control characters, so mes will not use it.",
             hint="Give the plain full path of the app's program.",
         )
-    owner_hint = "Ask the owner of this computer to check the app (mes apps list)."
+    owner_hint = "Ask the owner of this computer to check the app (mes projects list)."
     try:
         st = p.stat()
     except OSError:
         raise MesError(
             f"{shown} does not exist on this computer, so it cannot be run.",
-            hint=owner_hint if app else "Reinstall the app, then register it again with: mes apps add <name> <program>",
+            hint=owner_hint if app else "Reinstall the app (uv sync in the project folder), then register it again with: mes projects add <folder>",
             code="app_unavailable",
         ) from None
     if not stat.S_ISREG(st.st_mode) or not os.access(p, os.X_OK):
         raise MesError(
             f"{shown} is not a program that can be run, so the app cannot be started.",
-            hint=owner_hint if app else "Point to the app's command-line program (usually in the app's .venv/bin folder).",
+            hint=owner_hint if app else "Run uv sync in the project folder so the app's program is installed in .venv/bin.",
             code="app_unavailable",
         )
     problem = trust_problem(p, public=app is not None)
@@ -287,96 +280,116 @@ def check_program(program: str | Path, *, app: str | None = None) -> Path:
 
 
 def lookup(name: str, *, public: bool = False) -> Path:
-    apps = load(public=public)
-    if name not in apps:
+    projects = load(public=public)
+    if name not in projects:
         raise NotFound(
-            f'There is no app called "{name}" on this computer, so nothing was run.',
-            hint="Ask the owner which apps are installed (they can list them with: mes apps list).",
+            f'There is no project called "{name}" on this computer, so nothing was run.',
+            hint="Ask the owner which projects are set up (they can list them with: mes projects list).",
         )
-    return Path(apps[name])
+    return Path(projects[name])
 
 
-def add(name: str, program: str | Path, *, timeout: float = 20.0) -> dict[str, Any]:
+def check_project_file(folder: Path, *, public: bool) -> Path:
+    """The project's ``project.toml`` must exist and be changeable only by this account."""
+    p = folder / manifest_mod.MANIFEST_FILE
+    if not p.is_file():
+        raise MesError("The project's settings file is missing, so the gate cannot tell which apps it has.",
+                       hint="Ask the owner to check the project (mes projects list).", code="app_unavailable")
+    problem = trust_problem(p, public=public)
+    if problem:
+        raise Refused(
+            f"The project's settings file could be changed by someone else: {problem}. Someone could then change "
+            "which programs the gate runs, so mes refuses.",
+            hint="Ask the owner to make the project folder private to their account.",
+            code="untrusted_file",
+        )
+    return p
+
+
+def add(folder: str | Path, *, timeout: float = 20.0) -> dict[str, Any]:
     from mes.gate import ask_commands  # the gate's own safe way of asking an app what it is
 
-    _check_name(name)
-    p = Path(os.path.abspath(Path(program).expanduser()))
-    check_program(p)
-    try:
-        commands = ask_commands(p, name, timeout=timeout)
-    except Refused as e:
-        if e.code != "wrong_app":
-            raise
-        actual = getattr(e, "actual_app", None)
-        if isinstance(actual, str) and valid_name(actual):
+    root = Path(os.path.abspath(Path(folder).expanduser()))
+    project = manifest_mod.load(root)
+    check_project_file(root, public=False)
+    found: dict[str, dict[str, list[str]]] = {}
+    for spec in project.apps.values():
+        program = program_path(root, spec.cli)
+        check_program(program)
+        try:
+            commands = ask_commands(program, spec.name, timeout=timeout)
+        except Refused as e:
+            if e.code != "wrong_app":
+                raise
             raise Refused(
-                f'This program is the app "{actual}", not "{name}". Nothing was added.',
-                hint=f"Register it under its own name: mes apps add {actual} {p}",
+                f'The program {spec.cli} does not say it is the app "{spec.name}", so the project was not added. '
+                "Nothing changed.",
+                hint=f'Check App("...") in the app\'s code: it must be App("{spec.name}").',
                 code="wrong_app",
             ) from None
-        raise Refused(f'This program does not say it is the app "{name}", so it was not added. Nothing changed.',
-                      hint="Check that you picked the program of the right app.", code="wrong_app") from None
-    except MesError as e:
-        if e.code != "app_unavailable":
-            raise
-        raise MesError(
-            f'{p} is not an app made with mes (it did not answer "describe" the way mes apps do), so it '
-            "was not added. Nothing changed.",
-            hint="Point to the app's own program, usually in the app's .venv/bin folder (run 'uv sync' "
-            "in the app's folder first).",
-            code="not_an_app",
-        ) from None
-    apps = load()
-    status = "updated" if name in apps else "added"
-    apps[name] = str(p)
-    where = _save(apps)
-    kinds = {k: sorted(c for c, v in commands.items() if v == k) for k in ("read", "write", "admin")}
+        except MesError as e:
+            if e.code != "app_unavailable":
+                raise
+            raise MesError(
+                f'{program} is not an app made with mes (it did not answer "describe" the way mes apps do), so '
+                "the project was not added. Nothing changed.",
+                hint="Run 'uv sync' in the project's folder first, so its programs are installed.",
+                code="not_an_app",
+            ) from None
+        found[spec.name] = {k: sorted(c for c, v in commands.items() if v == k) for k in ("read", "write", "admin")}
+    projects = load()
+    status = "updated" if project.name in projects else "added"
+    projects[project.name] = str(root)
+    where = _save(projects)
     return {
-        "app": name,
-        "program": str(p),
+        "project": project.name,
+        "folder": str(root),
         "status": status,
         "registry": str(where),
-        "commands": kinds,
-        "message": f'"{name}" can now be reached through the gate. Agents with a read key can run its '
-        "read commands, agents with a write key also its write commands, and admin commands stay "
-        "with you. How agents connect and how keys are set up: mes guide gate",
+        "apps": found,
+        "message": f'The apps of "{project.name}" can now be reached through the gate (mes gate --project '
+        f"{project.name}). Agents with a read key can run their read commands, agents with a write key also "
+        "their write commands, and admin commands stay with you. How agents connect: mes guide gate",
     }
 
 
 def remove(name: str) -> dict[str, Any]:
-    apps = load()
-    if name not in apps:
+    projects = load()
+    if name not in projects:
         raise NotFound(
-            f'There is no app called "{name}" in the list of installed apps, so nothing was removed.',
-            hint="See the list with: mes apps list",
+            f'There is no project called "{name}" in the list, so nothing was removed.',
+            hint="See the list with: mes projects list",
         )
-    del apps[name]
-    _save(apps)
+    del projects[name]
+    _save(projects)
     return {
-        "app": name,
+        "project": name,
         "status": "removed",
         "message": f'"{name}" can no longer be reached through the gate. Its data was not touched.',
     }
 
 
-def list_apps() -> list[dict[str, Any]]:
+def list_projects() -> list[dict[str, Any]]:
     out = []
-    for name, program in sorted(load().items()):
+    for name, folder in sorted(load().items()):
+        usable, problem = True, None
         try:
-            check_program(program)
-            usable, problem = True, None
+            project = manifest_mod.load(folder)
+            check_project_file(Path(folder), public=False)
+            for spec in project.apps.values():
+                check_program(program_path(folder, spec.cli))
         except MesError as e:
             usable, problem = False, e.message
-        out.append({"app": name, "program": program, "usable": usable, "problem": problem})
+        out.append({"project": name, "folder": folder, "usable": usable, "problem": problem})
     return out
 
 
-# --------------------------------------------------------------------------- mes apps
+# --------------------------------------------------------------------------- mes projects
 
 
 def _handle_add(args: argparse.Namespace) -> Any:
     check_allowed("admin")  # it changes which programs the gate may run
-    return add(args.name, args.program)
+    return add(args.folder)
 
 
 def _handle_remove(args: argparse.Namespace) -> Any:
@@ -386,32 +399,32 @@ def _handle_remove(args: argparse.Namespace) -> Any:
 
 def _handle_list(args: argparse.Namespace) -> Any:
     check_allowed("read")
-    items = list_apps()
+    items = list_projects()
     if args.json:
-        return {"registry": str(registry_path()), "apps": items}
+        return {"registry": str(registry_path()), "projects": items}
     if not items:
-        return ("No apps are registered yet, so the gate cannot run anything. "
-                "Add one with: mes apps add <name> <program>")
+        return ("No projects are registered yet, so the gate cannot run anything on this computer. "
+                "Add one with: mes projects add <folder>")
     return items
 
 
 def register(subparsers: Any) -> None:
-    if "apps" in getattr(subparsers, "choices", {}):
+    if "projects" in getattr(subparsers, "choices", {}):
         return  # already added (mes.gate adds it too)
     p = subparsers.add_parser(
-        "apps",
-        help="The apps the gate may run on this computer (add, remove, list).",
-        description="Manage the list of installed apps that AI agents can reach through 'mes gate'.",
+        "projects",
+        help="The projects whose apps the gate may run on this computer (add, remove, list).",
+        description="Manage the list of projects that AI agents can reach through 'mes gate' on a personal "
+        "machine. (On a server, the gate finds the project in /var/lib/mes and needs no list.)",
     )
-    sub = p.add_subparsers(dest="apps_command", metavar="<add|remove|list>")
-    a = sub.add_parser("add", help="Let the gate run an installed app.",
-                       description="Register an installed app. mes first asks the program to describe "
+    sub = p.add_subparsers(dest="projects_command", metavar="<add|remove|list>")
+    a = sub.add_parser("add", help="Let the gate run a project's apps.",
+                       description="Register a project. mes first asks each app's program to describe "
                        "itself, to make sure it really is that app.")
-    a.add_argument("name", help="the app's name, as in its app.toml")
-    a.add_argument("program", help="full path of the app's command-line program")
+    a.add_argument("folder", help="the project's folder (the one holding project.toml)")
     a.set_defaults(func=_handle_add)
-    r = sub.add_parser("remove", help="Stop the gate from running an app (its data is kept).")
-    r.add_argument("name", help="the app's name")
+    r = sub.add_parser("remove", help="Stop the gate from running a project's apps (its data is kept).")
+    r.add_argument("name", help="the project's name")
     r.set_defaults(func=_handle_remove)
-    ls = sub.add_parser("list", help="Show the registered apps.")
+    ls = sub.add_parser("list", help="Show the registered projects.")
     ls.set_defaults(func=_handle_list)

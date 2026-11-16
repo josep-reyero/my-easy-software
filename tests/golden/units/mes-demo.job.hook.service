@@ -1,0 +1,62 @@
+# Made by my-easy-software (mes). Do not edit: run 'mes server plan' again and the script it writes instead.
+# mes-project: demo
+# mes-unit: job
+# mes-job: hook
+# network: none
+
+[Unit]
+Description=mes job hook of project demo
+
+[Service]
+Type=oneshot
+User=mes-demo
+Group=mes-demo
+ExecStart="/var/lib/mes/demo/code/current/project/.venv/bin/demo" "--json" "sync" "--quick"
+ExecStopPost=+"/usr/local/bin/mes" "jobs" "record" "--project" "demo" "--server-root" "/var/lib/mes" "hook"
+WorkingDirectory=/var/lib/mes/demo/code/current/project
+Environment="MES_PROJECT=demo"
+Environment="MES_DATA_DIR=/var/lib/mes/demo/data"
+Environment="MES_STATE_DIR=/var/lib/mes/demo/state"
+Environment="MES_STORE_DIR=/var/lib/mes/demo/store"
+Environment="HOME=/var/lib/mes/demo/state"
+Environment="LANG=C.UTF-8"
+Environment="PYTHONDONTWRITEBYTECODE=1"
+Environment="MES_ALLOW=write"
+Environment="MES_JOB=hook"
+Slice=mes.slice
+MemoryMax=256M
+MemorySwapMax=0
+TimeoutStartSec=900
+UMask=0077
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+DevicePolicy=closed
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+KeyringMode=private
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
+LimitCORE=0
+TasksMax=256
+ReadWritePaths=/var/lib/mes/demo/state
+InaccessiblePaths=-/var/lib/mes/demo/etc/webhook.key
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any

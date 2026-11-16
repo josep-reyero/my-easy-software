@@ -185,21 +185,73 @@ def test_guide_generated_and_from_agents_md(app, tmp_path, capsys):
 
 
 def test_manifest_gives_title_version_and_jobs(tmp_path, capsys):
-    (tmp_path / "app.toml").write_text(
-        '[app]\nname = "myapp"\ntitle = "My App"\nversion = "1.2.3"\n'
-        '[jobs.sync]\nrun = "summary --days 1"\nschedule = "daily"\n'
+    (tmp_path / "project.toml").write_text(
+        '[project]\nname = "myapp"\ntitle = "My App"\nversion = "1.2.3"\n'
+        '[jobs.sync]\nrun = "myapp summary --days 1"\nschedule = "daily"\n'
     )
     app = make_app(tmp_path)
     code, data = run_json(app, capsys, "--json", "describe")
-    assert data["title"] == "My App" and data["version"] == "1.2.3"
-    assert data["jobs"][0]["name"] == "sync" and data["jobs"][0]["argv"] == ["summary", "--days", "1"]
+    assert data["title"] == "My App" and data["version"] == "1.2.3" and data["project"] == "myapp"
+    job = data["jobs"][0]
+    assert job["name"] == "sync" and job["app"] == "myapp" and job["argv"] == ["summary", "--days", "1"]
+    assert app.run(["describe"]) == 0
+    assert 'runs "myapp summary --days 1"' in capsys.readouterr().out
 
 
-def test_manifest_name_mismatch_is_an_error(tmp_path, capsys):
-    (tmp_path / "app.toml").write_text('[app]\nname = "other"\n')
+def test_app_not_in_project_is_an_error(tmp_path, capsys):
+    (tmp_path / "project.toml").write_text('[project]\nname = "other"\n')
     app = make_app(tmp_path)
     code, data = run_json(app, capsys, "--json", "describe")
     assert code == 1 and data["error"]["code"] == "manifest_invalid"
+    assert "myapp" in data["error"]["message"]
+
+
+def test_one_of_several_apps_sees_only_its_jobs(tmp_path, capsys, mes_home):
+    (tmp_path / "project.toml").write_text(
+        '[project]\nname = "fitness"\n[apps.myapp]\n[apps.other]\n'
+        '[jobs.mine]\nrun = "myapp summary"\nmanual = true\n'
+        '[jobs.theirs]\nrun = "other sync"\nmanual = true\n'
+    )
+    app = make_app(tmp_path)
+    code, data = run_json(app, capsys, "--json", "describe")
+    assert code == 0 and data["app"] == "myapp" and data["project"] == "fitness"
+    assert [j["name"] for j in data["jobs"]] == ["mine"]
+    # Data belongs to the project, not to the app.
+    code, data = run_json(app, capsys, "--json", "add-note", "hi")
+    assert code == 0 and data["saved"] == str(mes_home["data"] / "fitness" / "notes.txt")
+
+
+def test_mes_project_mismatch_is_refused(tmp_path, capsys, monkeypatch):
+    (tmp_path / "project.toml").write_text('[project]\nname = "myapp"\n')
+    monkeypatch.setenv("MES_PROJECT", "someone-else")
+    app = make_app(tmp_path)
+    code, data = run_json(app, capsys, "--json", "describe")
+    assert code != 0 and data["error"]["code"] == "wrong_project"
+
+
+def test_session_dirs_only_for_own_project(tmp_path, capsys, monkeypatch, mes_home):
+    (tmp_path / "project.toml").write_text('[project]\nname = "myapp"\n')
+    own = tmp_path / "own-data"
+    own.mkdir()
+    monkeypatch.setenv("MES_PROJECT", "myapp")
+    monkeypatch.setenv("MES_DATA_DIR", str(own))
+    app = make_app(tmp_path)
+    code, data = run_json(app, capsys, "--json", "add-note", "x")
+    assert code == 0 and data["saved"] == str(own / "notes.txt")
+
+
+def test_data_dir_override_from_machine_config(tmp_path, capsys, mes_home, monkeypatch):
+    from mes import paths
+    monkeypatch.delenv("MES_PROJECT", raising=False)
+    monkeypatch.delenv("MES_DATA_DIR", raising=False)
+    elsewhere = tmp_path / "big-disk" / "myapp"
+    mes_home["config"].parent.mkdir(parents=True)
+    mes_home["config"].write_text(f'[projects.myapp]\ndata_dir = "{elsewhere}"\n')
+    assert paths.project_data_dir("myapp") == elsewhere
+    assert paths.project_store_dir("myapp") == elsewhere / "store"
+    app = make_app(tmp_path)
+    code, data = run_json(app, capsys, "--json", "add-note", "x")
+    assert code == 0 and data["saved"] == str(elsewhere / "notes.txt")
 
 
 def test_root_discovered_from_caller_file():
@@ -237,7 +289,7 @@ def test_bare_decorator_uses_function_name(tmp_path, capsys):
 
 def test_context_config(tmp_path, capsys, mes_home):
     mes_home["config"].parent.mkdir(parents=True)
-    mes_home["config"].write_text('[apps.myapp]\nunits = "metric"\n')
+    mes_home["config"].write_text('[projects.myapp]\nunits = "metric"\n')
     app = App("myapp", root=tmp_path)
 
     @app.command("units")
@@ -248,7 +300,7 @@ def test_context_config(tmp_path, capsys, mes_home):
 
 
 def test_broken_manifest_only_blocks_commands_that_need_it(tmp_path, capsys):
-    (tmp_path / "app.toml").write_text('[app]\nname = "myapp"\ncolour = "red"\n')
+    (tmp_path / "project.toml").write_text('[project]\nname = "myapp"\ncolour = "red"\n')
     app = make_app(tmp_path)
     assert run_json(app, capsys, "--json", "summary") == (0, {"days": 7, "json": True})
     code, data = run_json(app, capsys, "--json", "describe")

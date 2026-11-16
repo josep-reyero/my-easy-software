@@ -1,45 +1,51 @@
-"""Per-machine folders and the per-machine config file.
+"""Per-machine folders, the per-machine config file, and the server layout.
 
-App data never lives inside the app's repository. Each machine keeps it here:
+Project data never lives inside the project's repository.
 
-- data:   ``$MES_DATA_HOME/<app>/``  (default ``$XDG_DATA_HOME/mes`` or ``~/.local/share/mes``)
-- state:  ``$MES_STATE_HOME/<app>/`` (default ``$XDG_STATE_HOME/mes`` or ``~/.local/state/mes``)
-- config: ``$MES_CONFIG``            (default ``$XDG_CONFIG_HOME/mes/config.toml`` or
+On a personal machine (no accounts involved):
+
+- data:   ``$MES_DATA_HOME/<project>/``  (default ``$XDG_DATA_HOME/mes`` or ``~/.local/share/mes``)
+- state:  ``$MES_STATE_HOME/<project>/`` (default ``$XDG_STATE_HOME/mes`` or ``~/.local/state/mes``)
+- config: ``$MES_CONFIG``                (default ``$XDG_CONFIG_HOME/mes/config.toml`` or
   ``~/.config/mes/config.toml``)
 
-``MES_DATA_HOME`` / ``MES_STATE_HOME`` replace the ``mes`` base folder (the app
-name is still appended). ``MES_CONFIG`` is the path of the config file itself.
+A project may keep its data elsewhere on one machine with ``[projects.<name>] data_dir = "..."``
+in the config file (``state_dir`` works the same way). my-easy-ui honours the same setting.
+
+On a server, everything for a project is under ``/var/lib/mes/<project>/`` (see
+``ServerLayout``). The system units and the gate tell the project's programs where their folders
+are with ``MES_PROJECT``, ``MES_DATA_DIR`` and ``MES_STATE_DIR``; those win over everything
+else, and only for the project named in ``MES_PROJECT``.
 
 Public API
 ----------
-``data_home() -> Path``, ``state_home() -> Path``
-    Base folders (not created).
-``config_path() -> Path``
-    The config file path (may not exist).
-``app_data_dir(app, create=False) -> Path``, ``app_state_dir(app, create=False) -> Path``
-    ``<base>/<app>``; the app name is validated so it cannot escape the base.
+``data_home() -> Path``, ``state_home() -> Path``, ``config_path() -> Path``
+``check_name(project) -> str``  raises ``UsageError`` for a name that is not a project name.
+``project_data_dir(project, create=False) -> Path``, ``project_state_dir(project, create=False) -> Path``,
+``project_store_dir(project, create=False) -> Path`` (the my-bucket-storage store)
     ``create=True`` makes the folder (mode 0700).
-``load_config(path=None) -> dict``
-    The parsed config file, ``{}`` when it does not exist. Raises ``ConfigError``
-    when it is not valid TOML.
-``app_config(app) -> dict``
-    The ``[apps.<app>]`` table of the config file, ``{}`` when absent.
-``project_root(start=None) -> Path | None``
-    Nearest folder at or above ``start`` (default: current directory) holding
-    ``app.toml`` or ``pyproject.toml``.
+``load_config(path=None) -> dict``  ``{}`` when missing; ``ConfigError`` when not valid TOML.
+``project_config(project) -> dict``  the ``[projects.<project>]`` table, ``{}`` when absent.
+``project_root(start=None) -> Path | None``  nearest folder holding ``project.toml`` or
+    ``pyproject.toml``.
 ``is_inside(path, folder) -> bool``
-    True when ``path`` is ``folder`` or inside it (after resolving).
+``SERVER_ROOT`` (``/var/lib/mes``), ``RELEASE_PROJECT_DIR``, ``ServerLayout``,
+``server_layout(project, root=SERVER_ROOT)``.
 """
 
 from __future__ import annotations
 
 import os
 import tomllib
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from mes.errors import ConfigError, UsageError
-from mes.manifest import APP_NAME_RE, MANIFEST_FILE
+from mes.manifest import MANIFEST_FILE, PROJECT_NAME_RE
+
+SERVER_ROOT = Path("/var/lib/mes")
+RELEASE_PROJECT_DIR = "project"  # inside each release: the project's own files
 
 
 def _env_path(name: str) -> Path | None:
@@ -63,24 +69,74 @@ def config_path() -> Path:
     return _env_path("MES_CONFIG") or _xdg("XDG_CONFIG_HOME", ".config") / "mes" / "config.toml"
 
 
-def _app_dir(base: Path, app: str, create: bool) -> Path:
-    if not isinstance(app, str) or not APP_NAME_RE.match(app):
+def check_name(project: Any) -> str:
+    if not isinstance(project, str) or not PROJECT_NAME_RE.match(project):
         raise UsageError(
-            f"{app!r} is not a valid app name, so mes will not use it as a folder name.",
-            hint="App names use 2 to 31 lowercase letters, digits and dashes, starting with a letter.",
+            f"{str(project)[:40]!r} is not a valid project name, so mes will not use it as a folder name.",
+            hint="Project names use 2 to 31 lowercase letters, digits and dashes, starting with a letter.",
         )
-    d = base / app
+    return project
+
+
+def _session_dir(project: str, env_name: str) -> Path | None:
+    """The folder the system unit or the gate gave this session, for its own project only."""
+    session_project = os.environ.get("MES_PROJECT")
+    if session_project is None:
+        return None
+    if session_project != project:
+        raise UsageError(
+            f'This session belongs to the project "{session_project[:40]}", so it cannot use the folders of '
+            f'"{project}". Projects cannot read each other.',
+            hint="Run the command in the project's own session or account.",
+            code="wrong_project",
+        )
+    return _env_path(env_name)
+
+
+def _configured_dir(project: str, key: str) -> Path | None:
+    value = project_config(project).get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip() or any(ord(c) < 32 for c in value):
+        raise ConfigError(
+            f"In the settings file for this computer, [projects.{project}] {key} must be the full path of a folder.",
+            hint=f'Write for example {key} = "/srv/archive/{project}", or remove the line.',
+        )
+    p = Path(value).expanduser()
+    if not p.is_absolute():
+        raise ConfigError(
+            f"In the settings file for this computer, [projects.{project}] {key} = {value!r} is not a full path, "
+            "so mes cannot be sure which folder is meant.",
+            hint=f'Write the full path, for example {key} = "/srv/archive/{project}".',
+        )
+    return p
+
+
+def _project_dir(project: str, key: str, env_name: str, base: Path, create: bool) -> Path:
+    check_name(project)
+    d = _session_dir(project, env_name) or _configured_dir(project, key) or base / project
     if create:
         d.mkdir(mode=0o700, parents=True, exist_ok=True)
     return d
 
 
-def app_data_dir(app: str, create: bool = False) -> Path:
-    return _app_dir(data_home(), app, create)
+def project_data_dir(project: str, create: bool = False) -> Path:
+    return _project_dir(project, "data_dir", "MES_DATA_DIR", data_home(), create)
 
 
-def app_state_dir(app: str, create: bool = False) -> Path:
-    return _app_dir(state_home(), app, create)
+def project_state_dir(project: str, create: bool = False) -> Path:
+    return _project_dir(project, "state_dir", "MES_STATE_DIR", state_home(), create)
+
+
+def project_store_dir(project: str, create: bool = False) -> Path:
+    """The project's my-bucket-storage store: ``MES_STORE_DIR`` in a server session, else
+    ``[projects.<name>] store_dir``, else ``<data folder>/store``."""
+    check_name(project)
+    d = _session_dir(project, "MES_STORE_DIR") or _configured_dir(project, "store_dir") \
+        or project_data_dir(project) / "store"
+    if create:
+        d.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return d
 
 
 def load_config(path: str | Path | None = None) -> dict[str, Any]:
@@ -101,9 +157,9 @@ def load_config(path: str | Path | None = None) -> dict[str, Any]:
         ) from None
 
 
-def app_config(app: str) -> dict[str, Any]:
-    apps = load_config().get("apps", {})
-    section = apps.get(app, {}) if isinstance(apps, dict) else {}
+def project_config(project: str) -> dict[str, Any]:
+    projects = load_config().get("projects", {})
+    section = projects.get(project, {}) if isinstance(projects, dict) else {}
     return section if isinstance(section, dict) else {}
 
 
@@ -120,3 +176,64 @@ def project_root(start: str | Path | None = None) -> Path | None:
 def is_inside(path: str | Path, folder: str | Path) -> bool:
     p, f = Path(path).resolve(), Path(folder).resolve()
     return p == f or f in p.parents
+
+
+# --------------------------------------------------------------------------- server layout
+
+
+@dataclass(frozen=True)
+class ServerLayout:
+    """Where everything of one project lives on a server.
+
+    ``base`` (``/var/lib/mes/<project>``) belongs to root and can only be entered, not listed.
+    ``code``, ``data``, ``state`` and ``store`` belong to ``mes-<project>`` and nobody else can
+    open them. ``ui`` belongs to ``mes-<project>`` and is readable by ``mes-<project>-web``;
+    ``web`` (``ui/auth``) belongs to ``mes-<project>-web`` (the dashboard sign-in state). ``etc``,
+    ``home`` and ``log`` belong to root: ``etc`` holds the signer list, the gate's login shell and
+    the paths of the tools; ``home/.ssh/authorized_keys`` the keys that may connect; ``log`` the
+    tamper-evident run log that only root writes.
+    """
+
+    project: str
+    root: Path
+
+    @property
+    def base(self) -> Path:
+        return self.root / self.project
+
+    code = property(lambda self: self.base / "code")
+    releases = property(lambda self: self.code / "releases")
+    current = property(lambda self: self.code / "current")
+    incoming = property(lambda self: self.code / "incoming")
+    data = property(lambda self: self.base / "data")
+    state = property(lambda self: self.base / "state")
+    ui = property(lambda self: self.base / "ui")
+    web = property(lambda self: self.base / "ui" / "auth")  # the dashboard sign-in, only for mes-<p>-web
+    store = property(lambda self: self.base / "store")
+    etc = property(lambda self: self.base / "etc")
+    home = property(lambda self: self.base / "home")
+    log = property(lambda self: self.base / "log")
+    ssh_dir = property(lambda self: self.home / ".ssh")
+    authorized_keys = property(lambda self: self.ssh_dir / "authorized_keys")
+    allowed_signers = property(lambda self: self.etc / "allowed_signers")
+    server_toml = property(lambda self: self.etc / "server.toml")
+    gate_shell = property(lambda self: self.etc / "gate-shell")
+    webhook_key = property(lambda self: self.etc / "webhook.key")
+    run_log = property(lambda self: self.log / "runs.jsonl")
+    triggers = property(lambda self: self.state / "triggers")
+
+    @property
+    def current_project(self) -> Path:
+        return self.current / RELEASE_PROJECT_DIR
+
+    @property
+    def account(self) -> str:
+        return f"mes-{self.project}"
+
+    @property
+    def web_account(self) -> str:
+        return f"mes-{self.project}-web"
+
+
+def server_layout(project: str, root: str | Path = SERVER_ROOT) -> ServerLayout:
+    return ServerLayout(check_name(project), Path(root))
