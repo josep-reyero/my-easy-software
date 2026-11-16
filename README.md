@@ -84,7 +84,7 @@ Pieces:
 - **[my-easy-ui](https://github.com/josep-reyero/my-easy-ui)**: the dashboard server and renderer. Dashboards are plain description files with
   no code in them.
 - **[my-bucket-storage](https://github.com/josep-reyero/my-bucket-storage)**: space-efficient storage with an SDK.
-- **[fitdata-garmin](https://github.com/josep-reyero/fitdata-garmin)**: the first app, a personal
+- **[fitdata](https://github.com/josep-reyero/fitdata)**: the first app, a personal
   archive of Garmin fitness data.
 
 ## Principles
