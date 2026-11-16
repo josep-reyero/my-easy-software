@@ -16,8 +16,8 @@ the `--json` error shape, the published-copies-only dashboard server.
 | project name | `^[a-z][a-z0-9-]{1,30}\Z`, not `mes`, not a name `NOT_APP_PROGRAMS` matches | `fitdata` |
 | package name (in `[project] apps`) | `^[a-z][a-z0-9_]{1,40}\Z`, a top-level Python package | `fitdata_garmin` |
 | app name (`[app] name`) | `^[a-z][a-z0-9-]{1,30}\Z`, not `mes`, not the project name, not a `NOT_APP_PROGRAMS` name | `fitdata-garmin` |
-| short name | derived, see below; must be unique and not `describe`, `guide`, `apps`, `help` | `garmin` |
-| table prefix | short name with `-` replaced by `_`, then `_` | `garmin_` |
+| short name | derived, see below; must be unique and not `describe`, `guide`, `apps`, `help`, `sqlite`, `mes` | `garmin` |
+| table prefix | short name with `-` replaced by `_`, then `_`; may not start with `sqlite_` or `mes_` | `garmin_` |
 | job name (in `app.toml`) | `^[a-z][a-z0-9-]{0,30}\Z` (today's `JOB_NAME_RE`) | `daily` |
 | job id | `<app name>.<job name>` | `fitdata-garmin.daily` |
 | shared table / view name | `^[a-z][a-z0-9_]{0,40}\Z`, no `__`, not starting with `sqlite_` or `mes_`, not starting with any installed app's table prefix | `activities` |
@@ -30,7 +30,9 @@ the `--json` error shape, the published-copies-only dashboard server.
 (`fitdata-garmin` in `fitdata` -> `garmin`); otherwise it is the whole app name (`strava-sync` in
 `fitdata` -> `strava-sync`). Across one project, the set of all app names and short names may not
 hold one word twice (an app's own name and short name may be equal). No app's table prefix may
-start with another app's table prefix (`walks_` and `walks_x_` cannot both be installed).
+start with another app's table prefix (`walks_` and `walks_x_` cannot both be installed). No two
+apps may name the same program (`[app] cli` app name or `[app] command`), so a job or command of
+one app can never run another app's program.
 
 Limits: at most 16 apps per project; 32 jobs per app and 64 per project; 32 shared tables;
 200 columns per shared table; 1 to 4 key columns; 32 `[views]`; `project.toml` 256 KB and
@@ -281,6 +283,14 @@ the ownership checks it applies to `project.toml` today.
 package; if one is missing: *"The app <package> is not inside this project's apps folder and the
 list of installed apps has not been written yet."* / *"Run: mes apps sync"*. This is how the
 fitness project works on a computer without mes.
+
+**A lock that is only out of date because `project.toml` changed** (its sha256 differs, or its
+package list differs) while every listed package is a real `apps/<package>/` folder with a regular
+`app.toml`: readers ignore it and read exactly as without a lock (the lock adds nothing an
+in-project reader needs). The message for this case, when an app is installed elsewhere, is
+*"project.toml changed after the list of apps (apps.lock.json) was written, so mes will not guess
+which apps to run."* / *"Run: mes apps sync (it takes a second), then run this command again."*
+A damaged lock (not JSON, a link, other keys, bad paths) is always refused.
 
 `app.toml` itself is always read fresh from the app folder; the lock only locates it.
 

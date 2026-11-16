@@ -457,7 +457,7 @@ def test_a_job_others_wait_for_cannot_be_switched_off(tmp_path):
 
 
 @pytest.mark.parametrize("project, needle", [
-    ('apps = ["pp_a"]\n[settings.pp-b]\njobs.x.timeout = "1m"', "not the name of an installed app"),
+    ('apps = ["pp_a"]\n[settings.pp-b]\njobs.x.timeout = "1m"', "not the name of one of this project's apps"),
     ('apps = ["pp_a"]\n[settings.pp-a]\njobs.nope.timeout = "1m"', 'no job called "nope"'),
     ('apps = ["pp_a"]\n[ui]\nrefresh_after = ["pp-a.nope"]', "no enabled job"),
     ('apps = ["pp_a"]\n[ui]\ntables = ["secret"]', "not a shared table"),
@@ -586,7 +586,11 @@ def test_a_stale_or_invalid_lock_is_refused(tmp_path, change):
     root = _locked(tmp_path, **change)
     with pytest.raises(ManifestError) as e:
         manifest.load(root)
-    assert e.value.message == manifest.LOCK_STALE_MESSAGE and e.value.hint == "Run: mes apps sync"
+    if change in ({"project_toml_sha256": "0" * 64}, {"apps": []}):
+        assert e.value.message.startswith("project.toml changed after the list of apps")
+        assert e.value.hint.startswith("Run: mes apps sync")
+    else:
+        assert e.value.message.startswith(manifest.LOCK_STALE_MESSAGE) and e.value.hint == "Run: mes apps sync"
     assert e.value.code == "apps_lock_stale"
 
 
@@ -733,3 +737,51 @@ def test_the_fitness_project_parses_and_renders(tmp_path):
     assert "OnCalendar=*-*-* 07,13,22:30:00" in rendered["mes-fitdata.job.fitdata-garmin.daily.timer"]
     assert "mes-fitdata.net.fitdata-garmin.daily.service" in rendered
     assert "mes-fitdata.ui-refresh.service" in rendered["mes-fitdata.job.fitdata-garmin.daily.service"]
+
+
+# ---------------------------------------------------------------- review fixes: names that must stay apart
+
+
+def test_two_apps_may_not_name_the_same_program(tmp_path):
+    err = _compose_err(tmp_path, '[project]\nname = "p1"\napps = ["p1_a", "p1_b"]\n', {
+        "p1_a": '[app]\nname = "p1-a"\ncommand = "shared-prog"\n',
+        "p1_b": '[app]\nname = "p1-b"\ncommand = "shared-prog"\n',
+    })
+    assert "p1-a and p1-b both name the program" in err.message and "shared-prog" in err.message
+
+
+@pytest.mark.parametrize("app", ["p1-sqlite", "p1-mes", "p1-sqlite-x", "mes-tools"])
+def test_an_app_may_not_get_a_table_prefix_of_the_database_itself(tmp_path, app):
+    """Malformed input: such an app could list sqlite_master in [data] and [ui] tables."""
+    pkg = app.replace("-", "_")
+    err = _compose_err(tmp_path, f'[project]\nname = "p1"\napps = ["{pkg}"]\n', {
+        pkg: f'[app]\nname = "{app}"\ncommand = "{app}"\n[data]\ntables = []\n',
+    })
+    assert "short name" in err.message or "sqlite_ or mes_" in err.message
+
+
+def test_a_short_name_in_settings_points_to_the_full_name(tmp_path):
+    err = _compose_err(tmp_path, '[project]\nname = "trail"\napps = ["trail_rides"]\n[settings.rides]\n'
+                       'jobs.x.timeout = "1m"\n', {
+                           "trail_rides": '[app]\nname = "trail-rides"\ncommand = "trail-rides"\n'
+                                          '[jobs.x]\nrun = "x"\nmanual = true\n'})
+    assert "short name of the app trail-rides" in err.message
+    assert err.hint == "Did you mean [settings.trail-rides]?"
+
+
+def test_a_lock_made_stale_by_editing_project_toml_is_ignored_when_every_app_is_in_apps(tmp_path):
+    root = helpers.write(tmp_path / "pp", '[project]\nname = "pp"\napps = ["pp_a"]\n',
+                         {"pp_a": '[app]\nname = "pp-a"\ncommand = "pp-a"\n'}).resolve()
+    sha = hashlib.sha256((root / "project.toml").read_bytes()).hexdigest()
+    lock = {"v": 1, "project": "pp", "project_toml_sha256": sha, "apps": [
+        {"package": "pp_a", "name": "pp-a", "path": str(root / "apps" / "pp_a"), "in_project": True, "program": "pp-a"}]}
+    (root / manifest.LOCK_FILE).write_text(json.dumps(lock))
+    assert manifest.load(root).lock_used
+    (root / "project.toml").write_text((root / "project.toml").read_text() + "# touch\n")
+    p = manifest.load(root)
+    assert not p.lock_used and list(p.apps) == ["pp-a"]
+    # A damaged lock is still refused, even with every app in apps/.
+    (root / manifest.LOCK_FILE).write_text("{not json")
+    with pytest.raises(ManifestError) as e:
+        manifest.load(root)
+    assert e.value.code == "apps_lock_stale"

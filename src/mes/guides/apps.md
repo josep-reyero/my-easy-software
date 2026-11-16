@@ -50,9 +50,10 @@ against the commands, and writes `apps.lock.json` in the project folder. Everyth
 gate, the dashboards, the project command) reads that file. It holds paths of this computer, so it
 is never committed (`.gitignore`) and a deploy makes it again on the server.
 
-When it is missing or out of date (for example after editing `project.toml`), you are told:
-"The list of installed apps (apps.lock.json) is out of date ..." Run `mes apps sync`. Apps that are
-all in `apps/` also work without it.
+When it is missing or out of date (for example after editing `project.toml`) and an app is
+installed outside `apps/`, you are told: "project.toml changed after the list of apps
+(apps.lock.json) was written ..." Run `mes apps sync`. When every app is in `apps/`, an out-of-date
+or missing lock is simply not needed: the apps are read from `apps/` directly.
 
 When the project's shared database already exists, `mes apps sync` also brings it in line with
 `project.toml` (as `mes db sync` does), so the shared views always show the rows of exactly the

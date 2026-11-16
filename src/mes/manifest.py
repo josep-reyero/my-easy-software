@@ -51,7 +51,7 @@ Constants: ``MANIFEST_FILE``, ``APP_FILE``, ``LOCK_FILE``, ``APPS_DIR``, ``PROJE
 (also ``APP_NAME_RE``), ``PACKAGE_RE``, ``JOB_NAME_RE``, ``JOB_ID_RE``, ``COMMAND_WORD_RE``,
 ``CLI_NAME_RE``, ``CLI_REF_RE``, ``SHARED_NAME_RE``, ``COLUMN_RE``, ``APP_TABLE_RE``,
 ``FOLDER_RE``, ``SECTIONS_PATH_RE``, ``UI_DASHBOARD_RE``, ``COLUMN_TYPES``, ``HOST_RE``,
-``BUCKET_NAME_RE``, ``JOB_KEYS``, ``TRIGGER_KEYS``, ``RESERVED_APP_NAMES``, ``RESERVED_SHORT_NAMES``,
+``BUCKET_NAME_RE``, ``JOB_KEYS``, ``TRIGGER_KEYS``, ``RESERVED_APP_NAMES``, ``RESERVED_SHORT_NAMES``, ``RESERVED_TABLE_PREFIXES``,
 ``RESERVED_FOLDERS``, ``NOT_APP_PROGRAMS``, ``NETWORK_NOTE_LOCAL``, ``DEFAULT_MEMORY``,
 ``DEFAULT_TIMEOUT``, ``DEFAULT_WRITES``, ``WRITE_TARGETS``, ``MAX_MANIFEST_BYTES``,
 ``MAX_APP_TOML_BYTES``, ``MAX_LOCK_BYTES``, ``LOCK_STALE_MESSAGE``, ``LOCK_STALE_HINT``.
@@ -115,7 +115,9 @@ BUCKET_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}\Z")
 COLUMN_TYPES = {"text": "TEXT", "integer": "INTEGER", "real": "REAL", "boolean": "INTEGER", "json": "TEXT"}
 KEY_TYPES = ("text", "integer")
 RESERVED_APP_NAMES = ("mes",)
-RESERVED_SHORT_NAMES = ("describe", "guide", "apps", "help")
+RESERVED_SHORT_NAMES = ("describe", "guide", "apps", "help", "sqlite", "mes")
+# Table names (and so app table prefixes) that belong to SQLite or to mes itself.
+RESERVED_TABLE_PREFIXES = ("sqlite_", "mes_")
 RESERVED_FOLDERS = ("store", "logs", "state", "ui", "backup", "tmp")
 TOP_KEYS = ("project", "tables", "views", "settings", "ui", "storage")
 PROJECT_KEYS = ("name", "title", "version", "apps")
@@ -1286,8 +1288,17 @@ def load_app_file(path: str | Path, *, source: str | None = None, package: str |
 # --------------------------------------------------------------------------- finding the apps
 
 
+_LOCK_CHANGED = ("project.toml changed after the lock was written", "the lock lists other apps than project.toml")
+
+
 def _stale(detail: str) -> ManifestError:
-    return ManifestError(LOCK_STALE_MESSAGE, hint=LOCK_STALE_HINT, code="apps_lock_stale", detail=detail)
+    if detail in _LOCK_CHANGED:
+        return ManifestError(
+            "project.toml changed after the list of apps (apps.lock.json) was written, so mes will not guess "
+            "which apps to run.", hint="Run: mes apps sync (it takes a second), then run this command again.",
+            code="apps_lock_stale", detail=detail)
+    return ManifestError(f"{LOCK_STALE_MESSAGE} ({detail})", hint=LOCK_STALE_HINT, code="apps_lock_stale",
+                         detail=detail)
 
 
 def _real_dir_with_app_toml(folder: Path) -> bool:
@@ -1351,7 +1362,17 @@ def read_lock(root: Path, pf: ProjectFile) -> list[Located] | None:
 
 def locate_apps(root: Path, pf: ProjectFile) -> tuple[list[Located], bool]:
     """``(apps, lock_used)``: from the lock when there is one, else ``<root>/apps/<package>``."""
-    from_lock = read_lock(root, pf)
+    try:
+        from_lock = read_lock(root, pf)
+    except ManifestError as e:
+        # A lock that is only out of date because project.toml changed (a comment, a new table, a
+        # reordered apps list) tells nothing a reader needs when every app is in apps/: it is then
+        # read exactly as if there were no lock. A damaged lock, or one that points outside apps/,
+        # is still refused.
+        if e.code != "apps_lock_stale" or e.detail not in _LOCK_CHANGED or not all(
+                _real_dir_with_app_toml(root / APPS_DIR / p) for p in pf.packages):
+            raise
+        from_lock = None
     if from_lock is not None:
         return from_lock, True
     out = []
@@ -1419,12 +1440,22 @@ def compose(pf: ProjectFile, located: list[Located], *, lock_used: bool = False)
     apps: dict[str, AppSpec] = {}
     words: dict[str, str] = {}
     folders: dict[str, str] = {}
+    programs: dict[str, str] = {}
     for loc, af in files:
         source = f"{APPS_DIR}/{loc.package}/{APP_FILE}" if loc.in_project else f"the app.toml of {loc.package}"
         short = short_name(af.name, pf.name)
         if short in RESERVED_SHORT_NAMES:
-            raise _fail(source, "[app]", f'the app\'s short name would be "{short}", which the project command uses '
-                        "for itself.", f'Call the app "{pf.name}-<something else>".')
+            raise _fail(source, "[app]", f'the app\'s short name would be "{short}", which the project command or the '
+                        "database uses for itself.", f'Call the app "{pf.name}-<something else>".')
+        if table_prefix(short).startswith(RESERVED_TABLE_PREFIXES):
+            raise _fail(source, "[app]", f'the app\'s tables would start with "{table_prefix(short)}", and names that '
+                        "start with sqlite_ or mes_ belong to the database itself.",
+                        f'Call the app "{pf.name}-<something else>".')
+        if af.program in programs:
+            raise _pfail(pf, "[project] apps", f'the apps {programs[af.program]} and {af.name} both name the program '
+                         f'"{af.program}", so the jobs of one would run the other\'s program.',
+                         "Give each app its own program ([app] cli or command in its app.toml).")
+        programs[af.program] = af.name
         for w in dict.fromkeys((af.name, short)):
             if w in words:
                 raise _pfail(pf, "[project] apps", f'the apps {words[w]} and {af.name} can both be reached as "{w}", '
@@ -1494,8 +1525,12 @@ def compose(pf: ProjectFile, located: list[Located], *, lock_used: bool = False)
     for key, per in pf.settings.items():
         if key not in apps:
             by_package = next((a.name for a in apps.values() if a.package == key), None)
-            maybe = f" Did you mean {by_package}?" if by_package else ""
-            raise _pfail(pf, f"[settings.{key}]", f'"{key}" is not the name of an installed app.',
+            by_short = next((a.name for a in apps.values() if a.short == key), None)
+            if by_short:
+                raise _pfail(pf, f"[settings.{key}]", f'"{key}" is the short name of the app {by_short}, but settings '
+                             "use the app's full name.", f"Did you mean [settings.{by_short}]?")
+            maybe = f" Did you mean [settings.{by_package}]?" if by_package else ""
+            raise _pfail(pf, f"[settings.{key}]", f'"{key}" is not the name of one of this project\'s apps.',
                          f"Settings are keyed by app name: {', '.join(apps)}.{maybe}")
         known = files[[af.name for _, af in files].index(key)][1].jobs
         for job in per:
