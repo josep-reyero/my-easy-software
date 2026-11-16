@@ -6,9 +6,11 @@ How it fits together on a server (all rendered by ``mes server plan``, see ``mes
   so only a local proxy running as root (for example ``tailscale serve`` or ``funnel``, set up by
   the person) can pass requests to it. mes never runs that proxy.
 - The first request starts ``mes webhook serve --project <p> --server-root <root>`` as
-  ``mes-<p>``, with no network of its own and only ``state/triggers`` writable. It checks the
-  signature and, when it is right, rewrites ``state/triggers/<job>``. It stops by itself after
-  ``IDLE_EXIT_SEC`` seconds without requests.
+  ``mes-<p>``, with no network of its own. It sees only ``etc/`` (read-only: the secret and
+  ``etc/webhook-jobs``, the list of webhook jobs the root script copied from project.toml) and
+  its own ``webhook/`` folder, which no job can write: the replay record and the trigger notes
+  live there. When the signature is right it rewrites ``webhook/triggers/<job>``. It never reads
+  the project's code. It stops by itself after ``IDLE_EXIT_SEC`` seconds without requests.
 - ``mes-<p>.job.<job>.path`` notices the change and starts the job's own sandboxed unit. The
   receiver therefore never runs project code and never needs any privilege.
 
@@ -17,13 +19,16 @@ The request a sender makes::
     POST /hooks/<job> HTTP/1.1
     Content-Length: <n>
     X-Mes-Timestamp: <unix seconds>
-    X-Mes-Signature: sha256=<hex of HMAC-SHA256(secret, "<timestamp>." + body)>
+    X-Mes-Signature: sha256=<hex of HMAC-SHA256(secret, "<timestamp>\nPOST\n/hooks/<job>\n<job>\n" + body)>
+
+The method, the path and the job name are part of what is signed, so a signature made for one
+job can never start another.
 
 Checks, in order: method and path, header sizes, ``Content-Length`` (required, at most
 ``MAX_BODY`` bytes; no chunked bodies), the body read within ``READ_TIMEOUT_SEC``, the timestamp
 within ``WINDOW_SEC`` seconds of now (either way), the signature (constant-time compare), not
-seen before in the window (an exact replay is refused), and the job: it must exist in the
-deployed project.toml with ``webhook = true``. Answers are short JSON bodies with no internal
+seen before in the window (an exact replay is refused), and the job: it must be listed in
+``etc/webhook-jobs`` (root's copy of the jobs with ``webhook = true``). Answers are short JSON bodies with no internal
 detail: 202 accepted, 400, 401, 404, 405, 408, 411, 413, 503.
 
 The secret is ``<root>/<p>/etc/webhook.key``: written by the root script (owned by root,
@@ -35,12 +40,14 @@ Public API
 ----------
 ``WINDOW_SEC``, ``MAX_BODY``, ``MAX_HEADER_BYTES``, ``READ_TIMEOUT_SEC``, ``IDLE_EXIT_SEC``,
 ``MAX_CONNECTIONS``, ``MIN_SECRET_BYTES``, ``SEEN_FILE``.
-``sign(secret, timestamp, body) -> str``               ``"sha256=<hex>"``.
-``verify(secret, timestamp, signature, body, now, seen) -> str | None``
+``signed_message(timestamp, body, *, job, method="POST") -> bytes``  what the MAC covers.
+``sign(secret, timestamp, body, *, job, method="POST") -> str``  ``"sha256=<hex>"``.
+``verify(secret, timestamp, signature, body, now, seen, *, job, method="POST") -> str | None``
     ``None`` when the request may pass, else a problem code: ``bad_timestamp``, ``stale``,
     ``too_large``, ``bad_signature_header``, ``bad_signature``, ``replay``. Pure: ``seen`` (a
     mapping signature -> time) is only read.
-``job_problem(project, job) -> str | None``            ``bad_job``, ``unknown_job`` or ``not_webhook``.
+``job_problem(project_or_names, job) -> str | None``   ``bad_job``, ``unknown_job`` or ``not_webhook``.
+``load_jobs(path) -> set[str]``                         ``etc/webhook-jobs``, a root-owned list.
 ``parse_secret(text) -> bytes``, ``load_secret(path, *, owner_only=False) -> bytes``
 ``Receiver(layout, secret)``                           ``handle(conn)`` serves one connection.
 ``serve(layout, *, listener=None, socket_path=None, idle=IDLE_EXIT_SEC) -> dict``
@@ -71,7 +78,7 @@ from typing import Any
 from mes import manifest as manifest_mod
 from mes import paths
 from mes.app import check_allowed
-from mes.errors import MesError, NotFound, Refused, UsageError
+from mes.errors import NotFound, Refused, UsageError
 
 WINDOW_SEC = 300
 MAX_BODY = 64 * 1024
@@ -99,13 +106,17 @@ _REASONS = {202: "Accepted", 400: "Bad Request", 401: "Unauthorized", 404: "Not 
 # --------------------------------------------------------------------------- pure checks
 
 
-def sign(secret: bytes, timestamp: int | str, body: bytes) -> str:
-    mac = hmac.new(secret, f"{timestamp}.".encode("ascii") + body, hashlib.sha256)
+def signed_message(timestamp: int | str, body: bytes, *, job: str, method: str = "POST") -> bytes:
+    return f"{timestamp}\n{method}\n/hooks/{job}\n{job}\n".encode("ascii") + body
+
+
+def sign(secret: bytes, timestamp: int | str, body: bytes, *, job: str, method: str = "POST") -> str:
+    mac = hmac.new(secret, signed_message(timestamp, body, job=job, method=method), hashlib.sha256)
     return "sha256=" + mac.hexdigest()
 
 
 def verify(secret: bytes, timestamp: Any, signature: Any, body: bytes, now: float,
-           seen: Mapping[str, float]) -> str | None:
+           seen: Mapping[str, float], *, job: str, method: str = "POST") -> str | None:
     if not isinstance(timestamp, str) or not _TS_RE.fullmatch(timestamp):
         return "bad_timestamp"
     if abs(now - int(timestamp)) > WINDOW_SEC:
@@ -114,7 +125,9 @@ def verify(secret: bytes, timestamp: Any, signature: Any, body: bytes, now: floa
         return "too_large"
     if not isinstance(signature, str) or not _SIG_RE.fullmatch(signature):
         return "bad_signature_header"
-    expected = sign(secret, timestamp, body)
+    if not isinstance(job, str) or not manifest_mod.JOB_NAME_RE.fullmatch(job):
+        return "bad_signature"
+    expected = sign(secret, timestamp, body, job=job, method=method)
     if not hmac.compare_digest(expected.encode("ascii"), signature.encode("ascii")):
         return "bad_signature"
     if signature in seen:
@@ -122,14 +135,33 @@ def verify(secret: bytes, timestamp: Any, signature: Any, body: bytes, now: floa
     return None
 
 
-def job_problem(project: manifest_mod.Project, job: Any) -> str | None:
+def job_problem(project: Any, job: Any) -> str | None:
     if not isinstance(job, str) or not manifest_mod.JOB_NAME_RE.fullmatch(job):
         return "bad_job"
+    if isinstance(project, (set, frozenset)):
+        return None if job in project else "unknown_job"
     if job not in project.jobs:
         return "unknown_job"
     if project.jobs[job].trigger != "webhook":
         return "not_webhook"
     return None
+
+
+def load_jobs(path: str | os.PathLike[str]) -> set[str]:
+    """``etc/webhook-jobs``: one job name per line, written by the root script. Only a plain file
+    that only root (or this account) can change is trusted; anything else means no jobs."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return set()
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode) or st.st_uid not in (0, os.getuid()) \
+            or st.st_mode & (stat.S_IWGRP | stat.S_IWOTH) or st.st_size > 64 * 1024:
+        return set()
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    with os.fdopen(fd, "rb") as f:
+        text = f.read(64 * 1024).decode("ascii", "replace")
+    return {ln.strip() for ln in text.splitlines()
+            if ln.strip() and not ln.startswith("#") and manifest_mod.JOB_NAME_RE.fullmatch(ln.strip())}
 
 
 def parse_secret(text: str) -> bytes:
@@ -235,7 +267,7 @@ class Receiver:
         if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() \
                 or st.st_mode & 0o077:
             raise Refused("The webhook trigger folder is not a private folder of this account, so nothing is "
-                          "written into it.", hint="Remove state/triggers and let mes create it again.",
+                          "written into it.", hint="Run 'mes server plan' and its script again.",
                           code="unsafe_folder")
         return d
 
@@ -280,8 +312,8 @@ class Receiver:
         self._prune(now)
         self._write_atomic(SEEN_FILE, json.dumps(self.seen, separators=(",", ":")).encode("ascii"))
 
-    def _project(self) -> manifest_mod.Project:
-        return manifest_mod.load(self.layout.current_project)
+    def _jobs(self) -> set[str]:
+        return load_jobs(self.layout.webhook_jobs)
 
     # -- one request
 
@@ -293,17 +325,15 @@ class Receiver:
         if not m:
             raise _Problem(404, "not_found")
         job = m.group(1)
+        if not manifest_mod.JOB_NAME_RE.fullmatch(job):
+            raise _Problem(404, "unknown_job")  # says only that this is not a job name, never which jobs exist
         now = self.clock()
         with self.lock:
             problem = verify(self.secret, headers.get("x-mes-timestamp"), headers.get("x-mes-signature"),
-                             body, now, self.seen)
+                             body, now, self.seen, job=job, method=method)
             if problem:
                 raise _Problem(_STATUS_FOR[problem], problem if problem != "bad_signature_header" else "bad_signature")
-            try:
-                project = self._project()
-            except MesError:
-                raise _Problem(404, "unknown_job") from None
-            jp = job_problem(project, job)
+            jp = job_problem(frozenset(self._jobs()), job)
             if jp:
                 raise _Problem(404, "unknown_job")
             signature = headers["x-mes-signature"]
@@ -509,10 +539,13 @@ def _cmd_sign(args: argparse.Namespace) -> Any:
     if not _TS_RE.fullmatch(ts):
         raise UsageError("--timestamp must be a whole number of seconds.", hint="Leave it out to use now.")
     body = _read_stdin_body()
-    signature = sign(secret, ts, body)
+    if not manifest_mod.JOB_NAME_RE.fullmatch(args.job or ""):
+        raise UsageError(f"{str(args.job)[:40]!r} is not a job name.", hint="Give the job, for example: --job import")
+    signature = sign(secret, ts, body, job=args.job)
     headers = [f"X-Mes-Timestamp: {ts}", f"X-Mes-Signature: {signature}"]
     if args.json:
-        return {"timestamp": ts, "signature": signature, "headers": headers, "body_bytes": len(body)}
+        return {"timestamp": ts, "job": args.job, "path": f"/hooks/{args.job}", "signature": signature,
+                "headers": headers, "body_bytes": len(body)}
     return "\n".join(headers)
 
 
@@ -551,6 +584,7 @@ def register(subparsers: Any) -> None:
     g = sub.add_parser("sign", help="Print the signature headers for a body read from standard input (for testing).")
     g.add_argument("--secret-file", required=True, metavar="FILE",
                    help="a file only you can read, holding the webhook secret")
+    g.add_argument("--job", required=True, help="the job the request is for (part of what is signed)")
     g.add_argument("--timestamp", type=int, default=None, help="unix seconds (default: now)")
     g.set_defaults(func=_cmd_sign)
     c = sub.add_parser("secret-check", help="Check that the project's webhook secret on the server is usable.")

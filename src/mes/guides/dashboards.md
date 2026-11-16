@@ -26,6 +26,7 @@ Steps:
 
 Only tables listed under `[ui] tables` ever reach a dashboard, and only the dashboards' own
 queries run on them. On a server the dashboard server runs as its own account
-(`mes-<project>-web`), can read only the published copy in `/var/lib/mes/<project>/ui/`, and is
-reached through your private network (`mes guide setup`, Tailscale serve). To show dashboards to
+(`mes-<project>-web`), can read only the published copy in `/var/lib/mes/<project>/ui/` and its
+own sign-in folder `/var/lib/mes/<project>/auth/` (which the project's own code cannot reach), has
+no network of its own, and is reached through your private network (`mes guide setup`, Tailscale serve). To show dashboards to
 other people, see `mes guide share`.

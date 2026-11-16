@@ -52,8 +52,11 @@ Constants: ``MANIFEST_FILE`` (``"project.toml"``), ``PROJECT_NAME_RE`` (also ``A
 ``Job`` (frozen): ``name``, ``run`` (text), ``app`` (the app it runs), ``argv`` (the words after
     the app name: ``argv[0]`` is the app's command, also ``job.command``), ``trigger``
     (``"schedule" | "after" | "manual" | "webhook"``), ``schedule``, ``after``, ``memory``,
-    ``timeout``, ``network`` (tuple of host names; empty means no network), ``writes``.
-    Properties ``timeout_seconds``, ``memory_bytes``, ``network_allowed``. ``to_dict()``.
+    ``timeout``, ``network`` (tuple of host names; empty means no network), ``local_network``
+    (host names on the person's own network, such as ``nas.home.arpa``: only these may resolve to
+    private addresses; loopback and link-local addresses are never allowed), ``writes``.
+    Properties ``timeout_seconds``, ``memory_bytes``, ``network_allowed``, ``hosts`` (both lists).
+    ``to_dict()``.
 ``UI`` (frozen): ``data``, ``tables``, ``accent``, ``dashboards``, ``refresh_after``. ``to_dict()``.
 ``Storage`` (frozen): ``bucket``.
 ``Project`` (frozen): ``name``, ``title``, ``version``, ``apps`` (dict name -> AppSpec),
@@ -86,7 +89,8 @@ RESERVED_APP_NAMES = ("mes",)
 TOP_KEYS = ("project", "apps", "jobs", "ui", "storage")
 PROJECT_KEYS = ("name", "title", "version")
 APP_KEYS = ("cli",)
-JOB_KEYS = ("run", "schedule", "after", "manual", "webhook", "memory", "timeout", "network", "writes")
+JOB_KEYS = ("run", "schedule", "after", "manual", "webhook", "memory", "timeout", "network", "local_network",
+            "writes")
 TRIGGER_KEYS = ("schedule", "after", "manual", "webhook")
 UI_KEYS = ("data", "tables", "accent", "dashboards", "refresh_after")
 STORAGE_KEYS = ("bucket",)
@@ -116,6 +120,18 @@ _TIMEOUT_RE = re.compile(r"^([1-9][0-9]{0,5})([smh])\Z")
 _SCHEDULE_RE = re.compile(r"^[A-Za-z0-9*:,./~ +_@-]+\Z")
 _HOST_LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
 HOST_RE = re.compile(rf"^(?=.{{1,253}}\Z){_HOST_LABEL}(?:\.{_HOST_LABEL})*\Z")
+_TLD_RE = re.compile(r"^(?:[a-z]{2,63}|xn--[a-z0-9-]{1,59})\Z")
+
+
+def is_host_name(h: str) -> bool:
+    """A real host name: plain labels, a final label made of letters (so no number in any
+    spelling, such as 0x7f.1 or 2130706433, can pass for a name), no label starting with 0x."""
+    if not isinstance(h, str) or not HOST_RE.match(h) or "." not in h:
+        return False
+    labels = h.split(".")
+    return bool(_TLD_RE.match(labels[-1])) and not any(label.startswith("0x") for label in labels)
+
+
 _SHELL_TOKENS = {"|", "||", "&", "&&", ";", ">", ">>", "<", "<<", "2>", "2>&1"}
 _UNITS = {"K": 1024, "M": 1024**2, "G": 1024**3}
 _SECONDS = {"s": 1, "m": 60, "h": 3600}
@@ -143,6 +159,7 @@ class Job:
     timeout: str = DEFAULT_TIMEOUT
     network: tuple[str, ...] = ()
     writes: tuple[str, ...] = DEFAULT_WRITES
+    local_network: tuple[str, ...] = ()
 
     @property
     def command(self) -> str:
@@ -162,7 +179,11 @@ class Job:
 
     @property
     def network_allowed(self) -> bool:
-        return bool(self.network)
+        return bool(self.network or self.local_network)
+
+    @property
+    def hosts(self) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(self.network + self.local_network))
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -177,8 +198,9 @@ class Job:
             "timeout": self.timeout,
             "network": list(self.network) if self.network else False,
             # A host list is enforced by the system units of a server, not by 'mes jobs run'.
-            "network_enforced": {"server": True, "this_computer": not self.network},
-            "network_note": NETWORK_NOTE_LOCAL if self.network else None,
+            "network_enforced": {"server": True, "this_computer": not self.network_allowed},
+            "network_note": NETWORK_NOTE_LOCAL if self.network_allowed else None,
+            "local_network": list(self.local_network),
             "writes": list(self.writes),
         }
 
@@ -508,7 +530,7 @@ def _parse_job(name: str, table: Any, apps: dict[str, AppSpec], source: str) -> 
         hosts = []
         for host in network_value:
             h = host.strip().lower().rstrip(".")
-            if "://" in host or "/" in host or not HOST_RE.match(h) or h.replace(".", "").isdigit():
+            if "://" in host or "/" in host or not HOST_RE.match(h):
                 raise _fail(
                     source,
                     where,
@@ -521,6 +543,14 @@ def _parse_job(name: str, table: Any, apps: dict[str, AppSpec], source: str) -> 
                     where,
                     f'"network" contains {host!r}, which names this computer or its local network, not a '
                     "service on the internet. Jobs may only reach the internet hosts they list.",
+                    'List full internet host names, for example network = ["api.example.com"].',
+                )
+            if not is_host_name(h):
+                raise _fail(
+                    source,
+                    where,
+                    f'"network" contains {host!r}, which is a number, not a host name (numbers in any spelling, '
+                    "such as 0x7f.1, can point at this computer).",
                     'List full internet host names, for example network = ["api.example.com"].',
                 )
             hosts.append(h)
@@ -536,6 +566,25 @@ def _parse_job(name: str, table: Any, apps: dict[str, AppSpec], source: str) -> 
             'Write network = false, or list the hosts, for example network = ["api.example.com"].',
         )
 
+    local_value = table.get("local_network", [])
+    local: list[str] = []
+    if not isinstance(local_value, list) or not all(isinstance(h, str) for h in local_value):
+        raise _fail(source, where, '"local_network" must be a list of host names on your own network.',
+                    'For example local_network = ["nas.home.arpa"], or leave it out.')
+    for host in local_value:
+        h = host.strip().lower().rstrip(".")
+        if "://" in host or "/" in host or not is_host_name(h) or h.endswith(".localhost"):
+            raise _fail(
+                source, where,
+                f'"local_network" contains {host!r}, which is not the name of another device on your network.',
+                'List device names only, for example local_network = ["nas.home.arpa"]. This computer itself '
+                "(localhost) can never be listed.")
+        local.append(h)
+    if len(local) + len(network) > MAX_HOSTS:
+        raise _fail(source, where, f'"network" and "local_network" list more than {MAX_HOSTS} hosts together.',
+                    "List only the hosts the job really needs.")
+    local_network = tuple(h for h in dict.fromkeys(local) if h not in network)
+
     writes_value = table.get("writes", list(DEFAULT_WRITES))
     if not isinstance(writes_value, list) or any(w not in WRITE_TARGETS for w in writes_value):
         raise _fail(
@@ -547,7 +596,7 @@ def _parse_job(name: str, table: Any, apps: dict[str, AppSpec], source: str) -> 
     writes = tuple(dict.fromkeys(writes_value))
 
     return Job(name=name, run=run, app=app, argv=argv, trigger=trigger, schedule=schedule, after=after,
-               memory=memory, timeout=timeout, network=network, writes=writes)
+               memory=memory, timeout=timeout, network=network, writes=writes, local_network=local_network)
 
 
 def _check_after(jobs: dict[str, Job], source: str) -> None:

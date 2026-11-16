@@ -96,35 +96,68 @@ def test_script_text_golden(proj, keys, tmp_path):
     for line in [
         f"ensure_top {q(str(srv))}",
         f"ensure_dir {q(base)} root root 0711",
+        f"ensure_dir {q(base + '/etc')} root mes-demo 0750",
+        f"ensure_dir {q(base + '/home')} root mes-demo 0750",
+        f"ensure_dir {q(base + '/home/.ssh')} root mes-demo 0750",
         f"ensure_dir {q(base + '/code')} mes-demo mes-demo 0700",
         f"ensure_dir {q(base + '/data')} mes-demo mes-demo 0700",
         f"ensure_dir {q(base + '/state')} mes-demo mes-demo 0700",
+        f"ensure_dir {q(base + '/gate')} mes-demo mes-demo 0700",
+        f"ensure_dir {q(base + '/webhook')} mes-demo mes-demo 0700",
         f"ensure_dir {q(base + '/ui')} mes-demo mes-demo-web 2750",
-        f"ensure_sub {q(base)} ui/auth mes-demo-web mes-demo-web 0700",
+        f"ensure_dir {q(base + '/auth')} mes-demo-web mes-demo-web 0700",
         f"ensure_sub {q(base)} ui/data mes-demo mes-demo-web 2750",
+        f"ensure_sub {q(base)} webhook/triggers mes-demo mes-demo 0700",
         f"ensure_dir {q(base + '/log')} root mes-demo 0750",
         "usermod -p '*' -- mes-demo",
         "usermod -p '!' -- mes-demo-web",
         f"ensure_account mes-demo {q(base + '/home')} {q(base + '/etc/gate-shell')} 'mes project demo'",
+        f"check_mes /bin/sh {q(units.DEFAULT_MES_PYTHON)} {q(server.__version__)}",
+        "check_tool uv /bin/sh",
     ]:
         assert line in script, line
+    assert "ui/auth" not in script  # finding 7: the sign-in folder is beside ui/, not inside it
     code_lines = [ln for ln in script.splitlines() if not ln.lstrip().startswith("#")]
     assert not any(re.match(r"\s*sudo\b", ln) for ln in code_lines)
     assert 'command="/bin/sh gate --project demo --allow read --server-root ' in script
     assert 'command="/bin/sh gate --project demo --allow deploy --server-root ' in script
     assert "someone@example.invalid" not in script  # key comments are never copied
-    assert 'demo namespaces="mes-deploy" ssh-ed25519 ' in script
+    assert 'demo namespaces="mes-deploy,mes-rollback" ssh-ed25519 ' in script
     for name in plan.units:
         assert f"put_file {q(f'{tmp_path}/units/{name}')} 0644 root:root <<'MES_END_" in script
+    for rel in ("etc/server.toml", "etc/allowed_signers", "etc/webhook-jobs", "home/.ssh/authorized_keys"):
+        assert f"put_file {q(f'{base}/{rel}')} 0640 root:mes-demo <<'MES_END_" in script, rel
+    assert f"put_file {q(f'{base}/etc/gate-shell')} 0750 root:mes-demo <<'MES_END_" in script
+    # The gate's login shell is written before the account that uses it.
+    assert script.index(f"put_file {q(f'{base}/etc/gate-shell')}") < script.index("ensure_account mes-demo ")
     assert "mes-demo.job.sync.timer" in script and "systemctl enable --now -- " in script
+    assert "mes-demo.selftest.path" in script.split("systemctl enable --now -- ")[1]
     assert "webhook.key" in script and "od -An -tx1 -N32 /dev/urandom" in script
+
+
+def test_script_header_names_the_version_and_a_fingerprint(proj, keys, tmp_path):
+    """Finding 1: nothing in the script showed which mes made it or whether it was changed."""
+    script = server.render_script(_plan(proj, keys, tmp_path))
+    head = script.split(server.PLAN_MARKER)[0]
+    assert f"(mes {server.__version__})" in head
+    m = re.search(r"^# Plan fingerprint \(SHA-256\): ([0-9a-f]{64})$", head, re.M)
+    assert m and m.group(1) == server.plan_fingerprint(script)
+
+
+@pytest.mark.skipif(shutil.which("sha256sum") is None, reason="needs sha256sum")
+def test_a_changed_script_stops_before_doing_anything(proj, keys, tmp_path):
+    script = server.render_script(_plan(proj, keys, tmp_path))
+    evil = script.replace("ensure_group mes-demo\n", "ensure_group mes-demo\necho pwned > /dev/null\n", 1)
+    res = _run_script(evil, tmp_path / "fake", harness=False)
+    assert res.returncode == 1 and "fingerprint does not match" in res.stderr
+    assert not (tmp_path / "fake" / "log").exists()
 
 
 def test_script_only_touches_its_own_places(proj, keys, tmp_path):
     script = server.render_script(_plan(proj, keys, tmp_path)).replace(server._PRELUDE, "")
     srv, udir = f"{tmp_path}/srv", f"{tmp_path}/units"
     allowed_prefixes = (srv, f"{udir}/mes-demo.", "/dev/null", "/dev/urandom", "/nonexistent", "/usr/sbin/nologin",
-                        "/bin/sh", "/usr/sbin:/usr/bin:/sbin:/bin", "/usr/bin/env bash")
+                        "/bin/sh", "/usr/sbin:/usr/bin:/sbin:/bin", "/usr/bin/env bash", units.DEFAULT_MES_PYTHON)
     code = [ln for ln in script.splitlines() if not ln.lstrip().startswith("#")]
     in_heredoc = None
     for ln in code:
@@ -136,7 +169,7 @@ def test_script_only_touches_its_own_places(proj, keys, tmp_path):
         if m:
             in_heredoc = m.group(1)
         for path in re.findall(r"(?<![\w$])(/[A-Za-z0-9._/:@+=,~-]+)", ln):
-            if path in ("/", "/*", "/bin/false"):
+            if path in ("/", "/*", "/bin/false", "//p"):
                 continue
             assert path.startswith(allowed_prefixes) or path == udir, (path, ln)
     assert re.search(r"rm -f -- \"\$f\"", script)  # only units with the project's marker
@@ -234,10 +267,21 @@ install() {
 '''
 
 
-def _run_script(script: str, fake: Path) -> subprocess.CompletedProcess[str]:
+def _harness(script: str) -> str:
+    """The tool checks need root-owned system tools; they have their own tests below. Here the
+    calls are switched off, and the fingerprint is made again so the script still accepts itself."""
+    body = script.split(server.PLAN_MARKER + "\n", 1)[1]
+    new_body = re.sub(r"^(check_mes|check_tool) ", r": \1 ", body, flags=re.M)
+    head = script.split(server.PLAN_MARKER + "\n", 1)[0]
+    head = re.sub(r"(# Plan fingerprint \(SHA-256\): )[0-9a-f]{64}",
+                  lambda m: m.group(1) + server.hashlib.sha256(new_body.encode()).hexdigest(), head)
+    return head + server.PLAN_MARKER + "\n" + new_body
+
+
+def _run_script(script: str, fake: Path, harness: bool = True) -> subprocess.CompletedProcess[str]:
     fake.mkdir(exist_ok=True)
     (fake / "fakes.sh").write_text(FAKES)
-    (fake / "plan.sh").write_text(script)
+    (fake / "plan.sh").write_text(_harness(script) if harness else script)
     return subprocess.run(["bash", "-c", f'FAKE="{fake}"; source "{fake}/fakes.sh"; source "{fake}/plan.sh"'],
                           capture_output=True, text=True, env={"PATH": os.environ["PATH"], "HOME": str(fake)})
 
@@ -254,19 +298,30 @@ def test_script_really_runs_and_is_idempotent(proj, keys, tmp_path):
     assert first.returncode == 0, first.stderr
     assert "Done. The project demo is set up." in first.stdout
     base = tmp_path / "srv" / "demo"
-    for sub, mode in (("code", 0o700), ("data", 0o700), ("state", 0o700), ("store", 0o700), ("ui/auth", 0o700),
+    for sub, mode in (("code", 0o700), ("data", 0o700), ("state", 0o700), ("store", 0o700), ("auth", 0o700),
+                      ("gate", 0o700), ("webhook", 0o700), ("webhook/triggers", 0o700), ("backups", 0o700),
                       ("ui", 0o2750), ("ui/data", 0o2750), ("ui/specs", 0o2750),
-                      ("log", 0o750), ("etc", 0o755), ("home/.ssh", 0o755)):
+                      ("log", 0o750), ("etc", 0o750), ("home", 0o750), ("home/.ssh", 0o750)):
         assert stat.S_IMODE((base / sub).stat().st_mode) == mode, sub
     assert stat.S_IMODE(base.stat().st_mode) == 0o711
+    assert not (base / "ui" / "auth").exists() and not (base / "state" / "triggers").exists()
+    owners = {}
+    for line in (tmp_path / "fake" / "owners").read_text().splitlines():
+        path, owner = line.split("\t")
+        owners[path] = owner
+    assert owners[str(base / "auth")] == "mes-demo-web:mes-demo-web"
+    assert owners[str(base / "etc")] == "root:mes-demo" and owners[str(base / "home/.ssh")] == "root:mes-demo"
+    assert owners[str(base / "etc/allowed_signers")] == "root:mes-demo"
     ak = (base / "home/.ssh/authorized_keys").read_text()
-    assert ak.count("restrict,command=") == 2 and stat.S_IMODE((base / "home/.ssh/authorized_keys").stat().st_mode) == 0o644
-    assert (base / "etc/allowed_signers").read_text().count('namespaces="mes-deploy"') == 1
-    assert stat.S_IMODE((base / "etc/gate-shell").stat().st_mode) == 0o755
+    assert ak.count("restrict,command=") == 2 and stat.S_IMODE((base / "home/.ssh/authorized_keys").stat().st_mode) == 0o640
+    assert (base / "etc/allowed_signers").read_text().count('namespaces="mes-deploy,mes-rollback"') == 1
+    assert (base / "etc/webhook-jobs").read_text().splitlines()[-1] == "hook"
+    assert stat.S_IMODE((base / "etc/gate-shell").stat().st_mode) == 0o750
+    for rel in ("etc/server.toml", "etc/allowed_signers", "etc/webhook-jobs"):
+        assert stat.S_IMODE((base / rel).stat().st_mode) == 0o640, rel
     key = (base / "etc/webhook.key").read_text()
     assert re.fullmatch(r"[0-9a-f]{64}", key.strip()), key
     assert stat.S_IMODE((base / "etc/webhook.key").stat().st_mode) == 0o640
-    assert stat.S_IMODE((base / "state/triggers").stat().st_mode) == 0o700
     for name, text in plan.units.items():
         assert (tmp_path / "units" / name).read_text() == text.rstrip("\n") + "\n"
     assert not stale.exists() and foreign.exists()
@@ -302,9 +357,15 @@ def test_script_stops_for_a_foreign_account_and_a_planted_link(proj, keys, tmp_p
     (tmp_path / "srv" / "demo").unlink()
     (tmp_path / "srv" / "demo" / "ui").mkdir(parents=True)
     (tmp_path / "elsewhere").mkdir()
-    (tmp_path / "srv" / "demo" / "ui" / "auth").symlink_to(tmp_path / "elsewhere")
+    (tmp_path / "srv" / "demo" / "ui" / "data").symlink_to(tmp_path / "elsewhere")
     res = _run_script(script, fake)
     assert res.returncode == 1 and "is not a real folder" in res.stderr
+    assert not list((tmp_path / "elsewhere").iterdir())
+    # Nor a link in place of the sign-in folder.
+    (tmp_path / "srv" / "demo" / "ui" / "data").unlink()
+    (tmp_path / "srv" / "demo" / "auth").symlink_to(tmp_path / "elsewhere")
+    res = _run_script(script, fake)
+    assert res.returncode == 1 and "is a link" in res.stderr
     assert not list((tmp_path / "elsewhere").iterdir())
 
 
@@ -394,65 +455,125 @@ def test_heredoc_delimiter_never_appears_in_content(proj, keys, tmp_path, monkey
 
 def _fake_easy_ui(tmp_path: Path, units_answer: dict) -> Path:
     exe = tmp_path / "easy-ui"
+    (tmp_path / "easy-ui-answer.json").write_text(json.dumps(units_answer))
     exe.write_text(f"#!{sys.executable}\nimport json, sys\n"
                    f"(open({str(tmp_path / 'easy-ui-argv.json')!r}, 'w').write(json.dumps(sys.argv[1:])))\n"
-                   f"print(json.dumps({json.dumps(units_answer)}))\n")
+                   f"print(open({str(tmp_path / 'easy-ui-answer.json')!r}).read())\n")
     exe.chmod(0o755)
     return exe
 
 
-GOOD_SERVICE = "[Service]\nUser=mes-demo-web\nExecStart=/bin/sh serve\n"
+ORIGIN = "https://box.example.ts.net"
 
 
-def test_dashboard_units_come_from_easy_ui(proj, keys, tmp_path, monkeypatch):
-    exe = _fake_easy_ui(tmp_path, {"units": {"mes-demo-web.socket": "[Socket]\nListenStream=/run/easy-ui/demo.sock\n",
-                                             "mes-demo-web.service": GOOD_SERVICE}})
-    monkeypatch.setenv("MES_EASY_UI", str(exe))
-    plan = _plan(proj, keys, tmp_path)
+def _web_answer(tmp_path: Path, **change) -> dict:
+    """What easy-ui units --render-only --json answers (my-easy-ui 1e1d33f)."""
+    root = str(tmp_path / "srv")
+    ui, auth = f"{root}/demo/ui", f"{root}/demo/auth"
+    answer = {
+        "app": "demo", "project": "demo", "accounts": {"project": "mes-demo", "web": "mes-demo-web"},
+        "unit_names": {"socket": "mes-demo-web.socket", "service": "mes-demo-web.service"},
+        "exec": "/bin/sh", "root": root, "ui_dir": ui, "auth_dir": auth, "socket": "/run/mes/demo-web.sock",
+        "socket_owner": "root", "origins": [ORIGIN], "memory_max": "256M",
+        "exec_start": ["/bin/sh", "serve", "--ui-dir", ui, "--auth-dir", auth, "--origin", ORIGIN],
+        "folders": [], "enable": ["mes-demo-web.socket"], "written": [],
+        "units": {"mes-demo-web.service": "[Service]\nUser=root\nExecStart=+/bin/sh -c id\n"},
+    }
+    answer.update(change)
+    return answer
+
+
+def test_dashboard_units_are_rendered_by_mes_from_checked_parameters(proj, keys, tmp_path, monkeypatch):
+    """Finding 1: the plan copied easy-ui's unit text into a root script. Now mes renders the units
+    itself and ignores easy-ui's text (the answer here carries a hostile one)."""
+    monkeypatch.setenv("MES_EASY_UI", str(_fake_easy_ui(tmp_path, _web_answer(tmp_path))))
+    plan = _plan(proj, keys, tmp_path, allow_hosts=["box.example.ts.net"])
     argv = json.loads((tmp_path / "easy-ui-argv.json").read_text())
     assert argv[:3] == ["--json", "--project-dir", str(proj.resolve())]
-    assert argv[3:] == ["units", "--render-only", "--exec", "/bin/sh", "--root", str(tmp_path / "srv")]
+    assert argv[3:] == ["units", "--render-only", "--exec", "/bin/sh", "--root", str(tmp_path / "srv"),
+                        "--origin", ORIGIN]
     assert set(plan.web_units) == {"mes-demo-web.socket", "mes-demo-web.service"}
+    svc = plan.web_units["mes-demo-web.service"]
+    assert "User=root" not in svc and "+/bin/sh" not in svc and "User=mes-demo-web" in svc
+    lines = svc.splitlines()
+    exec_start = next(ln for ln in lines if ln.startswith("ExecStart="))
+    assert shlex.split(exec_start[len("ExecStart="):]) == [
+        "/bin/sh", "serve", "--ui-dir", f"{tmp_path}/srv/demo/ui", "--auth-dir", f"{tmp_path}/srv/demo/auth",
+        "--origin", ORIGIN]
+    assert f"BindPaths={tmp_path}/srv/demo/auth" in lines and f"BindReadOnlyPaths={tmp_path}/srv/demo/ui" in lines
+    assert f"TemporaryFileSystem={tmp_path}/srv:ro" in lines
+    env = " ".join(ln for ln in lines if ln.startswith("Environment="))
+    assert "HOME=/nonexistent" in env and "MES_CONFIG=/nonexistent" in env
+    sock = plan.web_units["mes-demo-web.socket"]
+    assert "ListenStream=/run/mes/demo-web.sock" in sock and "SocketUser=root" in sock and "SocketMode=0600" in sock
     script = server.render_script(plan)
     assert "mes-demo-web.socket" in script.split("systemctl enable --now -- ")[1]
 
 
-@pytest.mark.parametrize("answer", [
-    {"units": {"mes-demo-web.service": "[Service]\nUser=root\n"}},
-    {"units": {"mes-demo-web.service": "[Service]\nExecStart=/bin/sh\n"}},
-    {"units": {"mes-demo-web.service": GOOD_SERVICE + "User=mes-demo\n"}},
-    {"units": {"mes-demo-web.service": GOOD_SERVICE + "ExecStartPre=+/bin/sh -c id\n"}},
-    {"units": {"mes-demo-web.service": GOOD_SERVICE + "AmbientCapabilities=CAP_NET_ADMIN\n"}},
-    {"units": {"mes-demo-web.service": GOOD_SERVICE + "Group=root\n"}},
-    {"units": {"mes-demo-web.service": GOOD_SERVICE + "SupplementaryGroups=mes-demo\n"}},
-    {"units": {"mes-demo-web.service": GOOD_SERVICE + "ExecStartPost=-+/bin/id\n"}},
-    {"units": {"mes-demo-web.socket": "[Socket]\nListenStream=/run/x.sock\nExecStartPre=/bin/id\n"}},
-    {"units": {"mes-demo-web.socket": "[Socket]\nListenStream=/run/x.sock\nService=sshd.service\n"}},
-    {"units": {"sshd.service": GOOD_SERVICE}},
-    {"units": {"mes-demo2-web.service": GOOD_SERVICE}},
-    {"units": {"mes-other-web.service": GOOD_SERVICE}},
-    {"units": {"mes-demo.job.sync.service": GOOD_SERVICE}},
-    {"units": {"../../etc/x-demo.service": GOOD_SERVICE}},
-    {"units": {"mes-demo-web.service": GOOD_SERVICE + "\x00"}},
-])
-def test_unsafe_dashboard_units_are_refused(proj, keys, tmp_path, monkeypatch, answer):
-    monkeypatch.setenv("MES_EASY_UI", str(_fake_easy_ui(tmp_path, answer)))
+def test_reviewers_hostile_easy_ui_is_refused(proj, keys, tmp_path, monkeypatch):
+    attack = Path("/tmp/mesreview/attack/fake-easy-ui")
+    if not attack.exists():
+        pytest.skip("the reviewer's file is not on this computer")
+    exe = tmp_path / "fake-easy-ui"
+    exe.write_text(f"#!{sys.executable}\n" + attack.read_text().split("\n", 1)[1])
+    exe.chmod(0o755)
+    monkeypatch.setenv("MES_EASY_UI", str(exe))
     with pytest.raises(Refused) as e:
-        _plan(proj, keys, tmp_path)
+        _plan(proj, keys, tmp_path, allow_hosts=["box.example.ts.net"])
     assert e.value.code == "unsafe_web_unit"
 
 
-def test_easy_ui_folders_are_compared_with_the_plan(proj, keys, tmp_path, monkeypatch):
-    base = str(tmp_path / "srv" / "demo")
-    good = [{"path": base, "owner": "mes-demo", "group": "mes-demo-web", "mode": "0710"},
-            {"path": base + "/ui", "owner": "mes-demo", "group": "mes-demo-web", "mode": "2750"},
-            {"path": base + "/ui/auth", "owner": "mes-demo-web", "group": "mes-demo-web", "mode": "0700"}]
-    answer = {"units": {"mes-demo-web.service": GOOD_SERVICE}, "folders": good}
-    monkeypatch.setenv("MES_EASY_UI", str(_fake_easy_ui(tmp_path, answer)))
-    assert not any("easy-ui expects" in n for n in _plan(proj, keys, tmp_path).notes)
-    answer["folders"] = good + [{"path": base + "/ui/new", "owner": "mes-demo", "group": "mes-demo", "mode": "0700"}]
-    monkeypatch.setenv("MES_EASY_UI", str(_fake_easy_ui(tmp_path, answer)))
-    assert any("ui/new" in n for n in _plan(proj, keys, tmp_path).notes)
+def test_dashboard_needs_a_web_address(proj, keys, tmp_path, monkeypatch):
+    monkeypatch.setenv("MES_EASY_UI", str(_fake_easy_ui(tmp_path, _web_answer(tmp_path))))
+    plan = _plan(proj, keys, tmp_path)
+    assert not plan.web_units and any("--allow-host" in n for n in plan.notes)
+    with pytest.raises(UsageError):
+        _plan(proj, keys, tmp_path, origins=["http://box.example.ts.net"])
+
+
+@pytest.mark.parametrize("change", [
+    {"accounts": {"project": "mes-demo", "web": "root"}},
+    {"accounts": {"project": "mes-demo", "web": "mes-demo"}},
+    {"ui_dir": "/var/lib/mes/other/ui"},
+    {"auth_dir": "/tmp/auth"},
+    {"auth_dir": None},
+    {"socket": "/run/x.sock"},
+    {"socket_owner": "mes-demo-web"},
+    {"exec": "/usr/bin/python3"},
+    {"memory_max": "256M\nUser=root"},
+    {"memory_max": "infinity"},
+    {"origins": []},
+    {"origins": ["http://box.example.ts.net"]},
+    {"origins": [ORIGIN, "https://evil.example.com"]},
+    {"origins": ["https://box.example.ts.net\nExecStartPre=+/bin/id"]},
+    {"exec_start": ["/bin/sh", "-c", "id"]},
+    {"unit_names": {"socket": "sshd.socket", "service": "sshd.service"}},
+    {"root": "/"},
+])
+def test_unsafe_dashboard_parameters_are_refused(proj, keys, tmp_path, monkeypatch, change):
+    monkeypatch.setenv("MES_EASY_UI", str(_fake_easy_ui(tmp_path, _web_answer(tmp_path, **change))))
+    with pytest.raises(Refused) as e:
+        _plan(proj, keys, tmp_path, allow_hosts=["box.example.ts.net"])
+    assert e.value.code == "unsafe_web_unit"
+
+
+def test_plan_refuses_a_mes_inside_the_project(proj, keys, tmp_path, monkeypatch):
+    """Finding 1: the guides said 'uv run mes server plan', i.e. the root script came from the mes
+    in the project's own virtual environment, which the project's code can change."""
+    venv = proj / ".venv"
+    (venv / "bin").mkdir(parents=True)
+    monkeypatch.setattr(server.sys, "prefix", str(venv))
+    with pytest.raises(Refused) as e:
+        _plan(proj, keys, tmp_path)
+    assert e.value.code == "tool_in_project" and "/usr/local/bin/mes" in e.value.hint
+
+
+def test_plan_refuses_a_login_key_that_also_signs(proj, keys, tmp_path):
+    """Finding 5: with one key for both, a stolen key deploys anything."""
+    with pytest.raises(Refused) as e:
+        server.build_plan(proj, "demo", server_root=str(tmp_path / "srv"), tools=dict(TOOLS),
+                          key_files=[f"deploy={keys['signer']}"], signer_files=[str(keys["signer"])])
+    assert e.value.code == "same_key"
 
 
 def test_without_easy_ui_the_plan_says_so(proj, keys, tmp_path):
@@ -501,6 +622,15 @@ def test_plan_without_out_prints_the_script(proj):
 def test_remove_script(tmp_path):
     keep = server.render_remove("demo", server_root=str(tmp_path / "srv"), units_dir=str(tmp_path / "u"))
     assert "--confirm" in keep and "KEEPS the data" in keep and "chown -R -P root:root" in keep
+    for sub in ("auth", "gate", "webhook", "code", "etc", "home"):
+        assert f"rm -rf --one-file-system -- {shlex.quote(f'{tmp_path}/srv/demo/{sub}')}" in keep, sub
+    # Finding 15: running instances and leftover processes are stopped before the accounts go.
+    lines = keep.splitlines()
+    first_userdel = next(i for i, ln in enumerate(lines) if "userdel" in ln)
+    for needle in ("systemctl stop -- 'mes-demo.*' 'mes-demo-web.*'", 'pkill -KILL -u "$acct"',
+                   'loginctl terminate-user "$acct"', 'pgrep -u "$acct"'):
+        i = next(i for i, ln in enumerate(lines) if needle in ln)
+        assert i < first_userdel, needle
     assert f"rm -rf --one-file-system -- {shlex.quote(f'{tmp_path}/srv/demo/data')}" not in keep
     assert "mes-demo-web.socket" in keep and "mes-demo-web.service" in keep
     gone = server.render_remove("demo", delete_data=True)
@@ -558,18 +688,23 @@ def test_check_passes_on_a_server_that_matches_the_plan(proj, keys, tmp_path):
     pw = types.SimpleNamespace
     accounts = {"mes-demo": pw(pw_uid=1001, pw_gid=1001, pw_shell=f"{base}/etc/gate-shell"),
                 "mes-demo-web": pw(pw_uid=1002, pw_gid=1002, pw_shell="/usr/sbin/nologin")}
-    d = stat.S_IFDIR
+    d, f = stat.S_IFDIR, stat.S_IFREG
     files = {
-        base: _st(d | 0o711), f"{base}/etc": _st(d | 0o755), f"{base}/home": _st(d | 0o755),
-        f"{base}/home/.ssh": _st(d | 0o755), f"{base}/code": _st(d | 0o700, 1001, 1001),
+        "/": _st(d | 0o755), "/bin": _st(d | 0o755),
+        base: _st(d | 0o711), f"{base}/etc": _st(d | 0o750, 0, 1001), f"{base}/home": _st(d | 0o750, 0, 1001),
+        f"{base}/home/.ssh": _st(d | 0o750, 0, 1001), f"{base}/code": _st(d | 0o700, 1001, 1001),
         f"{base}/data": _st(d | 0o700, 1001, 1001), f"{base}/state": _st(d | 0o700, 1001, 1001),
-        f"{base}/store": _st(d | 0o700, 1001, 1001), f"{base}/ui": _st(d | 0o2750, 1001, 1002),
+        f"{base}/store": _st(d | 0o700, 1001, 1001), f"{base}/gate": _st(d | 0o700, 1001, 1001),
+        f"{base}/webhook": _st(d | 0o700, 1001, 1001), f"{base}/backups": _st(d | 0o700, 1001, 1001),
+        f"{base}/ui": _st(d | 0o2750, 1001, 1002),
         f"{base}/ui/data": _st(d | 0o2750, 1001, 1002), f"{base}/ui/specs": _st(d | 0o2750, 1001, 1002),
-        f"{base}/ui/auth": _st(d | 0o700, 1002, 1002), f"{base}/log": _st(d | 0o750, 0, 1001),
-        f"{base}/etc/allowed_signers": _st(stat.S_IFREG | 0o644), f"{base}/etc/gate-shell": _st(stat.S_IFREG | 0o755),
-        f"{base}/etc/server.toml": _st(stat.S_IFREG | 0o644),
-        f"{base}/home/.ssh/authorized_keys": _st(stat.S_IFREG | 0o644),
-        "/bin/sh": _st(stat.S_IFREG | 0o755), os.path.realpath("/bin/sh"): _st(stat.S_IFREG | 0o755),
+        f"{base}/auth": _st(d | 0o700, 1002, 1002), f"{base}/log": _st(d | 0o750, 0, 1001),
+        f"{base}/etc/allowed_signers": _st(f | 0o640, 0, 1001), f"{base}/etc/gate-shell": _st(f | 0o750, 0, 1001),
+        f"{base}/etc/server.toml": _st(f | 0o640, 0, 1001),
+        f"{base}/home/.ssh/authorized_keys": _st(f | 0o640, 0, 1001),
+        "/bin/sh": _st(f | 0o755), "/opt": _st(d | 0o755), "/opt/mes": _st(d | 0o755),
+        "/opt/mes/tools": _st(d | 0o755), "/opt/mes/tools/my-easy-software": _st(d | 0o755),
+        "/opt/mes/tools/my-easy-software/bin": _st(d | 0o755), units.DEFAULT_MES_PYTHON: _st(f | 0o755),
     }
     active = {n for n in plan.units if n.endswith((".timer", ".socket", ".path"))}
     probe, texts = _probe(tmp_path, accounts, files, active)
@@ -587,9 +722,44 @@ def test_check_passes_on_a_server_that_matches_the_plan(proj, keys, tmp_path):
     result = server.run_check("demo", project_dir=str(proj), probe=probe)
     units_item = next(i for i in result["items"] if i["id"] == "units")
     assert units_item["status"] == "todo" and first in units_item["why"]
+    # --no-describe never reads the project or asks easy-ui.
+    result = server.run_check("demo", project_dir=str(proj), probe=probe, describe=False)
+    assert next(i for i in result["items"] if i["id"] == "units-plan")["status"] == "skipped"
+    # Finding 12: etc/ readable by everyone is reported.
+    files[f"{base}/etc"] = _st(d | 0o755, 0, 1001)
+    result = server.run_check("demo", project_dir=str(proj), probe=probe)
+    assert next(i for i in result["items"] if i["id"] == "folders")["status"] == "todo"
+    files[f"{base}/etc"] = _st(d | 0o750, 0, 1001)
+    # A key line that only mentions the gate somewhere is not a forced command.
+    texts[f"{base}/home/.ssh/authorized_keys"] = ("ssh-ed25519 " + "A" * 68 + ' x restrict,command="/bin/sh gate '
+                                                  '--project demo --allow read --server-root /var/lib/mes"\n')
+    result = server.run_check("demo", project_dir=str(proj), probe=probe)
+    assert next(i for i in result["items"] if i["id"] == "keys-forced")["status"] == "todo"
+    # A tool in a folder others can change is reported (every folder on the way is checked).
+    files["/opt/mes/tools"] = _st(d | 0o777)
+    result = server.run_check("demo", project_dir=str(proj), probe=probe)
+    assert next(i for i in result["items"] if i["id"] == "tool-mes_python")["status"] == "todo"
 
 
-def test_empty_capability_lines_are_fine(proj, keys, tmp_path, monkeypatch):
-    service = GOOD_SERVICE + "AmbientCapabilities=\nCapabilityBoundingSet=\n"
-    monkeypatch.setenv("MES_EASY_UI", str(_fake_easy_ui(tmp_path, {"units": {"mes-demo-web.service": service}})))
-    assert "mes-demo-web.service" in _plan(proj, keys, tmp_path).web_units
+def test_check_says_what_it_cannot_see_without_root(tmp_path):
+    base = "/var/lib/mes/demo"
+    pw = types.SimpleNamespace
+    accounts = {"mes-demo": pw(pw_uid=1001, pw_gid=1001, pw_shell=f"{base}/etc/gate-shell")}
+    d = stat.S_IFDIR
+    files = {base: _st(d | 0o711), f"{base}/etc": _st(d | 0o750, 0, 1001)}
+
+    def lstat(path):
+        if path.startswith(f"{base}/etc/"):
+            raise PermissionError(path)
+        if path not in files:
+            raise FileNotFoundError(path)
+        return files[path]
+
+    probe = server.ServerProbe(getpwnam=lambda n: accounts[n] if n in accounts else (_ for _ in ()).throw(KeyError(n)),
+                               getgrall=lambda: [], lstat=lstat, read=lambda p: (_ for _ in ()).throw(OSError(p)),
+                               run=lambda argv: (3, "inactive"))
+    result = server.run_check("demo", probe=probe)
+    item = next(i for i in result["items"] if i["id"] == "file-etc-allowed_signers")
+    assert item["status"] == "skipped" and "only root and mes-demo" in item["why"]
+
+

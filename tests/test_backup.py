@@ -38,6 +38,15 @@ else:
 
 
 @pytest.fixture(autouse=True)
+def own_home(tmp_path, monkeypatch):
+    """No real ~/.ssh/mes-sign may take part: HOME is a fresh folder."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    return home
+
+
+@pytest.fixture(autouse=True)
 def with_backup_commands(monkeypatch):
     if "mes.backup" not in cli.COMMAND_MODULES:
         monkeypatch.setattr(cli, "COMMAND_MODULES", cli.COMMAND_MODULES + ("mes.backup",))
@@ -54,6 +63,7 @@ def project(tmp_path):
     (data / "raw" / "notes.jsonl").write_text('{"text": "hello"}\n')
     (data / "keeper.sqlite").write_bytes(os.urandom(5000))
     (state / "runs.jsonl").write_text("{}\n")
+    (state / "cursor.json").write_text('{"page": 3}\n')
     return root
 
 
@@ -66,7 +76,8 @@ def run(*argv):
 
 def _tree(folder: Path) -> dict[str, bytes]:
     return {p.relative_to(folder).as_posix(): p.read_bytes() for p in sorted(folder.rglob("*"))
-            if p.is_file() and not any(part.startswith(".before-restore-") for part in p.relative_to(folder).parts)}
+            if p.is_file() and not any(part.startswith(".before-restore-") for part in p.relative_to(folder).parts)
+            and p.name not in ("runs.jsonl", "runs.jsonl.head")}
 
 
 def test_backup_and_restore_round_trip(project, tmp_path):
@@ -76,6 +87,9 @@ def test_backup_and_restore_round_trip(project, tmp_path):
     code, out = run("backup", "--project-dir", str(project), "--to", str(dest))
     assert code == 0, out
     assert out["verified"] is True and out["files"] == 3 and out["store"] is False
+    assert out["signed"] is False and any("integrity" in n and out["sha256"] in n for n in out["notes"])
+    names = {n for n, *_ in archive.read_members(out["archive"])}
+    assert "state/runs.jsonl" not in names  # the run log is never part of a backup
     arc = Path(out["archive"])
     assert arc.name.startswith("keeper-") and arc.name.endswith(".tar.gz")
     assert stat.S_IMODE(arc.stat().st_mode) == 0o600 and stat.S_IMODE(dest.stat().st_mode) == 0o700
@@ -88,6 +102,8 @@ def test_backup_and_restore_round_trip(project, tmp_path):
     shutil.rmtree(state)
     code, ask = run("restore", "keeper", str(arc), "--project-dir", str(project))
     assert code == 6 and ask["status"] == "needs_input" and "--yes" in ask["rerun"]
+    assert ask["recommended"] == "no"
+    assert "NOT signed" in ask["why"] and out["sha256"] in ask["why"]
     assert not data.exists() or not any(data.iterdir())
     code, out = run("restore", "keeper", str(arc), "--project-dir", str(project), "--yes")
     assert code == 0, out
@@ -261,14 +277,15 @@ def test_kinds(project, tmp_path, monkeypatch):
 def test_server_layout(tmp_path):
     root = tmp_path / "srv"
     layout = paths.server_layout("keeper", root)
-    for d in (layout.data, layout.state, layout.current_project):
-        d.mkdir(parents=True)
+    for d in (layout.data, layout.state, layout.current_project, layout.base / "backups"):
+        d.mkdir(parents=True, exist_ok=True)
         os.chmod(d, 0o700)
     (layout.current_project / "project.toml").write_text(PROJECT_TOML)
     (layout.data / "x.txt").write_text("server data")
     code, out = run("backup", "keeper", "--server-root", str(root))
     assert code == 0, out
-    assert Path(out["archive"]).parent == layout.state / "backups"
+    # Audit F4: never in state/, which the project's jobs can change.
+    assert Path(out["archive"]).parent == layout.base / "backups"
     code, out2 = run("backup", "keeper", "--server-root", str(root))
     names = {n for n, *_ in archive.read_members(out2["archive"])}
     assert not any(n.startswith("state/backups") for n in names)
@@ -290,3 +307,227 @@ def test_verify_archive_refuses_missing_info(tmp_path):
 def test_restore_missing_archive(project, tmp_path):
     code, out = run("restore", str(tmp_path / "nope.tar.gz"), "--project-dir", str(project), "--yes")
     assert code == 3
+
+
+# --------------------------------------------------------------------------- audit F3: origin
+
+
+needs_keygen = pytest.mark.skipif(__import__("shutil").which("ssh-keygen") is None, reason="needs ssh-keygen")
+
+
+def _key(tmp_path, name="sign"):
+    import subprocess
+
+    k = tmp_path / name
+    subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "t", "-f", str(k)], check=True)
+    return k
+
+
+def _wipe():
+    import shutil
+
+    shutil.rmtree(paths.project_data_dir("keeper"), ignore_errors=True)
+    shutil.rmtree(paths.project_state_dir("keeper"), ignore_errors=True)
+
+
+@needs_keygen
+def test_signed_backup_round_trip(project, tmp_path):
+    key = _key(tmp_path)
+    code, out = run("backup", "--project-dir", str(project), "--to", str(tmp_path / "b"), "--key", str(key))
+    assert code == 0, out
+    assert out["signed"] is True and Path(out["signature"]).is_file()
+    assert stat.S_IMODE(Path(out["signature"]).stat().st_mode) == 0o600
+    _wipe()
+    code, ask = run("restore", out["archive"], "--project-dir", str(project), "--signer", f"{key}.pub")
+    assert code == 6 and "signed by SHA256:" in ask["why"] and ask["recommended"] == "no"
+    code, res = run("restore", out["archive"], "--project-dir", str(project), "--signer", f"{key}.pub", "--yes")
+    assert code == 0, res
+    assert res["signed"] is True
+
+
+@needs_keygen
+def test_a_backup_signed_by_someone_else_or_changed_is_refused(project, tmp_path):
+    """Audit F3: anyone could make a backup that restores as genuine."""
+    mine, stranger = _key(tmp_path, "mine"), _key(tmp_path, "stranger")
+    code, out = run("backup", "--project-dir", str(project), "--to", str(tmp_path / "b"), "--key", str(stranger))
+    assert code == 0, out
+    _wipe()
+    code, res = run("restore", out["archive"], "--project-dir", str(project), "--signer", f"{mine}.pub", "--yes")
+    assert code == 5 and res["error"]["code"] == "bad_signature"
+    paths.project_data_dir("keeper", create=True).joinpath("x.txt").write_text("again")
+    code, out = run("backup", "--project-dir", str(project), "--to", str(tmp_path / "c"), "--key", str(mine))
+    assert code == 0, out
+    _wipe()
+    raw = bytearray(Path(out["archive"]).read_bytes())
+    raw[-40] ^= 1
+    Path(out["archive"]).write_bytes(bytes(raw))
+    code, res = run("restore", out["archive"], "--project-dir", str(project), "--signer", f"{mine}.pub", "--yes")
+    assert code == 5 and res["error"]["code"] == "bad_signature"
+    assert not paths.project_data_dir("keeper").exists() or not any(paths.project_data_dir("keeper").iterdir())
+
+
+@needs_keygen
+def test_an_unsigned_backup_is_refused_when_a_signing_key_is_set_up(project, tmp_path, own_home):
+    code, out = run("backup", "--project-dir", str(project), "--to", str(tmp_path / "b"))
+    assert code == 0 and out["signed"] is False
+    (own_home / ".ssh").mkdir()
+    _key(own_home / ".ssh", "mes-sign")  # the default signing key now exists
+    _wipe()
+    code, res = run("restore", out["archive"], "--project-dir", str(project), "--yes")
+    assert code == 5 and res["error"]["code"] == "unsigned"
+    code, res = run("restore", out["archive"], "--project-dir", str(project), "--yes", "--allow-unsigned")
+    assert code == 0 and res["signed"] is False and "NOT signed" in res["message"]
+    # And new backups are signed with it without asking.
+    code, out = run("backup", "--project-dir", str(project), "--to", str(tmp_path / "c"))
+    assert code == 0 and out["signed"] is True
+
+
+@needs_keygen
+def test_a_signed_backup_without_a_key_to_check_it_is_refused(project, tmp_path):
+    key = _key(tmp_path)
+    code, out = run("backup", "--project-dir", str(project), "--to", str(tmp_path / "b"), "--key", str(key))
+    _wipe()
+    code, res = run("restore", out["archive"], "--project-dir", str(project), "--yes")
+    assert code == 5 and res["error"]["code"] == "no_signer_key"
+
+
+def _rewrite(good: Path, bad: Path, change_info=None, extra=()):
+    members = []
+    for name, kind, mode, size, chunks in archive.read_members(good):
+        blob = b"".join(chunks)
+        if kind == "file":
+            members.append((name, blob))
+    info = json.loads(dict(members)[backup.BACKUP_INFO])
+    for name, blob in extra:
+        members.append((name, blob))
+        import hashlib
+
+        info["files"].append({"path": name, "size": len(blob), "sha256": hashlib.sha256(blob).hexdigest()})
+    if change_info:
+        change_info(info)
+    new = json.dumps(info).encode()
+    entries = [(_info(n, new if n == backup.BACKUP_INFO else b), new if n == backup.BACKUP_INFO else b)
+               for n, b in members]
+    _evil_archive(bad, entries)
+
+
+@pytest.mark.parametrize("created", ["yesterday", "2026-01-01T00:00:00", "2026-01-01T00:00:00+00:00\nRun: rm -rf ~",
+                                     12345, None])
+def test_created_must_be_a_real_timestamp(project, tmp_path, created):
+    """Audit F3: 'created' went into the question shown to the person as it was."""
+    code, out = run("backup", "--project-dir", str(project), "--to", str(tmp_path / "b"))
+    bad = tmp_path / "bad.tar.gz"
+    _rewrite(Path(out["archive"]), bad, change_info=lambda i: i.update(created=created))
+    _wipe()
+    code, res = run("restore", str(bad), "--project-dir", str(project))
+    assert code == 5 and res["error"]["code"] == "backup_broken"
+
+
+def test_the_run_log_and_gate_log_are_never_restored(project, tmp_path):
+    code, out = run("backup", "--project-dir", str(project), "--to", str(tmp_path / "b"))
+    bad = tmp_path / "old.tar.gz"
+    _rewrite(Path(out["archive"]), bad, extra=[("state/runs.jsonl", b'{"forged": true}\n'),
+                                              ("state/gate/gate-log.jsonl", b'{"forged": true}\n')])
+    state = paths.project_state_dir("keeper")
+    log_before = (state / "runs.jsonl").read_text()
+    code, ask = run("restore", str(bad), "--project-dir", str(project), "--replace")
+    assert code == 6 and "forged" not in json.dumps(ask)
+    code, res = run("restore", str(bad), "--project-dir", str(project), "--replace", "--yes")
+    assert code == 0, res
+    assert (state / "runs.jsonl").read_text() == log_before  # neither replaced nor moved aside
+    assert not (state / "gate").exists()
+    assert set(res["not_restored"]) == {"state/runs.jsonl", "state/gate/gate-log.jsonl"}
+
+
+# --------------------------------------------------------------------------- audit F4: who and where
+
+
+def test_backup_and_restore_refuse_root(project, tmp_path, monkeypatch):
+    monkeypatch.setattr(backup.os, "geteuid", lambda: 0)
+    code, out = run("backup", "--project-dir", str(project), "--to", str(tmp_path / "b"))
+    assert code == 5 and out["error"]["code"] == "as_root"
+    code, out = run("restore", str(tmp_path / "x.tar.gz"), "--project-dir", str(project), "--yes")
+    assert code == 5 and out["error"]["code"] == "as_root"
+
+
+def test_folders_of_another_account_are_refused(project, tmp_path, monkeypatch):
+    code, out = run("backup", "--project-dir", str(project), "--to", str(tmp_path / "b"))
+    me = os.geteuid()
+    dest = tmp_path / "other-dest"
+    monkeypatch.setattr(backup.os, "geteuid", lambda: me + 4242)
+    code, res = run("restore", out["archive"], "--project-dir", str(project), "--replace", "--yes")
+    assert code == 5 and res["error"]["code"] == "not_owner"
+    code, res = run("backup", "--project-dir", str(project), "--to", str(dest))
+    assert code == 5 and res["error"]["code"] in ("not_owner", "unsafe_folder")
+
+
+def test_a_data_folder_that_is_a_link_is_refused(project, tmp_path):
+    import shutil
+
+    code, out = run("backup", "--project-dir", str(project), "--to", str(tmp_path / "b"))
+    data = paths.project_data_dir("keeper")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    shutil.rmtree(data)
+    data.symlink_to(elsewhere)
+    code, res = run("restore", out["archive"], "--project-dir", str(project), "--replace", "--yes")
+    assert code == 5 and res["error"]["code"] == "unsafe_folder"
+    assert list(elsewhere.iterdir()) == []
+    code, res = run("backup", "--project-dir", str(project), "--to", str(tmp_path / "c"))
+    assert code == 5 and res["error"]["code"] == "unsafe_folder"
+
+
+def test_restore_never_writes_through_a_link_planted_in_a_skipped_name(tmp_path):
+    """Audit F4: a name restore leaves alone (state/backups on a server) could be a link, and the
+    files from the archive were then moved into wherever it pointed."""
+    root = tmp_path / "srv"
+    layout = paths.server_layout("keeper", root)
+    for d in (layout.data, layout.state, layout.current_project, layout.base / "backups"):
+        d.mkdir(parents=True, exist_ok=True)
+        os.chmod(d, 0o700)
+    (layout.current_project / "project.toml").write_text(PROJECT_TOML)
+    (layout.data / "x.txt").write_text("server data")
+    code, out = run("backup", "keeper", "--server-root", str(root))
+    assert code == 0, out
+    bad = tmp_path / "bad.tar.gz"
+    _rewrite(Path(out["archive"]), bad, extra=[("state/backups/planted.txt", b"evil"),
+                                              ("data/.before-restore-x/planted.txt", b"evil")])
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (layout.state / "backups").symlink_to(elsewhere)
+    code, res = run("restore", "keeper", str(bad), "--server-root", str(root), "--replace", "--yes")
+    assert code == 0, res
+    assert list(elsewhere.iterdir()) == []
+    assert (layout.state / "backups").is_symlink()  # left alone, not followed
+    assert not (layout.data / ".before-restore-x").exists()
+
+
+def test_backup_reads_files_without_following_links(project, tmp_path):
+    """Audit F4: a link planted as a file in a live folder is skipped, never read."""
+    secret = tmp_path / "owners-secret"
+    secret.write_text("private")
+    data = paths.project_data_dir("keeper")
+    (data / "raw" / "innocent.txt").symlink_to(secret)
+    code, out = run("backup", "--project-dir", str(project), "--to", str(tmp_path / "b"))
+    assert code == 0
+    assert {"path": "data/raw/innocent.txt", "why": "a link to somewhere else"} in out["skipped"]
+    for name, kind, mode, size, chunks in archive.read_members(out["archive"]):
+        assert b"private" not in b"".join(chunks)
+
+
+def test_rename_never_replaces(tmp_path):
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.mkdir()
+    b.mkdir()
+    (a / "f").write_text("new")
+    (b / "f").write_text("old")
+    fa, fb = os.open(a, os.O_RDONLY), os.open(b, os.O_RDONLY)
+    try:
+        with pytest.raises(Refused):
+            backup._rename_noreplace(fa, "f", fb, "f")
+        assert (b / "f").read_text() == "old"
+        backup._rename_noreplace(fa, "f", fb, "g")
+        assert (b / "g").read_text() == "new"
+    finally:
+        os.close(fa)
+        os.close(fb)

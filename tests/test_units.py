@@ -88,6 +88,7 @@ EXPECTED_FILES = sorted([
     "mes-demo.job.export.service",
     "mes-demo.ui-refresh.service",
     "mes-demo.webhook.socket", "mes-demo.webhook.service",
+    "mes-demo.selftest.path", "mes-demo.selftest.service",
 ])
 
 SANDBOX_KEYS = {line.split("=", 1)[0] for line in units.SANDBOX_LINES}
@@ -97,11 +98,13 @@ DIRECTIVES = {
         "Type", "User", "Group", "ExecStart", "ExecStopPost", "WorkingDirectory", "Environment", "Slice",
         "MemoryMax", "MemorySwapMax", "TimeoutStartSec", "RuntimeMaxSec", "StandardInput", "StandardOutput",
         "StandardError", "ReadWritePaths", "InaccessiblePaths", "PrivateNetwork", "RestrictAddressFamilies",
-        "IPAddressDeny",
+        "IPAddressDeny", "TemporaryFileSystem", "BindPaths", "BindReadOnlyPaths", "RuntimeDirectory",
+        "RuntimeDirectoryMode", "RuntimeDirectoryPreserve",
     },
     "Timer": {"OnCalendar", "Persistent", "RandomizedDelaySec", "Unit"},
     "Path": {"PathModified", "Unit"},
-    "Socket": {"ListenStream", "SocketUser", "SocketGroup", "SocketMode", "Accept", "MaxConnections", "Service"},
+    "Socket": {"ListenStream", "SocketUser", "SocketGroup", "SocketMode", "Accept", "MaxConnections", "Service",
+               "DirectoryMode"},
     "Install": {"WantedBy"},
 }
 
@@ -164,7 +167,8 @@ def split_exec(value: str) -> list[str]:
 
 def _is_project_code(name: str) -> bool:
     return ".job." in name and name.endswith(".service") or name.endswith("@.service") \
-        or name.endswith(".ui-refresh.service") or name.endswith(".webhook.service")
+        or name.endswith(".ui-refresh.service") or name.endswith(".webhook.service") \
+        or name.endswith(".selftest.service")
 
 
 # =========================================================================== golden files
@@ -230,17 +234,32 @@ def test_project_code_runs_sandboxed_as_the_project_account(files, layout, name)
     assert one(text, "RestrictAddressFamilies")
     assert one(text, "Slice") == units.SLICE
     # Writable folders: only the project's own, and the code only for deploys.
-    allowed = {str(layout.data), str(layout.state), str(layout.store), str(layout.ui), str(layout.triggers)}
+    allowed = {str(layout.data), str(layout.state), str(layout.store), str(layout.ui), str(layout.webhook)}
     if "gate-deploy" in name:
         allowed.add(str(layout.code))
-    for value in values(text, "ReadWritePaths"):
-        for p in value.split():
-            assert p in allowed, (name, p)
-    # The webhook key is readable only by the webhook receiver, which checks signatures with it.
-    hides_key = any(str(layout.webhook_key) in v for v in values(text, "InaccessiblePaths"))
+    if name.endswith(".selftest.service"):
+        allowed.add(f"-{layout.gate}/selftest")  # the probe's answer: no job sees it
+    for key in ("ReadWritePaths", "BindPaths"):
+        for value in values(text, key):
+            for p in value.split():
+                assert p in allowed, (name, p)
+    # Of /var/lib/mes only its own project's folders are there; never auth/, gate/ or another project.
+    assert one(text, "TemporaryFileSystem") == f"{layout.root}:ro"
+    shown = " ".join(values(text, "BindPaths") + values(text, "BindReadOnlyPaths")).split()
+    for p in shown:
+        src = p.split(":")[0].lstrip("-")
+        assert src.startswith(str(layout.base) + "/") or src.startswith("/run/mes-demo-net/"), (name, p)
+        assert not src.startswith(str(layout.auth)), (name, p)
+        assert not src.startswith(str(layout.gate)) or (name.endswith(".selftest.service")
+                                                         and src == f"{layout.gate}/selftest"), (name, p)
+    # The gate's sockets and the webhook key are hidden from everything that runs project code
+    # (the webhook receiver checks signatures with the key, so only it may read it).
+    hidden = " ".join(values(text, "InaccessiblePaths")).split()
+    assert "-/run/mes-demo-gate" in hidden, name
+    hides_key = f"-{layout.webhook_key}" in hidden
     assert hides_key == (name != "mes-demo.webhook.service"), name
     env = values(text, "Environment")
-    assert f'"MES_PROJECT=demo"' in env and f'"MES_DATA_DIR={layout.data}"' in env
+    assert '"MES_PROJECT=demo"' in env and f'"MES_DATA_DIR={layout.data}"' in env
     assert not any("PATH=" in e and "MES_" not in e for e in env if e.startswith('"PATH='))
 
 
@@ -261,40 +280,46 @@ def test_job_with_hosts_reaches_only_what_the_helper_allows(files):
     assert one(sync, "Requires") == "mes-demo.net.sync.service"
     assert one(sync, "After") == "mes-demo.net.sync.service"
     assert "# network: only api.example.com, auth.example.com" in sync
+    # Its own hosts file is its only name lookup: no DNS server, no system name service.
+    assert "/run/mes-demo-net/sync/hosts:/etc/hosts" in values(sync, "BindReadOnlyPaths")
+    hidden = one(sync, "InaccessiblePaths").split()
+    assert {"-/run/systemd/resolve", "-/run/dbus"} <= set(hidden)
 
     net = files["mes-demo.net.sync.service"]
     assert values(net, "User") == []  # root: only root may change another unit's settings
     assert split_exec(one(net, "ExecStart")) == [
-        MES, "jobs", "allow-network", "--unit", "mes-demo.job.sync.service", "--",
+        *units.ROOT_ENV, units.DEFAULT_MES_PYTHON, "-I", "-m", "mes", "jobs", "allow-network",
+        "--unit", "mes-demo.job.sync.service", "--hosts-file", "/run/mes-demo-net/sync/hosts", "--",
         "api.example.com", "auth.example.com"]
     assert one(net, "CapabilityBoundingSet") == "CAP_SYS_ADMIN"
     assert one(net, "Before") == "mes-demo.job.sync.service"
+    assert one(net, "RuntimeDirectory") == "mes-demo-net/sync"
     for line in ("NoNewPrivileges=yes", "ProtectSystem=strict", "ProtectHome=yes", "PrivateTmp=yes",
                  "SystemCallFilter=@system-service"):
         assert line in net.split("\n")
     assert values(net, "ReadWritePaths") == [] and values(net, "WorkingDirectory") == ["/"]
 
 
-def test_job_service_runs_the_app_and_records_as_root(files, layout):
-    sync = files["mes-demo.job.sync.service"]
-    assert one(sync, "Type") == "oneshot"
-    assert split_exec(one(sync, "ExecStart")) == [
-        f"{layout.current_project}/.venv/bin/demo", "--json", "sync", "--days", "3"]
-    post = one(sync, "ExecStopPost")
-    assert post.startswith("+")
-    # Root gets only names and the fixed server folder, never anything from the project's files.
-    assert split_exec(post) == [MES, "jobs", "record", "--project", "demo", "--server-root", ROOT, "sync"]
-    assert one(sync, "MemoryMax") == "512M" and one(sync, "MemorySwapMax") == "0"
-    assert one(sync, "TimeoutStartSec") == "1200"
-    assert one(sync, "UMask") == "0077"
-    assert one(sync, "WorkingDirectory") == str(layout.current_project)
-    assert '"MES_ALLOW=write"' in values(sync, "Environment") and '"MES_JOB=sync"' in values(sync, "Environment")
-    assert one(sync, "ReadWritePaths") == f"{layout.data} {layout.store} {layout.state}"
-    assert "[Install]" not in sync
-    report = files["mes-demo.job.report.service"]
-    assert split_exec(one(report, "ExecStart"))[0] == f"{layout.current_project}/.venv/bin/demo-tool"
-    assert values(report, "ReadWritePaths") == []  # writes = []
-    assert one(files["mes-demo.job.hook.service"], "ReadWritePaths") == str(layout.state)
+def test_root_helpers_get_an_empty_environment_and_isolated_python(files):
+    """Finding 4: root ran 'mes jobs record' with the job's HOME (state/, project-writable), so a
+    user site-packages .pth there ran as root. Now root's commands start from env -i and python -I."""
+    for name, text in files.items():
+        for key in ("ExecStopPost", "ExecStart"):
+            for v in values(text, key):
+                if v.startswith("+") or (name.startswith("mes-demo.net.")):
+                    argv = split_exec(v)
+                    assert argv[:4] == list(units.ROOT_ENV), (name, v)
+                    assert argv[4:8] == [units.DEFAULT_MES_PYTHON, "-I", "-m", "mes"], (name, v)
+
+
+def test_job_with_local_network_hosts(layout):
+    p = loads('[project]\nname = "demo"\n[jobs.x]\nrun = "demo x"\nmanual = true\n'
+              'network = ["api.example.com"]\nlocal_network = ["nas.home.arpa"]\n')
+    f = units.render_project(p, layout=layout, mes=MES)
+    argv = split_exec(one(f["mes-demo.net.x.service"], "ExecStart"))
+    assert argv[argv.index("--local") + 1] == "nas.home.arpa"
+    assert argv[argv.index("--") + 1:] == ["api.example.com", "nas.home.arpa"]
+    assert "nas.home.arpa may be on the local network" in f["mes-demo.job.x.service"]
 
 
 def test_after_chain_and_dashboard_refresh(files):
@@ -306,6 +331,7 @@ def test_after_chain_and_dashboard_refresh(files):
     assert split_exec(one(ui, "ExecStart")) == [
         EASY_UI, "--json", "--project-dir", f"{ROOT}/demo/code/current/project", "data", "build"]
     assert one(ui, "UMask") == "0027" and one(ui, "ReadWritePaths") == f"{ROOT}/demo/ui"
+    assert one(ui, "BindReadOnlyPaths") == f"{ROOT}/demo/code {ROOT}/demo/data {ROOT}/demo/state"
     assert '"MES_ALLOW=read"' in values(ui, "Environment")
     assert f'"MES_ROOT={ROOT}"' in values(ui, "Environment")  # how easy-ui finds the server layout
     assert f'"MES_ROOT={ROOT}"' in values(files["mes-demo.gate-deploy@.service"], "Environment")
@@ -340,15 +366,16 @@ def test_webhook_receiver(files, layout):
     assert one(sock, "Accept") == "no"
     svc = files["mes-demo.webhook.service"]
     assert split_exec(one(svc, "ExecStart")) == [MES, "webhook", "serve", "--project", "demo", "--server-root", ROOT]
-    assert one(svc, "ReadWritePaths") == str(layout.triggers)
-    hidden = one(svc, "InaccessiblePaths").split()
-    assert {f"-{layout.data}", f"-{layout.store}", f"-{layout.code}"} <= set(hidden)
+    # Finding 10: it sees etc/ (the root-owned job list and secret) and its own folder, never code/.
+    assert one(svc, "ReadWritePaths") == str(layout.webhook)
+    assert one(svc, "BindReadOnlyPaths") == str(layout.etc)
+    assert str(layout.code) not in svc and str(layout.data) + " " not in svc
 
 
 @pytest.mark.parametrize("level", units.GATE_LEVELS)
 def test_gate_instances(files, layout, level):
     sock = files[f"mes-demo.gate-{level}.socket"]
-    assert one(sock, "ListenStream") == units.gate_socket_path("demo", level) == f"/run/mes-demo-gate-{level}.sock"
+    assert one(sock, "ListenStream") == units.gate_socket_path("demo", level) == f"/run/mes-demo-gate/{level}.sock"
     assert one(sock, "SocketUser") == "mes-demo" and one(sock, "SocketGroup") == "mes-demo"
     assert one(sock, "SocketMode") == "0600" and one(sock, "Accept") == "yes"
     svc = files[f"mes-demo.gate-{level}@.service"]
@@ -356,17 +383,50 @@ def test_gate_instances(files, layout, level):
         MES, "gate", "child", "--project", "demo", "--server-root", ROOT, "--level", level]
     assert one(svc, "StandardInput") == "socket" and one(svc, "StandardOutput") == "socket"
     hidden = one(svc, "InaccessiblePaths").split()
-    assert {f"-{layout.state}/gate", f"-{layout.webhook_key}", f"-{layout.incoming}"} <= set(hidden)
+    assert {"-/run/mes-demo-gate", f"-{layout.webhook_key}", f"-{layout.incoming}"} <= set(hidden)
     rw = values(svc, "ReadWritePaths")
     if level == "read":
         assert rw == []
     elif level == "write":
         assert rw == [f"{layout.data} {layout.state} {layout.store}"]
     else:
-        assert rw == [f"{layout.code} {layout.state} {layout.ui}"]
-        assert values(svc, "PrivateNetwork") == []  # uv sync needs the internet
+        assert rw == [f"{layout.code} {layout.ui}"]
+        assert values(svc, "PrivateNetwork") == []  # uv sync needs the package index
         assert one(svc, "RuntimeMaxSec") == "1800"
     assert one(files[f"mes-demo.gate-{level}.socket"], "MaxConnections") == ("1" if level == "deploy" else "4")
+
+
+def test_deploy_sandbox_tools_are_out_of_reach_of_jobs(files, layout):
+    """Finding 6: uv's cache and Python lived in state/, which jobs and the write key can change."""
+    svc = files["mes-demo.gate-deploy@.service"]
+    env = values(svc, "Environment")
+    assert f'"UV_CACHE_DIR={layout.code}/uv-cache"' in env
+    assert f'"UV_PYTHON_INSTALL_DIR={layout.code}/uv-python"' in env
+    assert '"UV_NO_CONFIG=1"' in env and '"UV_LINK_MODE=copy"' in env and '"HOME=/nonexistent"' in env
+    assert not any(str(layout.state) in e for e in env if e.startswith(('"UV_', '"HOME')))
+    for name, text in files.items():
+        if ".job." in name or "gate-write" in name:
+            assert str(layout.code) not in " ".join(values(text, "ReadWritePaths")), name
+
+
+def test_deploy_sandbox_cannot_reach_this_computer_or_the_local_network(files):
+    """Finding 8: uv sync ran with unrestricted network."""
+    deny = one(files["mes-demo.gate-deploy@.service"], "IPAddressDeny").split()
+    for net in ("127.0.0.0/8", "::1/128", "169.254.0.0/16", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+                "100.64.0.0/10", "fc00::/7", "fe80::/10", "224.0.0.0/4", "ff00::/8"):
+        assert net in deny
+    assert values(files["mes-demo.gate-deploy@.service"], "IPAddressAllow") == []
+
+
+def test_selftest_probe_has_a_jobs_sandbox(files, layout):
+    svc = files["mes-demo.selftest.service"]
+    assert one(svc, "PrivateNetwork") == "yes" and one(svc, "User") == "mes-demo"
+    assert split_exec(one(svc, "ExecStart")) == [MES, "server", "selftest-probe", "demo", "--context", "job",
+                                                 "--server-root", ROOT]
+    assert values(svc, "ExecStopPost") == []
+    path = files["mes-demo.selftest.path"]
+    assert one(path, "PathModified") == f"{layout.gate}/selftest-request"
+    assert one(path, "Unit") == "mes-demo.selftest.service"
 
 
 def test_project_without_ui_or_webhook_has_no_such_units(layout):
@@ -423,6 +483,8 @@ def test_tool_paths_outside_admin_folders_are_refused(project, layout, tool):
         units.render_project(project, layout=layout, mes=tool, easy_ui=EASY_UI)
     with pytest.raises(Refused):
         units.render_project(project, layout=layout, mes=MES, easy_ui=tool)
+    with pytest.raises(Refused):
+        units.render_project(project, layout=layout, mes=MES, mes_python=tool)
 
 
 # =========================================================================== hostile values
@@ -465,6 +527,10 @@ def _project(job=None, name="demo", apps=None, ui=None):
     _job(network=("api.example.com\nPrivateNetwork=no",)),
     _job(network=("evil host",)),
     _job(network=("0.0.0.0/0",)),
+    _job(network=("0x7f.0.0.1",)),
+    _job(network=("0x7f.1",)),
+    _job(network=("2130706433",)),
+    _job(local_network=("127.1",)),
     _job(writes=("data", "/etc")),
     _job(writes=("code",)),
 ])

@@ -21,27 +21,33 @@ SSH puts that text in ``SSH_ORIGINAL_COMMAND``. The gate:
    that owns the project's ``code`` folder) or in the owner's list, never in the request. The
    app must be one of the project's ``[apps]``; its program is ``<project>/.venv/bin/<cli>``.
    ``project.toml`` and the program must be changeable only by the gate's account (or root).
-3. Asks the installed app for its commands and their kinds, fresh on every request.
-4. Levels: ``read`` runs read commands; ``write`` also write commands; ``deploy`` also the
-   ``mes`` operations (``deploy``, ``rollback``, ``releases``, ``status``; see ``mes.deploy``).
-   ``admin`` commands never run through the gate, and ``--allow admin`` is refused.
-5. Runs each request in its own sandbox: on a server set up by ``mes server plan`` the request
-   is handed to a fresh, socket-activated system service instance
+3. Levels: ``read`` runs read commands; ``write`` also write commands; ``deploy`` runs only
+   the ``mes`` operations (``deploy``, ``rollback``, ``releases``, ``status``, ``selftest``; see
+   ``mes.deploy``) and never an app command. ``admin`` commands never run through the gate, and
+   ``--allow admin`` is refused.
+4. On a server the gate itself (the SSH side) runs **no project code** at all: it checks the
+   request's form and level and hands it to a fresh, socket-activated system service instance
    (``mes-<p>.gate-<level>@.service``, see ``mes.units.render_gate``) that runs as the project's
    account with the full sandbox (no new privileges, read-only system, no home folders, private
    /tmp and /dev, no capabilities, ``@system-service`` system calls, no network, memory and task
-   limits; read requests see data and state read-only). That instance checks the request again
-   and runs the program. Where those sockets do not exist (a personal machine, a Mac, a server
-   not set up yet), the gate runs the program itself with the limits of v0.1 only: time,
-   output, CPU time, file size, no core files, address space (Linux), and says so in its log.
-   If a server's socket exists but cannot be used, the request is refused (exit 75), never run
-   with less protection.
+   limits; only its own project's folders; read requests see data and state read-only). That
+   instance asks the installed app for its commands and their kinds, fresh on every request,
+   checks the kind against the level and runs the program. It first checks who connected
+   (``SO_PEERCRED`` and ``/proc/<pid>/cgroup``): only the project's own account from an SSH
+   session (a ``session-*.scope`` of logind, or sshd's own service), never a process in the
+   jobs' and requests' ``mes.slice``. A server whose sockets are missing or do not answer
+   refuses every request (exit 75); nothing is ever run with less protection.
+5. On a personal computer (no sockets) the gate asks the app for its kinds and runs it itself,
+   with the limits of v0.1 only: time, output, CPU time, file size, no core files, address
+   space (Linux), and says so in its log.
 6. Every request runs with a small fixed environment (fixed ``PATH``, ``MES_ALLOW``, the
    project's folders, no SSH agent, no tokens, no ``PYTHON*`` from outside), no input (except
    the deploy archive), a time limit and an output limit; at most ``MAX_PARALLEL`` run at once
    (exit 75 when busy).
-7. Writes one JSON line per request to ``<state>/gate/gate-log.jsonl`` before running anything
-   (and one when it finishes). If that log cannot be written, nothing is run.
+7. Writes one JSON line per request to its log before running anything (and one when it
+   finishes): on a server ``/var/lib/mes/<p>/gate/gate-log.jsonl``, a folder no job or
+   sandboxed request can write; on a personal computer ``<state>/gate/gate-log.jsonl``. If that
+   log cannot be written, nothing is run.
 
 Any unexpected problem refuses the request (fails closed). Errors are JSON on stdout when the
 request or the gate command contains ``--json`` (always for ``mes`` operations); otherwise
@@ -59,7 +65,9 @@ Public API
 ``ask_commands(program, app, *, timeout, env=None) -> dict[str, str]``
 ``handle(raw, allow, *, project, server_root=None, json_mode=False, timeout=..., max_output=...,
   source="option", stdin=None) -> Outcome``  the whole gate; never raises.
-``child_main(project, server_root, level, stdin, stdout) -> int``  the per-request instance.
+``child_main(project, server_root, level, stdin, stdout, *, peer=None) -> int``  the per-request instance.
+``peer_problem(uid, cgroup_text, *, my_uid) -> str | None``  who may connect to an instance.
+``REQUIRE_SANDBOX_ON_SERVER``  ``True``: a server without request sockets runs nothing.
 ``register(subparsers)``  adds ``mes gate`` (and ``mes projects`` from ``mes.registry``).
 """
 
@@ -116,7 +124,12 @@ CPU_GRACE = 5
 MAX_PARALLEL = 4
 SLOTS_DIR = "slots"
 MES_WORD = "mes"
-MES_OPERATIONS = ("deploy", "rollback", "releases", "status")
+MES_OPERATIONS = ("deploy", "rollback", "releases", "status", "selftest")
+# On a server, requests only ever run in their own sandbox (tests of mes itself switch this off).
+REQUIRE_SANDBOX_ON_SERVER = True
+# Who may connect to a request instance: an SSH session of the project's account.
+_SESSION_CGROUP_RE = re.compile(r"^/user\.slice/user-(?P<uid>[0-9]+)\.slice/session-[A-Za-z0-9_-]{1,64}\.scope\Z")
+_SSHD_CGROUP_RE = re.compile(r"^/system\.slice/(?:system-sshd?\.slice/)?sshd?(?:@[A-Za-z0-9:._\\-]{1,200})?\.service\Z")
 
 _COMMAND_RE = re.compile(r"[a-z][a-z0-9-]{0,40}")
 _KEEP_ENV_PERSONAL = (
@@ -142,6 +155,8 @@ class Finished:
     timed_out: bool = False
     too_big: bool = False
     isolation: str = "limits"
+    kind: str | None = None
+    reason: str | None = None
 
 
 # --------------------------------------------------------------------------- where the project is
@@ -162,7 +177,8 @@ class GateProject:
 
     @property
     def gate_dir(self) -> Path:
-        return self.state / GATE_DIR
+        # On a server: a folder of its own that no job and no sandboxed request can write.
+        return self.layout.gate if self.layout is not None else self.state / GATE_DIR
 
     def env(self) -> dict[str, str]:
         out = {
@@ -530,12 +546,6 @@ def _socket_path(where: GateProject, level: str) -> str | None:
     return units.gate_socket_path(where.name, level)
 
 
-def _app_level(allow: str) -> str:
-    """The sandbox an app command runs in: a deploy key's app commands run in the write sandbox
-    (the deploy sandbox has the internet and the code folder, which app commands never need)."""
-    return "write" if allow == "deploy" else allow
-
-
 def _send_frame(sock_file: BinaryIO, header: dict[str, Any], *payloads: bytes) -> None:
     sock_file.write(json.dumps(header, ensure_ascii=True, separators=(",", ":")).encode("ascii") + b"\n")
     for p in payloads:
@@ -592,37 +602,164 @@ def via_instance(sock_path: str, request: dict[str, Any], *, timeout: float, max
         except (OSError, socket.timeout):
             raise TemporaryFailure("The request's sandbox stopped answering, so nothing was passed on.",
                                    hint="Try again later.", code="sandbox_failed") from None
+    kind = head.get("kind") if head.get("kind") in KINDS else None
+    reason = head.get("reason") if isinstance(head.get("reason"), str) and len(head["reason"]) <= 40 else None
     return Finished(int(head.get("exit_code", 1)), out, err, bool(head.get("timed_out")), bool(head.get("too_big")),
-                    "systemd")
+                    "systemd", kind, reason)
+
+
+def _sandbox_socket(where: GateProject, level: str) -> str | None:
+    """The socket of a level's request instances on a server; ``None`` on a personal computer.
+    On a server without it, nothing runs (fails closed)."""
+    sock = _socket_path(where, level)
+    if sock is None:
+        return None
+    if os.path.exists(sock):
+        return sock
+    if REQUIRE_SANDBOX_ON_SERVER:
+        raise TemporaryFailure(
+            "This server has no sandbox for requests (its socket is missing), so nothing was run: on a server the "
+            "gate never runs a request with less protection.",
+            hint="Ask the owner to run 'mes server plan' and its script again, then: mes server check",
+            code="sandbox_unavailable",
+        )
+    return None
+
+
+def _peer_credentials(fd: int) -> tuple[int, int, int]:
+    import struct
+
+    opt = getattr(socket, "SO_PEERCRED", None)
+    if opt is None:
+        raise OSError("SO_PEERCRED is not available")
+    with socket.socket(fileno=os.dup(fd)) as s:
+        raw = s.getsockopt(socket.SOL_SOCKET, opt, struct.calcsize("3i"))
+    pid, uid, gid = struct.unpack("3i", raw)
+    return pid, uid, gid
+
+
+def peer_problem(uid: int, cgroup_text: str | None, *, my_uid: int) -> str | None:
+    """Why the process that connected to a request instance may not use it, or ``None``.
+
+    Only the project's own account (``uid == my_uid``) from an SSH session may: its cgroup is a
+    logind session scope of that account (``/user.slice/user-<uid>.slice/session-<n>.scope``) or
+    sshd's own service (servers without PAM sessions). Jobs, dashboard refreshes, webhooks and
+    other requests run in ``mes.slice``, and nothing there can enter a session scope: only root
+    (logind, for a new SSH login) puts processes into one."""
+    if uid != my_uid:
+        return "another_account"
+    if not isinstance(cgroup_text, str):
+        return "no_cgroup"
+    unified = [ln[3:] for ln in cgroup_text.splitlines() if ln.startswith("0::")]
+    if len(unified) != 1:
+        return "no_cgroup"
+    path = unified[0].strip()
+    if "mes.slice" in path.split("/"):
+        return "from_a_job"
+    m = _SESSION_CGROUP_RE.fullmatch(path)
+    if m and int(m.group("uid")) == my_uid:
+        return None
+    if _SSHD_CGROUP_RE.fullmatch(path):
+        return None
+    return "not_an_ssh_session"
+
+
+def check_peer(fd: int) -> None:
+    """Refuse (``Refused``, code ``sandbox_peer``) unless an SSH session of this account connected."""
+    try:
+        pid, uid, _ = _peer_credentials(fd)
+        with open(f"/proc/{int(pid)}/cgroup", encoding="ascii", errors="replace") as f:
+            text = f.read(4096)
+    except (OSError, ValueError):
+        uid, text = -1, None
+    problem = peer_problem(uid, text, my_uid=os.getuid())
+    if problem:
+        raise Refused(
+            "This request sandbox only takes requests from the gate of an SSH session of the project's account, "
+            "and this one came from somewhere else (for example a job), so nothing was run.",
+            hint="Connect over SSH with a key set up by 'mes server plan'.",
+            code="sandbox_peer",
+            detail=problem,
+        )
 
 
 def _execute(where: GateProject, level: str, argv_request: list[str], *, timeout: float, max_output: int,
-             program: Path, env: dict[str, str]) -> Finished:
-    sock = _socket_path(where, _app_level(level))
-    if sock is not None and os.path.exists(sock):
+             program: Path | None, env: dict[str, str], sock: str | None, json_mode: bool) -> Finished:
+    if sock is not None:
         return via_instance(sock, {"kind": "app", "request": argv_request, "timeout": timeout,
-                                   "max_output": max_output}, timeout=timeout, max_output=max_output)
+                                   "max_output": max_output, "json": json_mode},
+                            timeout=timeout, max_output=max_output)
+    assert program is not None
     done = run_limited([str(program), *argv_request[1:]], env=env, timeout=timeout, max_output=max_output,
                        cwd=str(where.folder) if where.server else "/")
     done.isolation = "limits"
     return done
 
 
-def child_main(project: str, server_root: str, level: str, stdin: BinaryIO, stdout: BinaryIO) -> int:
+def _app_in_child(where: GateProject, level: str, req: dict[str, Any], *, timeout: float,
+                  max_output: int) -> Finished:
+    request = parse_request(json.dumps(req.get("request")))
+    if request[0] == MES_WORD:
+        raise _bad_request("mes operations are not run here.")
+    _, program = _project_and_program(where, request[0])
+    kinds = ask_commands(program, request[0], env=clean_env("read", where))
+    if request[1] not in kinds:
+        raise NotFound(f'The app "{request[0]}" has no command called "{request[1]}", so nothing was run.',
+                       hint=f'See its commands with: ["{request[0]}", "describe", "--json"]')
+    try:
+        _check_kind(request[1], kinds[request[1]], level)
+    except MesError as e:
+        e.kind = kinds[request[1]]  # type: ignore[attr-defined]
+        raise
+    done = run_limited([str(program), *request[1:]], env=clean_env(level, where), timeout=timeout,
+                       max_output=max_output, cwd=str(where.folder))
+    done.kind = kinds[request[1]]
+    return done
+
+
+def describe_release(where: GateProject, number: Any) -> dict[str, Any]:
+    """The apps of a release that is installed but not switched on yet, asked in a read sandbox."""
+    if not isinstance(number, int) or number < 1 or where.layout is None:
+        raise _bad_request("Bad release number.")
+    folder = where.layout.releases / str(number) / paths.RELEASE_PROJECT_DIR
+    if folder.is_symlink() or not folder.is_dir():
+        raise NotFound(f"Release {number} is not on the server.", hint="Deploy again.", code="no_release")
+    project = manifest_mod.load(folder)
+    if project.name != where.name:
+        raise Refused("The release is for another project.", hint="Deploy the right project.", code="wrong_project")
+    commands: dict[str, dict[str, str]] = {}
+    for spec in project.apps.values():
+        program = folder / ".venv" / "bin" / spec.cli
+        if not program.is_file():
+            raise MesError(f'The app "{spec.name}" has no program "{spec.cli}" after installing, so the release '
+                           "was not switched on.", hint=f'Name the script "{spec.cli}" in [project.scripts] of '
+                           "pyproject.toml.", code="app_missing")
+        commands[spec.name] = ask_commands(program, spec.name, env=clean_env("read", where))
+    return {"release": number, "commands": commands}
+
+
+def child_main(project: str, server_root: str, level: str, stdin: BinaryIO, stdout: BinaryIO, *,
+               peer: Any = None) -> int:
     """One request inside its own system service instance (stdin/stdout are the connection).
 
-    Everything is checked again here: the request, the project, the program and the kind."""
+    ``peer`` (a callable, given by ``mes gate child``) first checks who connected. Everything is
+    then checked here: the request, the project, the program and the kind."""
     def answer(done: Finished) -> int:
         _send_frame(stdout, {"exit_code": done.returncode, "stdout_bytes": len(done.stdout),
                              "stderr_bytes": len(done.stderr), "timed_out": done.timed_out,
-                             "too_big": done.too_big}, done.stdout, done.stderr)
+                             "too_big": done.too_big, "kind": done.kind, "reason": done.reason},
+                    done.stdout, done.stderr)
         return 0
 
+    json_mode = True
+
     def refuse(e: MesError) -> int:
-        out, err = _render_error(e, True)
-        return answer(Finished(int(e.exit_code), out, err))
+        out, err = _render_error(e, json_mode)
+        return answer(Finished(int(e.exit_code), out, err, kind=getattr(e, "kind", None), reason=e.code))
 
     try:
+        if peer is not None:
+            peer()
         if level not in GATE_LEVELS:
             raise UsageError("Unknown level.", hint="Use read, write or deploy.")
         line = stdin.readline(MAX_REQUEST_BYTES + 1)
@@ -632,25 +769,24 @@ def child_main(project: str, server_root: str, level: str, stdin: BinaryIO, stdo
             raise _bad_request("The sandbox got a request it could not read.") from None
         if not isinstance(req, dict):
             raise _bad_request("The sandbox got a request it could not read.")
+        json_mode = req.get("json", True) is not False
         timeout = float(req.get("timeout", DEFAULT_TIMEOUT))
         max_output = int(req.get("max_output", DEFAULT_MAX_OUTPUT))
         if not (0 < timeout <= MAX_TIMEOUT) or not (0 < max_output <= 64 * 1024 * 1024):
             raise _bad_request("The sandbox got limits it does not accept.")
         where = locate(project, server_root)
-        if req.get("kind") == "app" and level in ("read", "write"):
-            request = parse_request(json.dumps(req.get("request")))
-            if request[0] == MES_WORD:
-                raise _bad_request("mes operations are not run here.")
-            _, program = _project_and_program(where, request[0])
-            env = clean_env(level, where)
-            kinds = ask_commands(program, request[0], env=clean_env("read", where))
-            if request[1] not in kinds:
-                raise NotFound(f'The app "{request[0]}" has no command called "{request[1]}", so nothing was run.',
-                               hint=f'See its commands with: ["{request[0]}", "describe", "--json"]')
-            _check_kind(request[1], kinds[request[1]], level)
-            return answer(run_limited([str(program), *request[1:]], env=env, timeout=timeout,
-                                      max_output=max_output, cwd=str(where.folder)))
-        if req.get("kind") in ("sync", "publish") and level == "deploy":
+        kind = req.get("kind")
+        if kind == "app" and level in ("read", "write"):
+            return answer(_app_in_child(where, level, req, timeout=timeout, max_output=max_output))
+        if kind == "describe" and level == "read":
+            body = json.dumps(describe_release(where, req.get("release")), ensure_ascii=False).encode("utf-8")
+            return answer(Finished(0, body, b""))
+        if kind == "selftest":
+            from mes import selftest
+
+            body = json.dumps(selftest.probe(where.layout, level), ensure_ascii=False).encode("utf-8")
+            return answer(Finished(0, body, b""))
+        if kind in ("sync", "publish") and level == "deploy":
             from mes import deploy
 
             result = deploy.child_step(where, req, timeout=timeout)
@@ -790,15 +926,25 @@ def _handle_request(raw: str | None, allow: str, *, project: str, server_root: A
             with contextlib.suppress(OSError):
                 _log(where, record)
             return Outcome(0, (protocol.to_json(result) + "\n").encode("utf-8"), b"")
-        _, program = _project_and_program(where, app)
-        kinds = ask_commands(program, app, env=clean_env("read", where))
-        if command not in kinds:
-            raise NotFound(
-                f'The app "{app}" has no command called "{command}", so nothing was run.',
-                hint=f'See its commands with: ["{app}", "describe", "--json"]',
+        if allow == "deploy":
+            raise NotAllowed(
+                f'A deploy key only installs releases (the "mes" operations); it never runs app commands, so '
+                f'"{app} {command}" was refused.',
+                hint="Use a read or write key for app commands.",
             )
-        record["kind"] = kinds[command]
-        _check_kind(command, kinds[command], allow)
+        sock = _sandbox_socket(where, allow)
+        program = None
+        if sock is None:
+            # A personal computer: no system sandbox, so the gate asks the app itself (limited fallback).
+            _, program = _project_and_program(where, app)
+            kinds = ask_commands(program, app, env=clean_env("read", where))
+            if command not in kinds:
+                raise NotFound(
+                    f'The app "{app}" has no command called "{command}", so nothing was run.',
+                    hint=f'See its commands with: ["{app}", "describe", "--json"]',
+                )
+            record["kind"] = kinds[command]
+            _check_kind(command, kinds[command], allow)
     except MesError as e:
         record.update(decision="refused", reason=e.code)
         with contextlib.suppress(OSError):
@@ -812,14 +958,13 @@ def _handle_request(raw: str | None, allow: str, *, project: str, server_root: A
         out, err = _render_error(_internal(e), json_mode)
         return Outcome(1, out, err)
 
-    sock = _socket_path(where, _app_level(allow))
-    record.update(decision="allowed", isolation="systemd" if sock and os.path.exists(sock) else "limits")
+    record.update(decision="allowed", isolation="systemd" if sock else "limits")
     try:
         _log(where, record)
     except OSError:
         err_ = MesError(
             "The gate could not write its log, and it never runs anything it cannot record, so nothing was run.",
-            hint="Ask the owner to check that the project's state folder exists and can be written.",
+            hint="Ask the owner to check that the project's gate folder exists and can be written.",
             code="log_unavailable",
         )
         out, err = _render_error(err_, json_mode)
@@ -829,8 +974,10 @@ def _handle_request(raw: str | None, allow: str, *, project: str, server_root: A
     finished: dict[str, Any] = {"event": "finished"}
     try:
         done = _execute(where, allow, request, timeout=timeout, max_output=max_output, program=program,
-                        env=clean_env(allow, where))
+                        env=clean_env(allow, where), sock=sock, json_mode=json_mode)
         finished["isolation"] = done.isolation
+        if done.kind:
+            finished["kind"] = done.kind
         if done.timed_out:
             stop: MesError = TemporaryFailure(
                 f'"{command}" took longer than {timeout:g} seconds, so the gate stopped it. Its output was '
@@ -850,7 +997,8 @@ def _handle_request(raw: str | None, allow: str, *, project: str, server_root: A
             result = Outcome(int(stop.exit_code), out, err)
         else:
             code = done.returncode if 0 <= done.returncode <= 255 else 1
-            finished.update(decision="done", reason=None)
+            refused = done.reason is not None and code != 0
+            finished.update(decision="refused" if refused else "done", reason=done.reason if refused else None)
             result = Outcome(code, done.stdout, done.stderr)
     except MesError as e:
         finished.update(decision="failed", reason=e.code)
@@ -869,23 +1017,48 @@ def _handle_request(raw: str | None, allow: str, *, project: str, server_root: A
     return result
 
 
+def _child_json(where: GateProject, level: str, req: dict[str, Any], timeout: float) -> dict[str, Any] | None:
+    """Ask a level's request instance for one step and return its JSON answer; ``None`` when
+    there is no sandbox (personal computers and tests of mes itself)."""
+    sock = _sandbox_socket(where, level)
+    if sock is None:
+        return None
+    done = via_instance(sock, {**req, "timeout": timeout, "max_output": DESCRIBE_MAX_OUTPUT},
+                        timeout=timeout, max_output=DESCRIBE_MAX_OUTPUT)
+    try:
+        data = json.loads(done.stdout.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        raise MesError("A deploy step did not answer correctly, so the deploy stopped.",
+                       hint="Run mes server check on the server.", code="deploy_failed") from None
+    if done.returncode != 0 or not isinstance(data, dict) or "error" in data:
+        said = data.get("error", {}) if isinstance(data, dict) and isinstance(data.get("error"), dict) else {}
+        raise MesError(str(said.get("message") or "A deploy step failed, so the deploy stopped."),
+                       hint=str(said.get("hint") or "Run mes server check on the server."),
+                       code=str(said.get("code") or "deploy_failed")[:40])
+    return data
+
+
 def _deploy_child(where: GateProject, req: dict[str, Any], timeout: float) -> dict[str, Any]:
-    """Run a deploy step (uv sync, publish) in its own sandbox when the server has one."""
-    sock = _socket_path(where, "deploy")
-    if sock is not None and os.path.exists(sock):
-        done = via_instance(sock, {**req, "timeout": timeout, "max_output": DESCRIBE_MAX_OUTPUT},
-                            timeout=timeout, max_output=DESCRIBE_MAX_OUTPUT)
-        try:
-            data = json.loads(done.stdout.decode("utf-8"))
-        except (UnicodeDecodeError, ValueError):
-            raise MesError("A deploy step did not answer correctly, so the deploy stopped.",
-                           hint="Run mes server check on the server.", code="deploy_failed") from None
-        if done.returncode != 0 or not isinstance(data, dict):
-            said = data.get("error", {}) if isinstance(data, dict) else {}
-            raise MesError(str(said.get("message") or "A deploy step failed, so the deploy stopped."),
-                           hint=str(said.get("hint") or "Run mes server check on the server."),
-                           code=str(said.get("code") or "deploy_failed"))
+    """Run a deploy step in its own sandbox: installing packages and publishing in the deploy
+    sandbox; asking the new release's apps what they are (project code) in a read sandbox, which
+    cannot change any release; the self-test probes in every sandbox."""
+    kind = req.get("kind")
+    if kind == "selftest":
+        level = req.get("level")
+        if level not in GATE_LEVELS:
+            raise _bad_request("Unknown level.")
+        data = _child_json(where, level, {"kind": "selftest"}, timeout)
+        if data is None:
+            from mes import selftest
+
+            return selftest.probe(where.layout, level)
         return data
+    level = "read" if kind == "describe" else "deploy"
+    data = _child_json(where, level, req, timeout)
+    if data is not None:
+        return data
+    if kind == "describe":
+        return describe_release(where, req.get("release"))
     from mes import deploy
 
     return deploy.child_step(where, req, timeout=timeout)
@@ -952,7 +1125,10 @@ def _handle(args: argparse.Namespace) -> Any:
 def _handle_child(args: argparse.Namespace) -> Any:
     stdin = sys.stdin.buffer
     stdout = sys.stdout.buffer
-    raise SystemExit(child_main(args.project, args.server_root, args.level, stdin, stdout))
+    # Started by systemd for one connection: stdin is that connection, and only an SSH session of
+    # this account may be on the other end.
+    raise SystemExit(child_main(args.project, args.server_root, args.level, stdin, stdout,
+                                peer=lambda: check_peer(stdin.fileno())))
 
 
 def _conflict(json_mode: bool) -> tuple[int, bytes, bytes]:

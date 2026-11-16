@@ -32,6 +32,7 @@ Public API
 
 from __future__ import annotations
 
+import contextlib
 import gzip
 import hashlib
 import io
@@ -137,11 +138,16 @@ def pack(entries: Iterable[tuple[str, str | os.PathLike[str] | bytes]], out_path
                 size = len(source)
             else:
                 src = Path(source)
-                st = os.lstat(src)
-                if not stat.S_ISREG(st.st_mode):
-                    raise ValueError(f"{src} is not a regular file")
-                mode = 0o755 if st.st_mode & 0o111 else 0o644
-                with open(src, "rb") as f:
+                # Opened without following a link, and checked on the open file itself.
+                try:
+                    sfd = os.open(src, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+                except OSError as e:
+                    raise ValueError(f"{src} could not be opened as a regular file ({e.strerror})") from None
+                with os.fdopen(sfd, "rb") as f:
+                    st = os.fstat(f.fileno())
+                    if not stat.S_ISREG(st.st_mode):
+                        raise ValueError(f"{src} is not a regular file")
+                    mode = 0o755 if st.st_mode & 0o111 else 0o644
                     tar.addfile(_tarinfo(name, st.st_size, mode, tarfile.REGTYPE), f)
                 size = st.st_size
             count += 1
@@ -202,11 +208,21 @@ def _text(field: bytes) -> str:
         raise _refuse("an entry's name is not valid UTF-8 text") from None
 
 
-def read_members(path: str | os.PathLike[str], limits: Limits = DEFAULT_LIMITS) -> Iterator[tuple[str, str, int, int, Iterator[bytes]]]:
+def _opened(source: Any) -> Any:
+    """An archive given by path is opened here; an already open file is read from its start and
+    left open (so a deploy can check and unpack the very same bytes, from one file handle)."""
+    if hasattr(source, "read"):
+        source.seek(0)
+        return contextlib.nullcontext(source)
+    return open(source, "rb")
+
+
+def read_members(path: Any, limits: Limits = DEFAULT_LIMITS) -> Iterator[tuple[str, str, int, int, Iterator[bytes]]]:
     """Yield ``(name, kind, mode, size, chunks)`` for each entry; ``kind`` is ``"file"`` or
-    ``"folder"``. ``chunks`` must be consumed before the next entry is asked for."""
+    ``"folder"``. ``chunks`` must be consumed before the next entry is asked for. ``path`` may
+    also be a binary file opened for reading."""
     cap = limits.max_total_bytes + (limits.max_files * 2 + 4) * BLOCK
-    with open(path, "rb") as raw:
+    with _opened(path) as raw:
         try:
             gz = gzip.GzipFile(fileobj=raw, mode="rb")
             src = _Limited(gz, cap)
@@ -282,7 +298,7 @@ def read_members(path: str | os.PathLike[str], limits: Limits = DEFAULT_LIMITS) 
             raise _refuse("it is not a gzip archive, or it is damaged") from None
 
 
-def extract(path: str | os.PathLike[str], dest: str | os.PathLike[str], *, limits: Limits = DEFAULT_LIMITS,
+def extract(path: Any, dest: str | os.PathLike[str], *, limits: Limits = DEFAULT_LIMITS,
             allowed_top: Iterable[str] | None = None) -> dict[str, int]:
     target = Path(dest)
     allowed = set(allowed_top) if allowed_top is not None else None

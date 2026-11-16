@@ -18,15 +18,19 @@ Environment="MES_PROJECT=demo"
 Environment="MES_DATA_DIR=/var/lib/mes/demo/data"
 Environment="MES_STATE_DIR=/var/lib/mes/demo/state"
 Environment="MES_STORE_DIR=/var/lib/mes/demo/store"
-Environment="HOME=/var/lib/mes/demo/state"
+Environment="HOME=/nonexistent"
 Environment="LANG=C.UTF-8"
 Environment="PYTHONDONTWRITEBYTECODE=1"
 Slice=mes.slice
 MemoryMax=2G
 MemorySwapMax=0
 RuntimeMaxSec=1800
-Environment="UV_CACHE_DIR=/var/lib/mes/demo/state/uv-cache"
-Environment="UV_PYTHON_INSTALL_DIR=/var/lib/mes/demo/state/uv-python"
+# The deploy tools' own folders are in code/, which jobs and the write gate see read-only.
+Environment="UV_CACHE_DIR=/var/lib/mes/demo/code/uv-cache"
+Environment="UV_PYTHON_INSTALL_DIR=/var/lib/mes/demo/code/uv-python"
+Environment="UV_NO_CONFIG=1"
+Environment="UV_LINK_MODE=copy"
+Environment="PYTHONNOUSERSITE=1"
 Environment="MES_ROOT=/var/lib/mes"
 NoNewPrivileges=yes
 CapabilityBoundingSet=
@@ -49,15 +53,23 @@ RestrictSUIDSGID=yes
 LockPersonality=yes
 RestrictRealtime=yes
 RestrictNamespaces=yes
+RemoveIPC=yes
 SystemCallArchitectures=native
-SystemCallFilter=@system-service
-SystemCallFilter=~@privileged @resources
 SystemCallErrorNumber=EPERM
 LimitCORE=0
 TasksMax=256
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+SystemCallFilter=@chown
 # The dashboard server's account reads ui/ through its group, so new files are group-readable.
 UMask=0027
-ReadWritePaths=/var/lib/mes/demo/code /var/lib/mes/demo/state /var/lib/mes/demo/ui
-InaccessiblePaths=-/var/lib/mes/demo/state/gate -/var/lib/mes/demo/etc/webhook.key -/var/lib/mes/demo/code/incoming
-# Installing the project's packages (uv sync) needs the internet.
+# Of all the projects' folders, only these of this project are there (read-only unless listed
+# as writable); other projects, the sign-in folder and the gate's own folder are not.
+TemporaryFileSystem=/var/lib/mes:ro
+BindReadOnlyPaths=/var/lib/mes/demo/etc /var/lib/mes/demo/data
+BindPaths=/var/lib/mes/demo/code /var/lib/mes/demo/ui
+ReadWritePaths=/var/lib/mes/demo/code /var/lib/mes/demo/ui
+InaccessiblePaths=-/run/mes-demo-gate -/var/lib/mes/demo/etc/webhook.key -/var/lib/mes/demo/code/incoming
+# uv needs the package index, but nothing on this computer or the local network.
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressDeny=0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.168.0.0/16 224.0.0.0/4 240.0.0.0/4 ::/128 ::1/128 fc00::/7 fe80::/10 ff00::/8

@@ -79,7 +79,7 @@ def _err(text):
 def test_unknown_key_names_key_and_allowed_keys():
     err = _err('[project]\nname = "myapp"\n[jobs.sync]\nrunn = "myapp sync"\nmanual = true\n')
     assert '"runn"' in err.message and "[jobs.sync]" in err.message
-    assert "run, schedule, after, manual, webhook, memory, timeout, network, writes" in err.hint
+    assert "run, schedule, after, manual, webhook, memory, timeout, network, local_network, writes" in err.hint
     assert 'Did you mean "run"?' in err.hint
     assert err.code == "manifest_invalid" and err.exit_code == 1
 
@@ -414,6 +414,32 @@ def test_local_network_hosts_are_refused(host):
     with pytest.raises(ManifestError) as e:
         manifest.loads(text)
     assert "local network" in e.value.message
+
+
+@pytest.mark.parametrize("host", ["0x7f.0.0.1", "0x7f.1", "2130706433", "127.1", "1.1.1.1", "x.0x7f",
+                                  "169.254.169.254", "017700000001"])
+def test_numeric_hosts_in_any_spelling_are_refused(host):
+    """Audit F6: 0x7f.0.0.1 and 0x7f.1 passed the check and resolve to this computer."""
+    from mes import manifest
+
+    for key in ("network", "local_network"):
+        text = ('[project]\nname = "demo"\n[apps.demo]\ncli = "demo"\n'
+                f'[jobs.sync]\nrun = "demo sync"\nmanual = true\n{key} = ["{host}"]\n')
+        with pytest.raises(ManifestError):
+            manifest.loads(text)
+
+
+def test_local_network_hosts_are_allowed_where_marked():
+    from mes import manifest
+
+    p = manifest.loads('[project]\nname = "demo"\n[apps.demo]\ncli = "demo"\n[jobs.sync]\nrun = "demo sync"\n'
+                       'manual = true\nnetwork = ["api.example.com"]\nlocal_network = ["nas.home.arpa", "api.example.com"]\n')
+    job = p.jobs["sync"]
+    assert job.local_network == ("nas.home.arpa",) and job.hosts == ("api.example.com", "nas.home.arpa")
+    for bad in ("localhost", "x.localhost"):
+        with pytest.raises(ManifestError):
+            manifest.loads('[project]\nname = "demo"\n[apps.demo]\ncli = "demo"\n[jobs.sync]\nrun = "demo sync"\n'
+                           f'manual = true\nlocal_network = ["{bad}"]\n')
 
 
 REAL_WORLD = """

@@ -12,7 +12,9 @@ Type=oneshot
 User=mes-demo
 Group=mes-demo
 ExecStart="/var/lib/mes/demo/code/current/project/.venv/bin/demo-tool" "--json" "report"
-ExecStopPost=+"/usr/local/bin/mes" "jobs" "record" "--project" "demo" "--server-root" "/var/lib/mes" "report"
+# Root records the run with an empty environment and Python's isolated mode: nothing the
+# job can write reaches it.
+ExecStopPost=+"/usr/bin/env" "-i" "PATH=/usr/bin:/bin" "LANG=C.UTF-8" "/opt/mes/tools/my-easy-software/bin/python" "-I" "-m" "mes" "jobs" "record" "--project" "demo" "--server-root" "/var/lib/mes" "report"
 WorkingDirectory=/var/lib/mes/demo/code/current/project
 Environment="MES_PROJECT=demo"
 Environment="MES_DATA_DIR=/var/lib/mes/demo/data"
@@ -49,13 +51,18 @@ RestrictSUIDSGID=yes
 LockPersonality=yes
 RestrictRealtime=yes
 RestrictNamespaces=yes
+RemoveIPC=yes
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources
 SystemCallErrorNumber=EPERM
 LimitCORE=0
 TasksMax=256
-InaccessiblePaths=-/var/lib/mes/demo/etc/webhook.key
+# Of all the projects' folders, only these of this project are there (read-only unless listed
+# as writable); other projects, the sign-in folder and the gate's own folder are not.
+TemporaryFileSystem=/var/lib/mes:ro
+BindReadOnlyPaths=/var/lib/mes/demo/code /var/lib/mes/demo/data /var/lib/mes/demo/store /var/lib/mes/demo/state
+InaccessiblePaths=-/run/mes-demo-gate -/var/lib/mes/demo/etc/webhook.key
 PrivateNetwork=yes
 RestrictAddressFamilies=AF_UNIX
 IPAddressDeny=any

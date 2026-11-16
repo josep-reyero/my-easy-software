@@ -297,7 +297,9 @@ def _sign_in(probe: checks.Probe, facts: dict[str, Any], prefix: str) -> dict[st
         )
     if ts.backend != "NeedsLogin":
         return None
-    url = ts.auth_url or checks.start_sign_in(probe, ts, plat)
+    # Only a link Tailscale already shows is used: mes never runs 'tailscale up' itself, since that
+    # changes the computer's network settings. Without a link, the person is told what to run.
+    url = ts.auth_url
     if url:
         why = messages.SIGN_IN_WHY + messages.SIGN_IN_WHY_LINK
     elif plat.kind == "macos":

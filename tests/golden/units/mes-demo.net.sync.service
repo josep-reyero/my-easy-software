@@ -2,8 +2,10 @@
 # mes-project: demo
 # mes-unit: net
 # mes-job: sync
-# Runs as root just before each start of the job: it looks up the job's hosts and lets the
-# job reach only those addresses (and the DNS servers). It reads nothing from the project.
+# Runs as root just before each start of the job, with an empty environment: it looks up the
+# job's hosts, writes the job's own hosts file and lets the job reach only those addresses.
+# Addresses on this computer or the local network are dropped, except for hosts listed in
+# local_network. It reads nothing from the project.
 
 [Unit]
 Description=Allow the network hosts of mes job sync of project demo
@@ -11,11 +13,13 @@ Before=mes-demo.job.sync.service
 
 [Service]
 Type=oneshot
-ExecStart="/usr/local/bin/mes" "jobs" "allow-network" "--unit" "mes-demo.job.sync.service" "--" "api.example.com" "auth.example.com"
+ExecStart="/usr/bin/env" "-i" "PATH=/usr/bin:/bin" "LANG=C.UTF-8" "/opt/mes/tools/my-easy-software/bin/python" "-I" "-m" "mes" "jobs" "allow-network" "--unit" "mes-demo.job.sync.service" "--hosts-file" "/run/mes-demo-net/sync/hosts" "--" "api.example.com" "auth.example.com"
 WorkingDirectory=/
-Environment="LANG=C.UTF-8"
+RuntimeDirectory=mes-demo-net/sync
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
 TimeoutStartSec=60
-UMask=0077
+UMask=0022
 NoNewPrivileges=yes
 # Only the right to change unit settings (systemd asks for CAP_SYS_ADMIN for that).
 CapabilityBoundingSet=CAP_SYS_ADMIN
@@ -31,6 +35,8 @@ RestrictSUIDSGID=yes
 LockPersonality=yes
 RestrictRealtime=yes
 RestrictNamespaces=yes
+# It needs nothing of the projects' folders.
+InaccessiblePaths=-/var/lib/mes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 SystemCallArchitectures=native
 SystemCallFilter=@system-service

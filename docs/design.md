@@ -83,7 +83,7 @@ tables and columns will leave the machine and asks for approval.
 | Mode | Who can open it | How |
 |---|---|---|
 | people | People you invite by email | The hosting platform's access layer (first: Cloudflare Access) |
-| link | Anyone holding the link | Export is encrypted (AES-256-GCM). The key is in the part of the link after `#`, which browsers never send to the host. Works on any static host. Revoke by rotating the key and republishing |
+| link | Anyone holding the link | Export is encrypted (AES-256-GCM). The key is in the part of the link after `#`, which browsers never send to the host. Works on any static host. Sharing again deletes the earlier deployments; `mes expose --remove` takes the site down. An earlier deployment that could not be deleted stays online with its old link |
 | public | Anyone | Plain static site |
 
 Interactive controls keep working: the browser runs the dashboard's named queries on the small
@@ -186,22 +186,26 @@ contract wins. What is built in my-easy-software, and how it differs from the de
   refused, never run with less protection. On a personal computer the gate has only time, output
   and size limits, and says so.
 - **Job network limits are enforced on servers.** `network = false`: no network at all. A host
-  list: the job unit denies all IP traffic, and a root helper unit resolves the hosts (plus the
-  DNS servers) just before each run and allows only those addresses. On a personal computer
+  list: the job unit denies all IP traffic, and a root helper unit resolves the hosts just before
+  each run, keeps only internet addresses (local-network ones only for `local_network` hosts),
+  writes the job's own hosts file and allows only those addresses; jobs get no name server. On a personal computer
   (`mes jobs run`) host lists cannot be enforced, and mes says so.
-- **Signed deploys, rule 7.** `mes deploy` packs git-tracked files and sibling path dependencies,
-  signs them with `ssh-keygen -Y sign` (namespace `mes-deploy`); the server checks the signature
-  against the project's root-owned allowed signers before unpacking, unpacks with its own
-  hardened tar reader, refuses replayed or older archives, installs with `uv sync --frozen` in a
-  sandbox, switches atomically, publishes dashboards (switching back on failure) and keeps 5
-  releases for rollback. Run records include the release; the code hash is in the deploy log.
+- **Signed deploys, rule 7.** `mes deploy` exports the last commit and sibling path dependencies
+  from git's objects, builds their wheels on the client and signs the archive with `ssh-keygen -Y
+  sign` (namespace `mes-deploy`) with a key that is not the login key; the server checks the
+  signature against the project's root-owned allowed signers before unpacking, unpacks with its
+  own hardened tar reader, refuses replayed or older archives, installs with `uv sync --frozen
+  --no-build` plus the archive's wheels in a sandbox, switches atomically, publishes dashboards
+  (switching back on failure) and keeps 5 releases for rollback (signed, namespace `mes-rollback`). Run records include the release; the code hash is in the deploy log.
 - **Sharing.** `mes expose` with Cloudflare Pages (people, link, public), Netlify and Vercel
   (link, public); GitHub Pages and Render are "not available yet". It never uploads without a
   confirmation that lists the dashboards, tables and audience.
-- **Webhooks, backups, skills.** Signed webhooks (HMAC-SHA256 over timestamp and body, replay
-  window) as a job trigger; `mes backup` / `mes restore`; skills in `skills/` with a Claude Code
+- **Webhooks, backups, skills.** Signed webhooks (HMAC-SHA256 over timestamp, method, path, job and
+  body, replay window; the job list is root's copy in `etc/`) as a job trigger; `mes backup` / `mes restore`; skills in `skills/` with a Claude Code
   plugin manifest; `mes setup` renders the Tailscale serve commands for a project's dashboard.
-- **Not done in this round:** `mes doctor` proving the sandbox from the inside (rule 11); secrets
+- **Since added:** `mes server selftest` proves the sandboxes from the inside on the real server
+  (rule 11), and `mes server analyze` writes systemd's own checks of every unit.
+- **Not done in this round:** secrets
   for jobs (rule 9); hardware-touch keys are allowed (`sk-ssh-ed25519`) but not required (rule 6);
   the dashboard copy shared by `mes expose` does not refresh by itself.
 - **Tested only on this computer.** Rendered scripts and units have golden tests and `bash -n`;

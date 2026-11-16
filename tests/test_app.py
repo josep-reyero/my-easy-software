@@ -358,3 +358,60 @@ def test_command_name_with_newline_is_refused(app):
         app.command("bad\n")(lambda ctx: None)
     with pytest.raises(ValueError):
         App("myapp\n", root=".")
+
+
+# --------------------------------------------------------------------------- audit F11
+
+
+def test_a_parameter_converter_never_runs_for_a_command_that_is_not_allowed(tmp_path, capsys, monkeypatch):
+    """Audit F11: the converter of a write command's parameter ran before the kind check."""
+    ran = []
+
+    def spy(text):
+        ran.append(text)
+        return text
+
+    app = App("myapp", root=tmp_path)
+
+    @app.command("change", kind="write")
+    def change(ctx, value: Annotated[spy, "a value"]):  # noqa: F821 - the converter is the type
+        return {"value": value}
+
+    monkeypatch.setenv("MES_ALLOW", "read")
+    code, data = run_json(app, capsys, "--json", "change", "x")
+    assert code == 4 and data["error"]["code"] == "not_allowed" and ran == []
+    monkeypatch.setenv("MES_ALLOW", "write")
+    code, data = run_json(app, capsys, "--json", "change", "x")
+    assert code == 0 and ran == ["x"]
+
+
+def test_without_project_toml_the_session_cannot_rename_the_project(tmp_path, capsys, monkeypatch, mes_home):
+    """Audit F11: an app without project.toml took its project from MES_PROJECT, and with it
+    another project's data folder."""
+    other = tmp_path / "other-data"
+    other.mkdir()
+    monkeypatch.setenv("MES_PROJECT", "other")
+    monkeypatch.setenv("MES_DATA_DIR", str(other))
+    app = make_app(tmp_path)
+    assert app.project == "myapp"
+    code, data = run_json(app, capsys, "--json", "add-note", "x")
+    assert code == 2 and data["error"]["code"] == "wrong_project"  # refused, not written into "other"
+    assert list(other.iterdir()) == []
+
+
+def test_help_text_cannot_hide_or_reorder_text(tmp_path, capsys):
+    app = App("myapp", root=tmp_path)
+
+    @app.command("trick", kind="read", help="safe‮ looking \x1b[2J text")
+    def trick(ctx):
+        return {"note": "a‮b\u0085"}
+
+    code = app.run(["--json"])
+    out = capsys.readouterr().out
+    assert "‮" not in out and "\x1b" not in out and "\\u202e" in out
+    code = app.run(["--help"])
+    out = capsys.readouterr().out
+    assert "‮" not in out and "\x1b" not in out
+    code = app.run(["--json", "trick"])
+    out = capsys.readouterr().out
+    assert code == 0 and "‮" not in out and "\u0085" not in out and json.loads(out) == {"note": "a‮b\u0085"}

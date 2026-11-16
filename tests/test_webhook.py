@@ -66,10 +66,12 @@ def run_cli(*argv, stdin: bytes = b""):
 def server(tmp_path):
     root = tmp_path / "srv"
     layout = paths.server_layout("hooky", root)
-    for d in (layout.base, layout.etc, layout.state, layout.current_project):
+    for d in (layout.base, layout.etc, layout.state, layout.webhook):
         d.mkdir(parents=True, exist_ok=True)
-    os.chmod(layout.state, 0o700)
-    (layout.current_project / "project.toml").write_text(PROJECT_TOML)
+    os.chmod(layout.webhook, 0o700)
+    # The root script copies the webhook jobs into etc/ (root-owned); the receiver never reads code/.
+    layout.webhook_jobs.write_text("# webhook jobs\nbuild\n")
+    os.chmod(layout.webhook_jobs, 0o640)
     layout.webhook_key.write_text(SECRET.hex() + "\n")
     os.chmod(layout.webhook_key, 0o640)
     return layout
@@ -78,14 +80,23 @@ def server(tmp_path):
 # --------------------------------------------------------------------------- pure checks
 
 
-def _sig(body=b"{}", ts=NOW, secret=SECRET):
-    return webhook.sign(secret, ts, body)
+def _sig(body=b"{}", ts=NOW, secret=SECRET, job="build"):
+    return webhook.sign(secret, ts, body, job=job)
 
 
 def test_valid_signature_passes():
-    assert webhook.verify(SECRET, str(NOW), _sig(), b"{}", NOW, {}) is None
-    assert webhook.verify(SECRET, str(NOW), _sig(), b"{}", NOW + 299, {}) is None
-    assert webhook.verify(SECRET, str(NOW), _sig(), b"{}", NOW - 299, {}) is None
+    assert webhook.verify(SECRET, str(NOW), _sig(), b"{}", NOW, {}, job="build") is None
+    assert webhook.verify(SECRET, str(NOW), _sig(), b"{}", NOW + 299, {}, job="build") is None
+    assert webhook.verify(SECRET, str(NOW), _sig(), b"{}", NOW - 299, {}, job="build") is None
+
+
+def test_signature_covers_method_path_and_job():
+    """Finding 10: the MAC covered only the timestamp and body, so a signed request for one job
+    could be replayed against another job's path."""
+    assert webhook.signed_message(NOW, b"{}", job="build") == f"{NOW}\nPOST\n/hooks/build\nbuild\n".encode() + b"{}"
+    sig = _sig(job="build")
+    assert webhook.verify(SECRET, str(NOW), sig, b"{}", NOW, {}, job="deploy-all") == "bad_signature"
+    assert webhook.verify(SECRET, str(NOW), sig, b"{}", NOW, {}, job="build", method="PUT") == "bad_signature"
 
 
 @pytest.mark.parametrize("case, expected", [
@@ -129,12 +140,12 @@ def test_refusals(case, expected):
         sig = _sig(body)
     elif case == "timestamp_swapped":
         ts = str(NOW + 1)
-    assert webhook.verify(SECRET, ts, sig, body, now, seen) == expected
+    assert webhook.verify(SECRET, ts, sig, body, now, seen, job="build") == expected
 
 
 def test_missing_headers_are_refused():
-    assert webhook.verify(SECRET, None, _sig(), b"{}", NOW, {}) == "bad_timestamp"
-    assert webhook.verify(SECRET, str(NOW), None, b"{}", NOW, {}) == "bad_signature_header"
+    assert webhook.verify(SECRET, None, _sig(), b"{}", NOW, {}, job="build") == "bad_timestamp"
+    assert webhook.verify(SECRET, str(NOW), None, b"{}", NOW, {}, job="build") == "bad_signature_header"
 
 
 def test_job_problem():
@@ -146,6 +157,22 @@ def test_job_problem():
     assert webhook.job_problem(project, "missing") == "unknown_job"
     for bad in ("../build", "build/../x", "Build", "", "a" * 40, "build\n"):
         assert webhook.job_problem(project, bad) == "bad_job"
+    assert webhook.job_problem(frozenset({"build"}), "build") is None
+    assert webhook.job_problem(frozenset({"build"}), "nightly") == "unknown_job"
+
+
+def test_job_list_must_belong_to_root_or_the_receiver(tmp_path):
+    f = tmp_path / "webhook-jobs"
+    f.write_text("build\nNot A Job\n# comment\n")
+    os.chmod(f, 0o640)
+    assert webhook.load_jobs(f) == {"build"}
+    os.chmod(f, 0o660)
+    assert webhook.load_jobs(f) == set()
+    os.chmod(f, 0o640)
+    link = tmp_path / "link"
+    link.symlink_to(f)
+    assert webhook.load_jobs(link) == set()
+    assert webhook.load_jobs(tmp_path / "missing") == set()
 
 
 def test_parse_secret():
@@ -217,7 +244,7 @@ class Running:
 
     def post(self, job="build", body=b'{"ref":"main"}', ts=None, sig=None, extra=b""):
         ts = str(int(time.time())) if ts is None else ts
-        sig = webhook.sign(SECRET, ts, body) if sig is None else sig
+        sig = webhook.sign(SECRET, ts, body, job=job) if sig is None else sig
         req = (f"POST /hooks/{job} HTTP/1.1\r\nHost: x\r\nContent-Length: {len(body)}\r\n"
                f"X-Mes-Timestamp: {ts}\r\nX-Mes-Signature: {sig}\r\n").encode() + extra + b"\r\n" + body
         return self.raw(req)
@@ -233,6 +260,7 @@ def test_receiver_accepts_and_writes_trigger(server):
         status, body = r.post()
         assert (status, body) == (202, {"accepted": True, "job": "build"})
         trigger = server.triggers / "build"
+        assert server.triggers == server.webhook / "triggers"  # a folder no job can write
         record = json.loads(trigger.read_text())
         assert set(record) == {"time", "body_sha256"} and "main" not in trigger.read_text()
         assert oct(server.triggers.stat().st_mode & 0o777) == "0o700"
@@ -244,7 +272,7 @@ def test_receiver_accepts_and_writes_trigger(server):
 def test_receiver_refuses_replay_also_after_restart(server):
     ts = str(int(time.time()))
     body = b"{}"
-    sig = webhook.sign(SECRET, ts, body)
+    sig = webhook.sign(SECRET, ts, body, job="build")
     r = Running(server, idle=1.0)
     try:
         assert r.post(body=body, ts=ts, sig=sig)[0] == 202
@@ -293,6 +321,19 @@ def test_receiver_protocol_limits(server):
         r.stop()
 
 
+def test_receiver_takes_jobs_from_etc_not_from_the_code(server):
+    """Finding 10: the receiver loaded project.toml from code/, which its sandbox hides, so no
+    webhook could ever start a job. It now reads root's etc/webhook-jobs and nothing in code/."""
+    assert not server.code.exists()
+    r = Running(server, idle=1.0)
+    try:
+        assert r.post()[0] == 202
+        server.webhook_jobs.write_text("other\n")
+        assert r.post(body=b'{"x":2}') == (404, {"error": "unknown_job"})
+    finally:
+        r.stop()
+
+
 def test_receiver_times_out_slow_clients(server, monkeypatch):
     monkeypatch.setattr(webhook, "READ_TIMEOUT_SEC", 0.5)
     r = Running(server, idle=2.0)
@@ -333,14 +374,16 @@ def test_cli_sign(tmp_path, cli_with_webhook):
     key = tmp_path / "key"
     key.write_text(SECRET.hex())
     os.chmod(key, 0o600)
-    code, out = run_cli("--json", "webhook", "sign", "--secret-file", str(key), "--timestamp", str(NOW), stdin=b"{}")
+    code, out = run_cli("--json", "webhook", "sign", "--secret-file", str(key), "--job", "build",
+                        "--timestamp", str(NOW), stdin=b"{}")
     data = json.loads(out)
-    assert code == 0 and data["signature"] == webhook.sign(SECRET, NOW, b"{}")
+    assert code == 0 and data["signature"] == webhook.sign(SECRET, NOW, b"{}", job="build")
     assert data["headers"] == [f"X-Mes-Timestamp: {NOW}", f"X-Mes-Signature: {data['signature']}"]
-    code, out = run_cli("webhook", "sign", "--secret-file", str(key), "--timestamp", str(NOW), stdin=b"{}")
+    code, out = run_cli("webhook", "sign", "--secret-file", str(key), "--job", "build", "--timestamp", str(NOW),
+                        stdin=b"{}")
     assert code == 0 and out.splitlines()[0] == f"X-Mes-Timestamp: {NOW}"
     os.chmod(key, 0o644)
-    code, out = run_cli("--json", "webhook", "sign", "--secret-file", str(key), stdin=b"{}")
+    code, out = run_cli("--json", "webhook", "sign", "--secret-file", str(key), "--job", "build", stdin=b"{}")
     assert code == 5 and json.loads(out)["error"]["code"] == "untrusted_file"
 
 

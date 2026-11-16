@@ -8,15 +8,21 @@ Interface
 ``Adapter.name``       the provider name used with ``--to``.
 ``Adapter.token_env``  the environment variable holding the token.
 ``Adapter.modes``      the sharing modes it supports (``people``, ``link``, ``public``).
-``Adapter.default_base``  the API address (``MES_EXPOSE_API_BASE`` replaces it, for tests).
+``Adapter.default_base``  the API address. ``Adapter(base=..., fetch=..., wait=...)`` replaces it
+                       and the site check (tests only; nothing in the environment can change it).
 ``Adapter.plan(site, files, mode, people) -> list[dict]``  every step, for ``--dry-run``.
-``Adapter.upload(site, files_dir, files, mode, people, token, http) -> dict``  with ``url``.
+``Adapter.upload(site, files_dir, files, mode, people, token, http) -> dict``  with ``url``: always
+                       an address the provider answered with, never one built from the name.
+                       Earlier deployments of the site are deleted after the new one is live.
+``Adapter.remove_plan(site)`` / ``Adapter.remove(site, token, http) -> dict``  take the site down
+                       (every deployment) at the provider.
 
 ``files`` is a list of ``ExportFile(path, abs_path, size, sha256)``.
 
 Also here: ``Http`` (a tiny JSON/bytes client that never follows redirects, has timeouts and a
-response size limit, and keeps the token out of every message), ``api_base(adapter)``,
-``load_token(adapter)``, ``ADAPTERS``.
+response size limit, and keeps the token out of every message), ``check_base(url)``,
+``fetch_site(url) -> (status, location)`` (no credentials, no redirects), ``access_answer(status,
+location) -> bool``, ``load_token(adapter)``, ``ADAPTERS``.
 """
 
 from __future__ import annotations
@@ -30,6 +36,7 @@ import os
 import re
 import secrets
 import stat
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -47,6 +54,10 @@ TIMEOUT = 60.0
 LOCAL_HOSTS = ("127.0.0.1", "localhost", "::1")
 TOKEN_FILE_MAX = 4096
 _TOKEN_RE = re.compile(r"^[\x21-\x7e]{8,4096}\Z")
+_HOST_RE = re.compile(r"^(?=.{1,253}\Z)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+\Z")
+_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}\Z")
+CHECK_TRIES = 10
+CHECK_WAIT_SEC = 6.0
 
 
 @dataclass(frozen=True)
@@ -173,20 +184,48 @@ class Http:
 # --------------------------------------------------------------------------- tokens
 
 
-def api_base(adapter: "Adapter") -> str:
-    override = os.environ.get("MES_EXPOSE_API_BASE")
-    if not override:
-        return adapter.default_base
-    parsed = urllib.parse.urlsplit(override)
+def check_base(url: str) -> str:
+    """An API address mes may send a token to: https, or plain http on this computer (tests)."""
+    parsed = urllib.parse.urlsplit(url)
     local = parsed.scheme == "http" and parsed.hostname in LOCAL_HOSTS
     if not (parsed.scheme == "https" and parsed.hostname) and not local:
-        raise Refused(
-            "MES_EXPOSE_API_BASE points to an address that is not https (or this computer), so mes will not send "
-            "your token or your data there.",
-            hint="Remove MES_EXPOSE_API_BASE; it is only for testing.",
-            code="unsafe_api_base",
-        )
-    return override.rstrip("/")
+        raise Refused("The provider's API address is not https (or this computer), so mes will not send your token "
+                      "or your data there.", hint="This is a mistake in mes; report it.", code="unsafe_api_base")
+    return url.rstrip("/")
+
+
+def fetch_site(url: str) -> tuple[int, str | None]:
+    """Open ``url`` the way a stranger would: no token, no cookie, no redirect followed. Returns
+    the status and the redirect address (0 when the site could not be reached)."""
+    req = urllib.request.Request(url, method="GET", headers={"User-Agent": "mes-expose-check"})
+    opener = urllib.request.build_opener(_NoRedirect)
+    try:
+        with opener.open(req, timeout=20) as resp:
+            return resp.status, resp.headers.get("Location")
+    except urllib.error.HTTPError as e:
+        return e.code, e.headers.get("Location") if e.headers else None
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return 0, None
+
+
+def access_answer(status: int, location: str | None) -> bool:
+    """What a protected site answers a stranger: a redirect to Cloudflare Access's sign-in page,
+    or "sign in first" / "not allowed"."""
+    if status in (401, 403):
+        return True
+    if status in (302, 303, 307) and isinstance(location, str):
+        loc = urllib.parse.urlsplit(location)
+        return loc.scheme == "https" and (loc.hostname or "").endswith(".cloudflareaccess.com")
+    return False
+
+
+def _host(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    v = value.strip().lower()
+    if v.startswith("https://"):
+        v = v[len("https://"):].rstrip("/")
+    return v if _HOST_RE.match(v) else None
 
 
 def token_file(adapter: "Adapter") -> Path:
@@ -256,7 +295,14 @@ class Adapter:
     available = True
     site_re = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,56}[a-z0-9])?\Z")
 
+    def __init__(self, base: str | None = None, *, fetch: Any = None, wait: Any = None) -> None:
+        self.base = check_base(base) if base else self.default_base
+        self.fetch = fetch or fetch_site
+        self.wait = wait or time.sleep
+
     def site_url(self, site: str) -> str:
+        """The address the site would normally get. Only shown before uploading, as what is asked
+        for; the result always reports the address the provider answered with."""
         raise NotImplementedError
 
     def plan(self, site: str, files: list[ExportFile], mode: str, people: list[str]) -> list[dict[str, Any]]:
@@ -265,6 +311,31 @@ class Adapter:
     def upload(self, site: str, files_dir: Path, files: list[ExportFile], mode: str, people: list[str],
                token: str, http: Http) -> dict[str, Any]:
         raise NotImplementedError
+
+    def remove_plan(self, site: str) -> list[dict[str, Any]]:
+        raise NotImplementedError
+
+    def remove(self, site: str, token: str, http: Http) -> dict[str, Any]:
+        raise NotImplementedError
+
+
+def _no_address(provider: str) -> MesError:
+    return MesError(f"{provider} did not say at which address the site is, so mes cannot tell you where it is or "
+                    "who can open it, and reports no address.",
+                    hint="Look at the site in your provider account, or run mes expose again later.",
+                    code="provider_no_address")
+
+
+def _delete_each(http: Http, token: str, paths_: list[str]) -> tuple[int, list[str]]:
+    """Delete earlier deployments; a failure is reported, never hidden."""
+    removed, kept = 0, []
+    for path in paths_:
+        try:
+            http.request("DELETE", path, token=token, ok_missing=True)
+            removed += 1
+        except MesError as e:
+            kept.append(f"{path.rsplit('/', 1)[-1].split('?', 1)[0]}: {e.message[:120]}")
+    return removed, kept
 
 
 def _step(step: str, method: str, path: str, sends: str) -> dict[str, str]:
@@ -319,18 +390,22 @@ class CloudflarePages(Adapter):
 
     def plan(self, site, files, mode, people):
         acc = "{account}"
-        steps = []
+        steps = [
+            _step("Check that the Pages project exists (create it if not) and read its real address", "GET",
+                  f"/accounts/{acc}/pages/projects/{site}", "nothing"),
+            _step("List the site's earlier versions (deleted once the new one is live)", "GET",
+                  f"/accounts/{acc}/pages/projects/{site}/deployments", "nothing"),
+        ]
         if mode == "people":
             steps += [
                 _step("Find an existing sign-in rule for the site", "GET", f"/accounts/{acc}/access/apps", "nothing"),
                 _step("Create or update the Cloudflare Access application (before any file is uploaded)", "POST",
-                      f"/accounts/{acc}/access/apps", f"the domains {site}.pages.dev and *.{site}.pages.dev"),
-                _step("Allow only these people to sign in", "POST",
+                      f"/accounts/{acc}/access/apps",
+                      "the site's real address from Cloudflare's answer, its per-version addresses and custom domains"),
+                _step("Remove every other rule of that application, then allow only these people", "POST",
                       f"/accounts/{acc}/access/apps/{{app}}/policies", "the email addresses: " + ", ".join(people)),
             ]
         steps += [
-            _step("Check that the Pages project exists (create it if not)", "GET",
-                  f"/accounts/{acc}/pages/projects/{site}", "nothing"),
             _step("Ask for an upload permission for this one upload", "GET",
                   f"/accounts/{acc}/pages/projects/{site}/upload-token", "nothing"),
             _step("Ask which files Cloudflare does not have yet", "POST", "/pages/assets/check-missing",
@@ -341,17 +416,56 @@ class CloudflarePages(Adapter):
             _step("Publish this version of the site", "POST", f"/accounts/{acc}/pages/projects/{site}/deployments",
                   "the list of file paths and fingerprints"),
         ]
+        if mode == "people":
+            steps.append(_step("Open the site like a stranger and require Cloudflare's sign-in page (otherwise the "
+                               "new version is deleted again)", "GET", "https://<the site's address>/", "nothing"))
+        steps.append(_step("Delete the earlier versions", "DELETE",
+                           f"/accounts/{acc}/pages/projects/{site}/deployments/{{id}}", "nothing"))
         return steps
+
+    def remove_plan(self, site):
+        acc = "{account}"
+        return [
+            _step("List the site's versions", "GET", f"/accounts/{acc}/pages/projects/{site}/deployments", "nothing"),
+            _step("Delete each version", "DELETE", f"/accounts/{acc}/pages/projects/{site}/deployments/{{id}}",
+                  "nothing"),
+            _step("Delete the Pages project", "DELETE", f"/accounts/{acc}/pages/projects/{site}", "nothing"),
+            _step("Delete mes's sign-in rule for it (after the site is gone)", "DELETE",
+                  f"/accounts/{acc}/access/apps/{{app}}", "nothing"),
+        ]
+
+    def _project_hosts(self, project: Any) -> tuple[str, list[str]]:
+        """The site's real address (``subdomain``, which is not always ``<name>.pages.dev``: Cloudflare
+        adds a suffix when the name is taken) and its custom domains, from Cloudflare's answer."""
+        if not isinstance(project, dict):
+            raise _no_address("Cloudflare")
+        sub = _host(project.get("subdomain"))
+        if not sub or not sub.endswith(".pages.dev"):
+            raise _no_address("Cloudflare")
+        custom = []
+        for d in project.get("domains") or []:
+            h = _host(d)
+            if h and h != sub and not h.endswith("." + sub):
+                custom.append(h)
+        return sub, sorted(set(custom))[:20]
+
+    def _deployments(self, acc: str, site: str, token: str, http: Http) -> list[str]:
+        listed = _result(http.request("GET", f"/accounts/{acc}/pages/projects/{site}/deployments", token=token,
+                                      ok_missing=True))
+        return [d["id"] for d in listed if isinstance(d, dict) and isinstance(d.get("id"), str)
+                and _ID_RE.match(d["id"])] if isinstance(listed, list) else []
 
     def upload(self, site, files_dir, files, mode, people, token, http):
         acc = _account_id()
-        access = None
-        if mode == "people":
-            access = self._protect(acc, site, people, token, http)  # before any file is public
         proj = http.request("GET", f"/accounts/{acc}/pages/projects/{site}", token=token, ok_missing=True)
         if proj is None:
-            http.request("POST", f"/accounts/{acc}/pages/projects", token=token,
-                         json_body={"name": site, "production_branch": "main"})
+            proj = http.request("POST", f"/accounts/{acc}/pages/projects", token=token,
+                                json_body={"name": site, "production_branch": "main"})
+        sub, custom = self._project_hosts(_result(proj))
+        earlier = self._deployments(acc, site, token, http)
+        access = None
+        if mode == "people":
+            access = self._protect(acc, site, [sub, *custom], people, token, http)  # before any file is uploaded
         jwt = _result(http.request("GET", f"/accounts/{acc}/pages/projects/{site}/upload-token", token=token))
         jwt = jwt.get("jwt") if isinstance(jwt, dict) else None
         if not isinstance(jwt, str) or not jwt:
@@ -393,20 +507,98 @@ class CloudflarePages(Adapter):
                 f"{json.dumps(manifest)}\r\n--{boundary}--\r\n").encode("utf-8")
         dep = _result(http.request("POST", f"/accounts/{acc}/pages/projects/{site}/deployments", token=token,
                                    body=body, headers={"Content-Type": f"multipart/form-data; boundary={boundary}"}))
-        out = {"url": self.site_url(site),
-               "deployment_url": dep.get("url") if isinstance(dep, dict) and _https(dep.get("url")) else None,
-               "uploaded": len([h for h in missing if h in contents]), "files": len(files)}
+        dep_id = dep.get("id") if isinstance(dep, dict) and isinstance(dep.get("id"), str) \
+            and _ID_RE.match(dep["id"]) else None
+        dep_host = _host(dep.get("url")) if isinstance(dep, dict) else None
+        if mode == "people":
+            hosts = [sub, *custom] + ([dep_host] if dep_host else [])
+            if dep_host and dep_host != sub and not dep_host.endswith("." + sub) and dep_host not in custom:
+                self._undo(acc, site, dep_id, token, http)
+                raise Refused(f"Cloudflare published this version at {dep_host}, which the sign-in rule does not "
+                              "cover, so mes deleted it again. Nothing stays online from this upload.",
+                              hint="Look at the project in your Cloudflare account, then run mes expose again.",
+                              code="access_not_covering")
+            self._check_protected(acc, site, dep_id, hosts, token, http)
+        removed, kept = _delete_each(http, token, [
+            f"/accounts/{acc}/pages/projects/{site}/deployments/{d}?force=true" for d in earlier if d != dep_id])
+        out = {"url": f"https://{sub}", "hosts": [sub, *custom],
+               "deployment_url": f"https://{dep_host}" if dep_host else None,
+               "uploaded": len([h for h in missing if h in contents]), "files": len(files),
+               "removed_earlier": removed, "earlier_not_removed": kept}
         if access:
             out["access"] = access
         return out
 
-    def _protect(self, acc, site, people, token, http):
-        domain = f"{site}.pages.dev"
-        domains = [domain, f"*.{domain}"]
+    def _undo(self, acc, site, dep_id, token, http):
+        if dep_id:
+            try:
+                http.request("DELETE", f"/accounts/{acc}/pages/projects/{site}/deployments/{dep_id}?force=true",
+                             token=token, ok_missing=True)
+            except MesError:
+                pass
+
+    def _check_protected(self, acc, site, dep_id, hosts, token, http):
+        """Open every address like a stranger; each must answer with Cloudflare's sign-in page."""
+        pending = list(dict.fromkeys(hosts))
+        last: dict[str, int] = {}
+        for attempt in range(CHECK_TRIES):
+            still = []
+            for h in pending:
+                status, location = self.fetch(f"https://{h}/")
+                http.log.append(f"GET https://{h}/ (as a stranger)")
+                last[h] = status
+                if not access_answer(status, location):
+                    still.append(h)
+            pending = still
+            if not pending:
+                return
+            if attempt + 1 < CHECK_TRIES:
+                self.wait(CHECK_WAIT_SEC)
+        self._undo(acc, site, dep_id, token, http)
+        raise Refused(
+            "The site did not ask for a sign-in when mes opened it like a stranger ("
+            + ", ".join(f"{h} answered {last.get(h) or 'nothing'}" for h in pending)
+            + "), so mes deleted the new version again instead of saying it is restricted.",
+            hint="Check the Access application for the site in your Cloudflare account (Zero Trust > Access), then "
+            "run mes expose again.", code="access_not_working")
+
+    def remove(self, site, token, http):
+        acc = _account_id()
+        proj = http.request("GET", f"/accounts/{acc}/pages/projects/{site}", token=token, ok_missing=True)
+        hosts: list[str] = []
+        if proj is not None:
+            try:
+                sub, custom = self._project_hosts(_result(proj))
+                hosts = [sub, *custom]
+            except MesError:
+                hosts = []
+            ids = self._deployments(acc, site, token, http)
+            # The newest version cannot be deleted on its own; deleting the project removes it.
+            removed, kept = _delete_each(http, token, [
+                f"/accounts/{acc}/pages/projects/{site}/deployments/{d}?force=true" for d in ids[1:]])
+            http.request("DELETE", f"/accounts/{acc}/pages/projects/{site}", token=token, ok_missing=True)
+        else:
+            removed, kept = 0, []
+        apps = _result(http.request("GET", f"/accounts/{acc}/access/apps", token=token))
+        rules = 0
+        for a in apps if isinstance(apps, list) else []:
+            if isinstance(a, dict) and isinstance(a.get("id"), str) and _ID_RE.match(a["id"]) and (
+                    a.get("name") == f"mes {site}" or a.get("domain") in hosts):
+                http.request("DELETE", f"/accounts/{acc}/access/apps/{a['id']}", token=token, ok_missing=True)
+                rules += 1
+        return {"removed": proj is not None, "versions_removed": removed + (1 if proj is not None else 0),
+                "not_removed": kept, "sign_in_rules_removed": rules, "hosts": hosts}
+
+    def _protect(self, acc, site, hosts, people, token, http):
+        domain = hosts[0]
+        domains = [domain, f"*.{domain}", *hosts[1:]]
         apps = _result(http.request("GET", f"/accounts/{acc}/access/apps", token=token))
         app_id = None
         for a in apps if isinstance(apps, list) else []:
-            if isinstance(a, dict) and (a.get("domain") == domain or domain in (a.get("self_hosted_domains") or [])):
+            if not isinstance(a, dict):
+                continue
+            theirs = {a.get("domain"), *(a.get("self_hosted_domains") or [])}
+            if a.get("name") == f"mes {site}" or theirs & set(domains):
                 app_id = a.get("id")
                 break
         body = {"name": f"mes {site}", "domain": domain, "self_hosted_domains": domains, "type": "self_hosted",
@@ -416,27 +608,27 @@ class CloudflarePages(Adapter):
         else:
             created = _result(http.request("POST", f"/accounts/{acc}/access/apps", token=token, json_body=body))
             app_id = created.get("id") if isinstance(created, dict) else None
-        if not isinstance(app_id, str) or not re.fullmatch(r"[A-Za-z0-9-]{1,64}", app_id):
+        if not isinstance(app_id, str) or not _ID_RE.match(app_id):
             raise MesError("Cloudflare did not confirm the sign-in rule for the site, so nothing was uploaded.",
                            hint="Check that the token may edit Access applications (mes guide share).",
                            code="provider_bad_answer")
+        base = f"/accounts/{acc}/access/apps/{app_id}/policies"
+        # The whole set of rules is replaced: every rule already there (which could let others in) goes
+        # first, then the one rule that lets only these people in.
+        for p in _result(http.request("GET", base, token=token)) or []:
+            if isinstance(p, dict) and isinstance(p.get("id"), str) and _ID_RE.match(p["id"]):
+                http.request("DELETE", f"{base}/{p['id']}", token=token, ok_missing=True)
         policy = {"name": "mes: people allowed", "decision": "allow", "precedence": 1,
                   "include": [{"email": {"email": e}} for e in people]}
-        policies = _result(http.request("GET", f"/accounts/{acc}/access/apps/{app_id}/policies", token=token))
-        pol_id = None
-        for p in policies if isinstance(policies, list) else []:
-            if isinstance(p, dict) and p.get("name") == policy["name"]:
-                pol_id = p.get("id")
-        if isinstance(pol_id, str) and re.fullmatch(r"[A-Za-z0-9-]{1,64}", pol_id):
-            http.request("PUT", f"/accounts/{acc}/access/apps/{app_id}/policies/{pol_id}", token=token,
-                         json_body=policy)
-        else:
-            http.request("POST", f"/accounts/{acc}/access/apps/{app_id}/policies", token=token, json_body=policy)
+        made = _result(http.request("POST", base, token=token, json_body=policy))
+        ours = made.get("id") if isinstance(made, dict) else None
+        now = _result(http.request("GET", base, token=token))
+        ids = [p.get("id") for p in now if isinstance(p, dict)] if isinstance(now, list) else None
+        if not ours or ids != [ours]:
+            raise MesError("Cloudflare did not confirm that the site's only sign-in rule is the list of people, so "
+                           "nothing was uploaded.", hint="Look at the Access application in your Cloudflare account "
+                           "(Zero Trust > Access), then run mes expose again.", code="access_not_confirmed")
         return {"domains": domains, "people": list(people)}
-
-
-def _https(value: Any) -> bool:
-    return isinstance(value, str) and value.startswith("https://") and len(value) < 500 and " " not in value
 
 
 class Netlify(Adapter):
@@ -454,31 +646,57 @@ class Netlify(Adapter):
         return [
             _step("Find the site", "GET", f"/api/v1/sites?name={site}", "nothing"),
             _step("Create the site if it does not exist", "POST", "/api/v1/sites", f"the name {site}"),
+            _step("List the site's earlier versions (deleted once the new one is live)", "GET",
+                  "/api/v1/sites/{site_id}/deploys", "nothing"),
             _step("Upload and publish all files as one zip", "POST", "/api/v1/sites/{site_id}/deploys",
                   f"{len(files)} files, {sum(f.size for f in files)} bytes before compression"),
+            _step("Delete the earlier versions", "DELETE", "/api/v1/sites/{site_id}/deploys/{id}", "nothing"),
         ]
 
-    def upload(self, site, files_dir, files, mode, people, token, http):
+    def remove_plan(self, site):
+        return [_step("Find the site", "GET", f"/api/v1/sites?name={site}", "nothing"),
+                _step("Delete the site with every version", "DELETE", "/api/v1/sites/{site_id}", "nothing")]
+
+    def _find(self, site, token, http):
         found = http.request("GET", "/api/v1/sites?" + urllib.parse.urlencode({"name": site, "filter": "all"}),
                              token=token)
-        site_id = None
         for s in found if isinstance(found, list) else []:
-            if isinstance(s, dict) and s.get("name") == site:
-                site_id = s.get("id")
-        if not site_id:
-            created = http.request("POST", "/api/v1/sites", token=token, json_body={"name": site})
-            site_id = created.get("id") if isinstance(created, dict) else None
-        if not isinstance(site_id, str) or not re.fullmatch(r"[A-Za-z0-9-]{1,64}", site_id):
+            if isinstance(s, dict) and s.get("name") == site and isinstance(s.get("id"), str) and _ID_RE.match(s["id"]):
+                return s
+        return None
+
+    def upload(self, site, files_dir, files, mode, people, token, http):
+        found = self._find(site, token, http)
+        if found is None:
+            found = http.request("POST", "/api/v1/sites", token=token, json_body={"name": site})
+        site_id = found.get("id") if isinstance(found, dict) else None
+        if not isinstance(site_id, str) or not _ID_RE.match(site_id):
             raise MesError("Netlify did not confirm the site, so nothing was uploaded.", hint="Try again later.",
                            code="provider_bad_answer")
+        listed = http.request("GET", f"/api/v1/sites/{site_id}/deploys", token=token, ok_missing=True)
+        earlier = [d["id"] for d in listed if isinstance(d, dict) and isinstance(d.get("id"), str)
+                   and _ID_RE.match(d["id"])] if isinstance(listed, list) else []
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
             for f in files:
                 z.writestr(f.path, f.read())
         dep = http.request("POST", f"/api/v1/sites/{site_id}/deploys", token=token, body=buf.getvalue(),
                            headers={"Content-Type": "application/zip"})
-        url = dep.get("ssl_url") if isinstance(dep, dict) else None
-        return {"url": url if _https(url) else self.site_url(site), "files": len(files)}
+        host = _host(dep.get("ssl_url")) if isinstance(dep, dict) else None
+        host = host or _host(found.get("ssl_url"))
+        if not host:
+            raise _no_address("Netlify")
+        dep_id = dep.get("id") if isinstance(dep, dict) else None
+        removed, kept = _delete_each(http, token, [f"/api/v1/sites/{site_id}/deploys/{d}" for d in earlier
+                                                   if d != dep_id])
+        return {"url": f"https://{host}", "files": len(files), "removed_earlier": removed, "earlier_not_removed": kept}
+
+    def remove(self, site, token, http):
+        found = self._find(site, token, http)
+        if found is None:
+            return {"removed": False, "versions_removed": 0, "not_removed": []}
+        http.request("DELETE", f"/api/v1/sites/{found['id']}", token=token, ok_missing=True)
+        return {"removed": True, "not_removed": []}
 
 
 class Vercel(Adapter):
@@ -493,45 +711,64 @@ class Vercel(Adapter):
     def site_url(self, site: str) -> str:
         return f"https://{site}.vercel.app"
 
-    def _team(self) -> str:
+    def _team(self, joiner: str = "?") -> str:
         team = os.environ.get("VERCEL_TEAM_ID")
         if team and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", team):
-            return "?" + urllib.parse.urlencode({"teamId": team})
+            return joiner + urllib.parse.urlencode({"teamId": team})
         return ""
 
     def plan(self, site, files, mode, people):
         return [
+            _step("List the site's earlier versions (deleted once the new one is live)", "GET",
+                  f"/v6/deployments?app={site}", "nothing"),
             _step("Upload each file", "POST", "/v2/files", f"{len(files)} files, {sum(f.size for f in files)} bytes"),
             _step("Publish this version of the site", "POST", "/v13/deployments",
                   f"the name {site} and the list of file paths and fingerprints"),
+            _step("Delete the earlier versions", "DELETE", "/v13/deployments/{id}", "nothing"),
         ]
+
+    def remove_plan(self, site):
+        return [_step("Delete the project with every version", "DELETE", f"/v9/projects/{site}", "nothing")]
 
     def upload(self, site, files_dir, files, mode, people, token, http):
         team = self._team()
-        listed = []
+        listed = http.request("GET", "/v6/deployments?" + urllib.parse.urlencode({"app": site, "limit": 100})
+                              + self._team("&"), token=token, ok_missing=True)
+        deps = listed.get("deployments") if isinstance(listed, dict) else None
+        earlier = [d["uid"] for d in deps if isinstance(d, dict) and isinstance(d.get("uid"), str)
+                   and _ID_RE.match(d["uid"])] if isinstance(deps, list) else []
+        uploaded = []
         for f in files:
             data = f.read()
             sha = hashlib.sha1(data).hexdigest()  # noqa: S324 - Vercel names files by SHA-1
             http.request("POST", "/v2/files" + team, token=token, body=data,
                          headers={"Content-Type": "application/octet-stream", "x-vercel-digest": sha,
                                   "x-vercel-size": str(len(data))})
-            listed.append({"file": f.path, "sha": sha, "size": len(data)})
+            uploaded.append({"file": f.path, "sha": sha, "size": len(data)})
         dep = http.request("POST", "/v13/deployments" + team, token=token,
-                           json_body={"name": site, "files": listed, "target": "production",
+                           json_body={"name": site, "files": uploaded, "target": "production",
                                       "projectSettings": {"framework": None}})
-        url = None
+        host = None
         if isinstance(dep, dict):
             alias = dep.get("alias")
-            first = alias[0] if isinstance(alias, list) and alias and isinstance(alias[0], str) else dep.get("url")
-            if isinstance(first, str) and re.fullmatch(r"[a-z0-9.-]{1,253}", first):
-                url = "https://" + first
-        return {"url": url or self.site_url(site), "files": len(files)}
+            host = _host(alias[0]) if isinstance(alias, list) and alias else None
+            host = host or _host(dep.get("url"))
+        if not host:
+            raise _no_address("Vercel")
+        dep_id = dep.get("id") if isinstance(dep, dict) else None
+        removed, kept = _delete_each(http, token, [f"/v13/deployments/{d}{team}" for d in earlier if d != dep_id])
+        return {"url": f"https://{host}", "files": len(files), "removed_earlier": removed, "earlier_not_removed": kept}
+
+    def remove(self, site, token, http):
+        gone = http.request("DELETE", f"/v9/projects/{site}" + self._team(), token=token, ok_missing=True)
+        return {"removed": gone is not None, "not_removed": []}
 
 
 class NotYet(Adapter):
     available = False
 
     def __init__(self, name: str, title: str) -> None:
+        super().__init__()
         self.name = name
         self.title = title
 

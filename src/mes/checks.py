@@ -28,8 +28,7 @@ Public API
     The install command from official package sources (``None`` when only a
     manual download works).
 ``tailscale_start_command(ts, plat) -> str``, ``tailscale_up_command(plat) -> str``
-``uv_install_command(probe, plat) -> str``
-``start_sign_in(probe, ts, plat) -> str | None``
+``uv_install_command(probe, plat) -> str | None``
     Runs ``tailscale up`` with a time limit to get the sign-in link. Only
     ``mes setup`` calls it, never ``mes doctor``.
 ``MODES``  ``("tailscale", "local-only")``: the network modes kept in the config.
@@ -286,8 +285,9 @@ def tailscale_install_command(probe: Probe, plat: Platform) -> str | None:
             else f"sudo dnf config-manager --add-repo {repo}"
         )
         return f"{add} && sudo dnf install -y tailscale && {enable}"
-    # Any other Linux: Tailscale's official installer, which adds its official repository.
-    return "curl -fsSL https://tailscale.com/install.sh | sh"
+    # Any other Linux: no command. Piping a script from the internet into a shell is never
+    # suggested; the person follows the official instructions for their system instead.
+    return None
 
 
 def tailscale_start_command(ts: TailscaleState, plat: Platform) -> str:
@@ -300,28 +300,19 @@ def tailscale_up_command(plat: Platform) -> str:
     return "tailscale up" if plat.kind == "macos" else "sudo tailscale up"
 
 
-def uv_install_command(probe: Probe, plat: Platform) -> str:
+UV_DOCS = "https://docs.astral.sh/uv/getting-started/installation/"
+TAILSCALE_LINUX_DOCS = "https://tailscale.com/download/linux"
+
+
+def uv_install_command(probe: Probe, plat: Platform) -> str | None:
+    """A package manager's command, or None (then the person follows uv's own instructions)."""
     if plat.kind == "macos" and probe.which("brew"):
         return "brew install uv"
     if plat.distro == "arch":
         return "sudo pacman -S uv"
-    return "curl -LsSf https://astral.sh/uv/install.sh | sh"
-
-
-def start_sign_in(probe: Probe, ts: TailscaleState, plat: Platform) -> str | None:
-    """Ask Tailscale to start a sign-in and return the link it prints, if any.
-
-    ``tailscale up`` waits until the sign-in is finished, so it runs with a
-    time limit; the link stays valid after it stops waiting.
-    """
-    if not ts.cli:
-        return None
-    res = probe.run([ts.cli, "up", "--timeout=15s"], timeout=30)
-    found = _URL_RE.findall(res.stdout + "\n" + res.stderr)
-    if found:
-        return found[0].rstrip(".,)")
-    again = tailscale_state(probe, plat)
-    return again.auth_url
+    if plat.distro == "fedora":
+        return "sudo dnf install -y uv"
+    return None
 
 
 # --------------------------------------------------------------------------- checks
@@ -357,14 +348,17 @@ def check_python(probe: Probe) -> dict[str, Any]:
 def check_uv(probe: Probe, plat: Platform) -> dict[str, Any]:
     title = _t("uv", "title")
     path = probe.which("uv")
+    fix = uv_install_command(probe, plat)
     if not path:
-        return item("uv", title, "todo", _t("uv", "why_todo"), fix=uv_install_command(probe, plat))
+        if fix is None:
+            return item("uv", title, "todo", _t("uv", "why_manual"), needs_human=True, detail=UV_DOCS)
+        return item("uv", title, "todo", _t("uv", "why_todo"), fix=fix)
     res = probe.run([path, "--version"], timeout=10)
     m = re.search(r"uv\s+(\d+(?:\.\d+)+)", res.stdout)
     if not res.ok or not m:
         return item(
-            "uv", title, "todo", _t("uv", "why_broken"),
-            fix=uv_install_command(probe, plat),
+            "uv", title, "todo", _t("uv", "why_broken") + ("" if fix else " " + _t("uv", "why_manual")),
+            fix=fix, needs_human=fix is None,
             detail=(res.stderr or res.stdout).strip()[:300] or None,
         )
     return item("uv", title, "done", _t("uv", "why_done"), detail=f"uv {m.group(1)}")
@@ -406,9 +400,12 @@ def check_tailscale(
         installed = item(ids[0], titles[0], "done", _t(ids[0], "why_done"), detail=f"found: {where}")
     else:
         fix = tailscale_install_command(probe, plat)
-        if fix is None:
+        if fix is None and plat.kind == "macos":
             installed = item(ids[0], titles[0], "todo", _t(ids[0], "why_manual_mac"), needs_human=True,
                              detail="https://tailscale.com/download/mac")
+        elif fix is None:
+            installed = item(ids[0], titles[0], "todo", _t(ids[0], "why_manual_linux"), needs_human=True,
+                             detail=TAILSCALE_LINUX_DOCS)
         else:
             installed = item(ids[0], titles[0], "todo", _t(ids[0], "why_todo"), fix=fix)
 
