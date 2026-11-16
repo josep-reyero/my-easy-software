@@ -95,7 +95,8 @@ Keys: `columns` (required), `key` (required), `prefer` (optional).
   |---|---|---|
   | `text` | `TEXT` | `str` |
   | `integer` | `INTEGER` | `int` |
-  | `real` | `REAL` | `int` or `float` |
+  | `real` | `REAL` | `int` or `float` (read back as `float`: 144 becomes 144.0) |
+  | `number` | none (the column is declared without a type: `"x",`) | `int` or `float`, read back in the form written (144 stays 144, 144.5 stays 144.5) |
   | `boolean` | `INTEGER` | `0`/`1` (the helper turns `True`/`False` into them) |
   | `json` | `TEXT` | JSON text (the helper runs `json.dumps(v, ensure_ascii=False, separators=(",", ":"))`) |
 

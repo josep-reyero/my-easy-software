@@ -23,7 +23,9 @@ columns = { date = "text", walk_km = "real", ride_km = "real", weather = "text" 
 sql = "SELECT strftime('%Y-%W', date) AS week, count(*) AS n FROM activities GROUP BY 1"
 ```
 
-Column types: `text`, `integer`, `real`, `boolean` (0/1), `json` (text holding JSON). mes stores a
+Column types: `text`, `integer`, `real` (always read back as a decimal: 144 becomes 144.0),
+`number` (a number kept as written: 144 stays 144, 144.5 stays 144.5), `boolean` (0/1), `json`
+(text holding JSON). mes stores a
 shared table as `<name>__rows` and makes the view `<name>` that everyone reads: every app's rows
 side by side, or, with `prefer`, one row per key where each column comes from the first app (in
 `prefer` order, then `[project] apps` order) that has a value for it. Dashboards and agents read

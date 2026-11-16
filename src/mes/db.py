@@ -78,7 +78,7 @@ def _create_table(t: SharedTable) -> str:
     for k in t.key:
         lines.append(f"  {_q(k)} {t.column(k).sql_type} NOT NULL,")  # type: ignore[union-attr]
     for c in t.other_columns:
-        lines.append(f"  {_q(c.name)} {c.sql_type},")
+        lines.append(f"  {_q(c.name)} {c.sql_type},".replace(" ,", ","))  # "number" has no declared type
     lines.append(f'  PRIMARY KEY ("source", {", ".join(_q(k) for k in t.key)})')
     lines.append(");")
     return "\n".join(lines)

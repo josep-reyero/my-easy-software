@@ -261,3 +261,24 @@ def test_mes_db_commands(proj, tmp_path, capsys, mes_home):
     assert json.loads(capsys.readouterr().out)["ok"] is True
     assert cli.run(["db", "sync", "--quiet", "--project-dir", root]) == 0
     assert capsys.readouterr().out == ""
+
+
+def test_a_number_column_keeps_the_form_each_value_was_written_in(tmp_path):
+    """real turns 144 into 144.0; number keeps 144 and 144.5 as they were written."""
+    import sqlite3
+
+    from mes import db as mesdb
+    from mes import manifest as m
+
+    pf = m.loads('[project]\nname = "pp"\napps = ["pp_a"]\n[tables.t]\nkey = ["k"]\n'
+                 'columns = { k = "text", n = "number", r = "real" }\n')
+    tables = pf.tables
+    sql = mesdb._create_table(tables["t"])
+    assert '"n",' in sql and '"r" REAL,' in sql
+    conn = sqlite3.connect(":memory:")
+    conn.execute(sql)
+    conn.executemany('INSERT INTO "t__rows" ("source", "k", "n", "r") VALUES (?, ?, ?, ?)',
+                     [("pp-a", "a", 144, 144), ("pp-a", "b", 144.5, 144.5), ("pp-a", "c", 144.0, 144.0)])
+    rows = conn.execute('SELECT n, r FROM "t__rows" ORDER BY k').fetchall()
+    assert [type(v) for v in rows[0]] == [int, float]
+    assert rows == [(144, 144.0), (144.5, 144.5), (144.0, 144.0)] and type(rows[2][0]) is float

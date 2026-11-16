@@ -112,7 +112,10 @@ UI_DASHBOARD_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}\Z")
 UI_TABLE_RE = SHARED_NAME_RE
 UI_ACCENT_RE = re.compile(r"^#[0-9a-fA-F]{6}\Z")
 BUCKET_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}\Z")
-COLUMN_TYPES = {"text": "TEXT", "integer": "INTEGER", "real": "REAL", "boolean": "INTEGER", "json": "TEXT"}
+# "number": no declared type (no SQLite affinity), so a value keeps the form it was written in: 144
+# stays 144 and 144.0 stays 144.0 (a REAL column would turn 144 into 144.0).
+COLUMN_TYPES = {"text": "TEXT", "integer": "INTEGER", "real": "REAL", "number": "", "boolean": "INTEGER",
+                "json": "TEXT"}
 KEY_TYPES = ("text", "integer")
 RESERVED_APP_NAMES = ("mes",)
 RESERVED_SHORT_NAMES = ("describe", "guide", "apps", "help", "sqlite", "mes")
