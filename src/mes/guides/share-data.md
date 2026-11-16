@@ -56,9 +56,12 @@ mes db schema            # tables, views and the dashboards' allowlist (--sql: t
 mes db sync              # creates what is missing, adds new columns, recreates changed views
 mes db sync --reset days # empties and recreates a shared table whose key or column type changed
 mes db rebuild           # runs every app's rebuild command (or --app <name>)
-mes db check             # differences, objects nobody declares, rows of removed apps (--prune)
+mes db check             # differences, objects nobody declares, app tables not in [data] tables,
+                         # rows of removed apps (--prune)
 ```
 
 `mes jobs run` and the server's job units run `mes db sync` before a job that writes data. A change
 that would lose data (a removed column, a new type or key) is refused until you `--reset` it.
-`mes apps check` checks that every app writes only its declared tables.
+A table whose name starts with an app's table prefix (`walks_...`) belongs to that app; only that
+app's `[data] tables` should list it, and `mes db check` notes the ones it does not list. An app's
+`[data] writes` names the shared tables it writes; `ctx.db()` refuses rows for any other.

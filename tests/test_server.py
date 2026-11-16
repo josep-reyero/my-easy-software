@@ -457,6 +457,18 @@ def test_easy_ui_folders_are_compared_with_the_plan(proj, keys, tmp_path, monkey
     assert any("ui/new" in n for n in _plan(proj, keys, tmp_path).notes)
 
 
+def test_a_missing_web_address_is_explained_with_mes_options(proj, keys, tmp_path, monkeypatch):
+    exe = tmp_path / "easy-ui"
+    exe.write_text(f"#!{sys.executable}\nimport json, sys\n"
+                   "print(json.dumps({'error': {'code': 'origin_needed', 'message': 'needs the web address', "
+                   "'hint': 'Add it, for example: easy-ui units --render-only --origin https://x'}}))\n"
+                   "sys.exit(2)\n")
+    exe.chmod(0o755)
+    monkeypatch.setenv("MES_EASY_UI", str(exe))
+    notes = " ".join(_plan(proj, keys, tmp_path).notes)
+    assert "mes server plan again with --allow-host" in notes and "--origin" not in notes
+
+
 def test_without_easy_ui_the_plan_says_so(proj, keys, tmp_path):
     plan = _plan(proj, keys, tmp_path)
     assert not plan.web_units and any("easy-ui (my-easy-ui) is not installed" in n for n in plan.notes)

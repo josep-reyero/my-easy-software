@@ -120,6 +120,8 @@ def run_json(argv: Sequence[str], *, cwd: str | os.PathLike[str] | None = None,
         if not detail:
             detail = res.stderr.decode("utf-8", "replace").strip()[-2000:] or f"exit code {res.returncode}"
         cls = {2: UsageError, 3: NotFound, 5: Refused, 75: TemporaryFailure}.get(res.returncode, MesError)
-        raise cls(f"{what} did not work.", hint="See what the tool said below, fix that, and try again.",
+        err = cls(f"{what} did not work.", hint="See what the tool said below, fix that, and try again.",
                   code="tool_failed", detail=detail, detail_label="What it said:")
+        err.tool_code = str(said.get("code") or "")[:64]  # the tool's own error code, for a better hint
+        raise err
     return data

@@ -3,7 +3,7 @@
 > **Rework in progress.** Two changes are being built right now and are not finished: apps are
 > becoming proper packages inside a project, with their own jobs and schedules, contributing to a
 > project's shared data and dashboards ([design](docs/apps.md)); and dashboards are getting fully
-> flexible styles ([design](https://github.com/josep-reyero/my-easy-ui/blob/main/docs/STYLES-DESIGN.md)).
+> flexible styles ([design](https://github.com/josep-reyero/my-easy-ui/blob/main/docs/STYLES.md)).
 > Until this note is removed, expect the project file format and some commands to change, and
 > treat what is described below as the previous shape.
 

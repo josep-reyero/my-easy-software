@@ -297,10 +297,11 @@ def sync(root: str | Path, *, runner: Runner | None = None, strict: bool = True,
             try:
                 done = db.sync(project, path=target)
                 database = {"file": str(target), "views_recreated": done["views_recreated"],
-                            "columns_added": done["columns_added"], "problems": done["problems"]}
+                            "columns_added": done["columns_added"], "created": done["created"],
+                            "problems": done["problems"]}
             except MesError as e:
-                warnings.append(f"The list of apps was written, but the shared database could not be brought in line "
-                                f"with project.toml: {e.message} {e.hint or ''}".strip())
+                warnings.append(f"The list of apps was written, but the shared database was left as it was: "
+                                f"{e.message} {e.hint or ''}".strip())
     return {
         "project": project.name,
         "lock": str(lock),
@@ -452,10 +453,11 @@ def _cmd_sync(args: argparse.Namespace) -> Any:
         return result
     lines = [result["message"], f"Written to {result['lock']}."]
     lines += [f"- {a['name']} ({a['short']}): {a['location']}" for a in result["apps"]]
-    changed = (result["database"] or {}).get("views_recreated") or []
-    if changed:
-        lines.append(f"The shared database now follows the apps list: the views {', '.join(changed)} were made "
-                     "again, so they show the rows of exactly the apps listed in project.toml.")
+    from mes import db
+
+    said = db.describe_changes(result["database"] or {})
+    if said:
+        lines.append(f"The shared database follows project.toml now. {said}")
     lines += [f"Please note: {w}" for w in result["warnings"]]
     return "\n".join(lines)
 

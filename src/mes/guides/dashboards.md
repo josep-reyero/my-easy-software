@@ -3,8 +3,9 @@
 How to show a project's data in a dashboard, preview it, and keep it working on a server.
 
 Dashboards are YAML files in `ui/dashboards/` read by the dashboard server easy-ui (my-easy-ui):
-named, read-only queries plus fixed components. No JavaScript, HTML or CSS. See every component
-with `easy-ui components`; check files with `easy-ui validate`.
+named, read-only queries plus fixed components. Dashboard files hold no code; the look lives in
+`ui/theme.yaml` and `ui/styles/` (see "Change the look" below). See every component with
+`easy-ui components`; check files with `easy-ui validate`.
 
 A project shows its own dashboards (`ui/dashboards/<slug>.yaml`) and the ones its apps ship
 (`[ui] dashboards` in an `app.toml`, files in the app's `dashboards/` folder). Apps can also add
@@ -30,6 +31,27 @@ Steps:
 3. Edit or add `ui/dashboards/<name>.yaml` and list it in `[ui] dashboards`.
 4. `uv run mes dev`: one link on this computer; the page updates when you save and lists mistakes.
    `easy-ui compose --project-dir . --json` shows the final dashboards and where each part came from.
+
+## Change the look
+
+Colours, fonts, spacing and how charts and cards are drawn can all change, without touching the
+dashboard files:
+
+- **A ready-made theme**: `easy-ui themes` lists them (almanac, dusk, harbour, instrument,
+  trail); `easy-ui theme use NAME` copies one to `ui/theme.yaml`, which you can then edit (named
+  colours, fonts and sizes, with a `dark:` part for dark mode).
+- **Your own stylesheets**: plain CSS files in `ui/styles/*.css`, applied after easy-ui's own,
+  in file-name order, and only inside the dashboard area. `easy-ui style-guide` lists every
+  stable class name (`.eui-title`, `.eui-value`, ...) and custom property (`--eui-...`) they may
+  use. Fonts and pictures go in `ui/assets/` (woff2, png, jpg, webp or plain svg).
+- **One chart or card only**: give the component an `id:` in the dashboard file (`id: heart`) and
+  style it in a stylesheet with `[data-id="heart"] { ... }`.
+
+Check with `easy-ui validate` (it checks the theme, the stylesheets and the assets too) and look
+with `uv run mes dev` or `easy-ui screenshot <dashboard>`. An app can ship its own look as well
+(its `styles/` and `assets/` folders); the project's files always win.
+
+## Where it runs
 
 Only the allowlist ever reaches a dashboard, and only the dashboards' own
 queries run on them. On a server the dashboard server runs as its own account

@@ -282,3 +282,42 @@ def test_a_number_column_keeps_the_form_each_value_was_written_in(tmp_path):
     rows = conn.execute('SELECT n, r FROM "t__rows" ORDER BY k').fetchall()
     assert [type(v) for v in rows[0]] == [int, float]
     assert rows == [(144, 144.0), (144.5, 144.5), (144.0, 144.0)] and type(rows[2][0]) is float
+
+
+def test_a_type_change_says_both_types_once(proj, tmp_path):
+    path = tmp_path / "pp.sqlite"
+    db.sync(proj, path=path)
+    root = tmp_path / "pp"
+    (root / "project.toml").write_text(PROJECT.replace('steps = "integer"', 'steps = "text"'))
+    with pytest.raises(db.SchemaError) as e:
+        db.sync(manifest.load(root), path=path)
+    assert e.value.message.startswith("days.steps changed from integer (or boolean) to text in project.toml")
+    assert e.value.message.count("brought in line") == 0
+
+
+def test_sync_changes_are_said_in_plain_words():
+    assert db.describe_changes({"created": ["outings__rows", "outings"], "views_recreated": ["daily"]}) == (
+        "Made the shared table outings; remade the view daily so it shows the rows of exactly the listed apps.")
+    assert db.describe_changes({"created": [], "views_recreated": []}) is None
+
+
+def test_schema_text_is_readable(proj, capsys):
+    from mes import cli
+
+    assert cli.run(["db", "schema", "--project-dir", str(proj.root)]) == 0
+    out = capsys.readouterr().out
+    assert "- days: key date; columns date (text), steps (integer)" in out and "{" not in out
+    assert "- things: key id;" in out and "first of pp-b" in out and "Dashboards may read: days" in out
+
+
+def test_check_notes_an_apps_table_it_does_not_list(proj, tmp_path):
+    path = tmp_path / "pp.sqlite"
+    db.sync(proj, path=path)
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE a_own (x)")
+    conn.execute("CREATE TABLE a_extra (x)")
+    conn.commit()
+    conn.close()
+    res = db.check(proj, path=path)
+    assert res["unlisted"] == ["a_extra (pp-a)"] and res["ok"]
+    assert "a_extra (pp-a) belongs to an app by name" in res["message"]

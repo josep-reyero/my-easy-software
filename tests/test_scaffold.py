@@ -739,3 +739,10 @@ def test_new_with_another_first_app(tmp_path):
     result = scaffold.create("my-notes", directory=tmp_path / "p", framework_path=FRAMEWORK, short="diary")
     assert result["app"] == "my-notes-diary" and (tmp_path / "p" / "apps" / "my_notes_diary" / "cli.py").is_file()
     assert manifest.load(tmp_path / "p").apps["my-notes-diary"].prefix == "diary_"
+
+
+def test_an_apps_agents_md_is_described_as_the_apps(tmp_path):
+    from mes import scaffold
+
+    assert scaffold._purpose("AGENTS.md") == "how an AI agent should use the project"
+    assert scaffold._purpose("apps/notes_main/AGENTS.md") == "how an AI agent should use this app"

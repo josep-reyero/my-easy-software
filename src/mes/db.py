@@ -176,6 +176,39 @@ def _objects(conn: sqlite3.Connection) -> dict[str, tuple[str, str | None]]:
         "SELECT name, type, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'")}
 
 
+def _type_word(sql_type: str) -> str:
+    """A declared SQLite type in project.toml's words."""
+    return {"TEXT": "text", "INTEGER": "integer (or boolean)", "REAL": "real", "": "number"}.get(sql_type,
+                                                                                               sql_type.lower())
+
+
+def describe_changes(done: dict[str, Any]) -> str | None:
+    """What a sync changed, in one plain sentence (None when nothing changed)."""
+    def names(items: list[str]) -> str:
+        return " and ".join([", ".join(items[:-1]), items[-1]]) if len(items) > 1 else items[0]
+
+    created = [n.removesuffix("__rows") for n in done.get("created", []) if n.endswith("__rows")]
+    new_views = [n for n in done.get("created", []) if not n.endswith("__rows") and n not in created]
+    parts = []
+    if created:
+        parts.append(f"made the shared table{'s' if len(created) > 1 else ''} {names(created)}")
+    if done.get("columns_added"):
+        cols = done["columns_added"]
+        parts.append(f"added the column{'s' if len(cols) > 1 else ''} {names(cols)}")
+    if new_views:
+        parts.append(f"made the view{'s' if len(new_views) > 1 else ''} {names(new_views)}")
+    if done.get("views_recreated"):
+        views = done["views_recreated"]
+        parts.append(f"remade the view{'s' if len(views) > 1 else ''} {names(views)} so "
+                     f"{'they show' if len(views) > 1 else 'it shows'} the rows of exactly the listed apps")
+    if done.get("dropped"):
+        parts.append(f"emptied and remade {names(done['dropped'])} (--reset)")
+    if not parts:
+        return None
+    text = "; ".join(parts)
+    return text[0].upper() + text[1:] + "."
+
+
 def _conflict(name: str, problem: str) -> SchemaError:
     return SchemaError(
         f"The project's database cannot be brought in line with project.toml: {problem} mes only makes changes "
@@ -226,7 +259,10 @@ def ensure_schema(conn: sqlite3.Connection, project: Project) -> dict[str, Any]:
                     conn.execute(f"ALTER TABLE {_q(t.rows_table)} ADD COLUMN {_q(name)} {w[1]}")
                     done["columns_added"].append(f"{t.name}.{name}")
                 elif h[1] != w[1] or h[2] != w[2]:
-                    raise _conflict(t.name, f'the column "{name}" of {t.name} changed its type (it was {h[1]}).')
+                    raise SchemaError(
+                        f"{t.name}.{name} changed from {_type_word(h[1])} to {_type_word(w[1])} in project.toml, which "
+                        "could lose values, so the shared database was not changed.",
+                        hint=RESET_HINT.format(name=t.name))
         idx = objects.get(t.index_name)
         want_idx = [k for k in t.key]
         if idx is not None and idx[0] != "index":
@@ -340,7 +376,7 @@ def check(project: Project, *, prune: bool = False, path: Path | None = None) ->
     target = path or db_path(project)
     if not target.is_file():
         return {"project": project.name, "file": str(target), "exists": False, "ok": True, "missing": [],
-                "differ": [], "undeclared": [], "orphan_rows": {}, "pruned": 0,
+                "differ": [], "undeclared": [], "unlisted": [], "orphan_rows": {}, "pruned": 0,
                 "message": "The project's database does not exist yet; it is made the first time an app writes data."}
     conn = connect(target, write=prune)
     try:
@@ -365,11 +401,17 @@ def check(project: Project, *, prune: bool = False, path: Path | None = None) ->
             | {t.index_name for t in project.tables.values()}
         prefixes = tuple(a.prefix for a in project.apps.values())
         undeclared = []
+        unlisted: list[str] = []
         for name, (kind, _sql) in objects.items():
             if name in known or kind == "index" and name.startswith("sqlite_autoindex"):
                 continue
-            if any(name.startswith(p) for p in prefixes):
-                continue  # an app's own table (or its index)
+            owner = next((a for a in project.apps.values() if name.startswith(a.prefix)), None)
+            if owner is not None:
+                # An app's own table (or its index): it belongs to the app by its name. A table the app
+                # does not list in [data] tables is only noted.
+                if kind in ("table", "view") and name not in owner.data.tables:
+                    unlisted.append(f"{name} ({owner.name})")
+                continue
             undeclared.append(f"{name} ({kind})")
         installed = list(project.apps)
         orphans: dict[str, int] = {}
@@ -410,13 +452,17 @@ def check(project: Project, *, prune: bool = False, path: Path | None = None) ->
                      + ", ".join(f"{n} in {t}" for t, n in orphans.items()))
     message = ("The database matches project.toml." if ok and not undeclared and not orphans else
                "The database differs from project.toml (" + "; ".join(parts) + ").")
+    if unlisted:
+        message += (" Please note: " + ", ".join(unlisted[:8]) + (" belong" if len(unlisted) > 1 else " belongs")
+                    + " to an app by name (its table prefix) but " + ("are" if len(unlisted) > 1 else "is")
+                    + " not in that app's [data] tables. Add them there, or remove them if nothing uses them.")
     if (missing or differ) and not prune:
         message += " Run: mes db sync"
     if orphans and not prune:
         message += " Rows of apps that are no longer installed are not shown anywhere; remove them with: mes db check --prune"
     return {"project": project.name, "file": str(target), "exists": True, "ok": ok, "missing": missing,
-            "differ": differ, "undeclared": undeclared, "orphan_rows": orphans, "pruned": pruned,
-            "problems": problems, "message": message}
+            "differ": differ, "undeclared": undeclared, "unlisted": unlisted, "orphan_rows": orphans,
+            "pruned": pruned, "problems": problems, "message": message}
 
 
 # --------------------------------------------------------------------------- the helper for apps
@@ -567,7 +613,30 @@ def _cmd_schema(args: argparse.Namespace) -> Any:
     if args.sql:
         text = schema_sql(project)
         return {"project": project.name, "sql": text} if args.json else _RawText(text)
-    return schema_info(project)
+    info = schema_info(project)
+    return info if args.json else schema_text(project, info)
+
+
+def schema_text(project: Project, info: dict[str, Any]) -> str:
+    """``mes db schema`` for a person: one readable line per table and view."""
+    lines = [f"The shared database of {project.name}: {info['file']} (one file in the project's data folder)."]
+    if project.tables:
+        lines += ["", "Shared tables (read the view of the same name):"]
+    for t in project.tables.values():
+        cols = ", ".join(f"{c.name} ({c.type})" for c in t.columns)
+        how = (f"one row per key, each value from the first of {', '.join(t.prefer)} (then the other apps) that has "
+               "one" if t.prefer else "every app's rows side by side (source says which app)")
+        lines.append(f"- {t.name}: key {', '.join(t.key)}; columns {cols}; {how}.")
+    if project.views:
+        lines += ["", "Views ([views] in project.toml):"]
+        lines += [f"- {v.name}" for v in project.views.values()]
+    own = {a: ts for a, ts in info["app_tables"].items() if ts}
+    if own:
+        lines += ["", "Apps' own tables:"]
+        lines += [f"- {a}: {', '.join(ts)}" for a, ts in own.items()]
+    lines += ["", f"Dashboards may read: {', '.join(info['allowlist']) or 'nothing yet'}.",
+              "The exact script: mes db schema --sql"]
+    return "\n".join(lines)
 
 
 class _RawText(str):
@@ -580,11 +649,11 @@ def _cmd_sync(args: argparse.Namespace) -> Any:
     result = sync(project, reset=args.reset)
     if args.json:
         return result
-    changed = result["created"] + result["columns_added"] + result["views_recreated"] + result["dropped"]
+    said = describe_changes(result)
     lines = []
-    if not args.quiet or changed or result["problems"]:
-        lines.append("The project's database matches project.toml now." if not changed else
-                     "The project's database was brought in line with project.toml: " + ", ".join(changed[:12]) + ".")
+    if not args.quiet or said or result["problems"]:
+        lines.append("The project's database matches project.toml now." if not said else
+                     f"The project's database was brought in line with project.toml. {said}")
     lines += [f"Please note: {p}" for p in result["problems"]]
     return "\n".join(lines) if lines else None
 

@@ -180,6 +180,11 @@ def _web_units(project: manifest_mod.Project, project_dir: Path, layout: paths.S
     try:
         answer = siblings.run_json(argv, what="Rendering the dashboard server's units (easy-ui units)", timeout=60)
     except MesError as e:
+        if getattr(e, "tool_code", "") == "origin_needed":
+            return {}, ["The dashboard server's units are not in this plan, because they need the web address the "
+                        "dashboards will be opened with (without it the server would refuse every request). Run "
+                        "mes server plan again with --allow-host <the server's Tailscale name>, for example "
+                        "--allow-host myserver.example.ts.net."]
         return {}, ["The dashboard server's units are not in this plan, because easy-ui could not render them: "
                     f"{(e.detail or e.message)[:500]}"]
     found = answer.get("units")

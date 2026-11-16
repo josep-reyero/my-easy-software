@@ -103,6 +103,12 @@ PURPOSES = {
     ".gitignore": "keeps this computer's private files (such as .venv/ and apps.lock.json) out of the project's code",
 }
 
+def _purpose(rel: str, default: str = "") -> str:
+    if rel.startswith("apps/") and Path(rel).name == "AGENTS.md":
+        return "how an AI agent should use this app"
+    return PURPOSES.get(rel, PURPOSES.get(Path(rel).name, default))
+
+
 # Names that would clash with Python itself or with the framework.
 _RESERVED_MODULES = {"mes", "my_easy_software", "src", "test", "tests"}
 _RESERVED_NAMES = {FRAMEWORK_NAME, "my-easy-ui", "my-bucket-storage"}
@@ -499,7 +505,7 @@ def create(
         "package": package,
         "folder": str(folder),
         "files": [
-            {"path": rel, "purpose": PURPOSES.get(rel, PURPOSES.get(Path(rel).name, ""))}
+            {"path": rel, "purpose": _purpose(rel)}
             for rel in files
         ],
         "short": short,
@@ -701,7 +707,7 @@ def new_app(name: str, *, project_dir: str | Path | None = None, title: str | No
         "package": package,
         "prefix": prefix,
         "folder": str(folder),
-        "files": [{"path": rel, "purpose": PURPOSES.get(Path(rel).name, "the app's dashboard")} for rel in files],
+        "files": [{"path": rel, "purpose": _purpose(rel, "the app's dashboard")} for rel in files],
         "changed": changed,
         "notes": notes,
         "next_steps": [
