@@ -33,7 +33,9 @@ and read nothing from the project's files):
 ``mes jobs should-run --project P --server-root R -- <job id>...``
     before a job that waits for another (``ExecCondition=+``): asks systemd how the job that
     finished last of those ended; exit 0 lets this run start, exit 1 skips it (that job failed,
-    was itself skipped, or stopped with exit code 75, "a temporary problem").
+    was itself skipped, or stopped with exit code 75, "a temporary problem"). Any other problem
+    (systemd cannot be asked, a wrong command line, an error inside mes) exits 255
+    (``SHOULD_RUN_BROKEN``), which systemd reports as a failed unit instead of a quiet skip.
 
 Run log
 -------
@@ -759,24 +761,52 @@ def record_systemd_run(project_name: str, job_name: str, server_root: str | Path
     return {k: rec[k] for k in ("time", "job", "result", "exit_code", "duration_s")}
 
 
+SHOULD_RUN_BROKEN = 255
+
+
+class ShouldRunBroken(MesError):
+    """``mes jobs should-run`` could not decide. Exit 255: in ``ExecCondition=`` systemd treats
+    1 to 254 as "skip this run" and 255 as a failure, so a broken check shows as a failed unit
+    instead of quietly skipping every run."""
+
+    exit_code = SHOULD_RUN_BROKEN
+    default_code = "should_run_broken"
+
+
+def _should_run_broken(why: str) -> ShouldRunBroken:
+    return ShouldRunBroken(
+        "mes could not tell whether the job this one waits for succeeded (" + why + "), so this run did not start "
+        "and systemd marks it as failed.",
+        hint="Run 'mes server check <project>' on the server, and look at: journalctl -u <this unit>.")
+
+
 def should_run(project_name: str, upstream: Sequence[str], *, server_root: str | Path,
                show: Callable[..., dict[str, str]] | None = None) -> dict[str, Any]:
     """Called as root by systemd (``ExecCondition=+``) before a job that waits for another, or
     before the dashboard refresh. Of the listed jobs, the one that finished last started this
-    run; it may go ahead only if that one really succeeded (not exit code 75, not skipped)."""
-    paths.server_layout(project_name, server_root)  # checks the project name
+    run; it may go ahead only if that one really succeeded (not exit code 75, not skipped).
+
+    Returns when it may run (exit 0); raises ``MesError`` with code ``upstream_skipped`` (exit 1,
+    systemd skips the run) when that job did not succeed; anything else is ``ShouldRunBroken``
+    (exit 255, systemd fails the unit)."""
+    try:
+        paths.server_layout(project_name, server_root)  # checks the project name
+    except MesError:
+        raise _should_run_broken(f"{str(project_name)[:40]!r} is not a project name") from None
     if not upstream:
-        raise UsageError("No job was named.", hint="Name the jobs after --.")
+        raise _should_run_broken("no job was named")
     for job in upstream:
         if not manifest_mod.JOB_ID_RE.fullmatch(job or ""):
-            raise UsageError(f"{str(job)[:70]!r} is not a job id.", hint="Use the job's id: <app>.<job>.")
+            raise _should_run_broken(f"{str(job)[:70]!r} is not a job id")
     if show is None and not _is_linux():
-        raise _not_from_systemd()
+        raise _should_run_broken("this is not a Linux server with systemd")
     look = show or _show
     latest: tuple[int, str, dict[str, str]] | None = None
     for job in upstream:
         props = look(units.job_unit(project_name, job), "Result", "ExecMainCode", "ExecMainStatus",
                      "InactiveEnterTimestampMonotonic")
+        if not props.get("Result"):
+            raise _should_run_broken(f'systemd did not say how the job "{job}" ended')
         try:
             when = int(props.get("InactiveEnterTimestampMonotonic", "0") or 0)
         except ValueError:
@@ -1116,8 +1146,17 @@ def _cmd_allow_network(args: argparse.Namespace) -> Any:
 
 
 def _cmd_should_run(args: argparse.Namespace) -> Any:
-    check_allowed("read")
-    return should_run(args.project, args.jobs, server_root=args.server_root)
+    try:
+        check_allowed("read")
+        return should_run(args.project, args.jobs, server_root=args.server_root)
+    except ShouldRunBroken:
+        raise
+    except MesError as e:
+        if e.code == "upstream_skipped":
+            raise
+        raise _should_run_broken(e.message.rstrip(".")) from None
+    except Exception as e:  # noqa: BLE001 - never a quiet skip
+        raise _should_run_broken(f"an error inside mes: {type(e).__name__}") from None
 
 
 def _project_dir_arg(p: argparse.ArgumentParser) -> None:

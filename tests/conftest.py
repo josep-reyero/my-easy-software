@@ -10,11 +10,26 @@ change the real ones:
 
 Fixture ``mes_home`` returns a dict with the paths: ``root``, ``data``,
 ``state``, ``config`` (the config file path) and ``xdg_config``.
+
+Fixture ``report_note`` adds a line to the end of the test run's output (for example which uv
+version a test checked against).
 """
 
 from __future__ import annotations
 
 import pytest
+
+_NOTES: list[str] = []
+
+
+@pytest.fixture
+def report_note():
+    return _NOTES.append
+
+
+def pytest_terminal_summary(terminalreporter):
+    for note in _NOTES:
+        terminalreporter.write_line(note)
 
 
 @pytest.fixture(autouse=True)

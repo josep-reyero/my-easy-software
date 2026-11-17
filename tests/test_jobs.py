@@ -528,8 +528,45 @@ def test_should_run_follows_the_job_that_finished_last():
     states[unit("demo", "app-a.one")]["Result"] = "exec-condition"  # it was skipped itself
     with pytest.raises(MesError):
         jobs.should_run("demo", ["app-a.one", "app-a.two"], server_root="/var/lib/mes", show=show_with(states))
-    with pytest.raises(UsageError):
+    with pytest.raises(jobs.ShouldRunBroken):
         jobs.should_run("demo", ["../x"], server_root="/var/lib/mes", show=show_with(states))
+
+
+def test_should_run_exits_0_to_run_1_to_skip_and_255_when_it_cannot_tell(capsys, monkeypatch):
+    """In ExecCondition= systemd skips the run on exit 1 to 254, so a broken check (exit 1 to 5)
+    quietly skipped every dashboard refresh. Now: 0 run, 1 upstream did not succeed, 255 broken
+    (systemd fails the unit), with a message of its own."""
+    ok = {"Result": "success", "ExecMainCode": "1", "ExecMainStatus": "0", "InactiveEnterTimestampMonotonic": "5"}
+    state = {"props": ok}
+    monkeypatch.setattr(jobs, "_is_linux", lambda: True)
+    monkeypatch.setattr(jobs, "_show", lambda unit, *props: state["props"])
+    argv = ["jobs", "should-run", "--project", "demo", "--server-root", "/var/lib/mes", "--", "demo-app.sync"]
+    assert mes(capsys, *argv) == (0, {"run": True, "after": "demo-app.sync"})
+    state["props"] = {**ok, "Result": "exit-code"}
+    code, data = mes(capsys, *argv)
+    assert code == 1 and data["error"]["code"] == "upstream_skipped"
+    broken = []
+    state["props"] = {}  # systemctl could not be asked
+    broken.append(mes(capsys, *argv))
+    state["props"] = ok
+    monkeypatch.setattr(jobs, "_is_linux", lambda: False)
+    broken.append(mes(capsys, *argv))  # not a systemd server (said "only records a run" before)
+    monkeypatch.setattr(jobs, "_is_linux", lambda: True)
+
+    def explode(*a):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(jobs, "_show", explode)
+    broken.append(mes(capsys, *argv))  # an error inside mes
+    broken.append(mes(capsys, "jobs", "should-run", "--project", "demo", "--server-root", "/var/lib/mes",
+                      "--bogus", "--", "demo-app.sync"))  # a command line it does not understand
+    broken.append(mes(capsys, "jobs", "should-run", "--project", "demo", "--server-root", "/var/lib/mes",
+                      "--", "../x"))
+    for code, data in broken:
+        assert code == 255 == jobs.SHOULD_RUN_BROKEN, (code, data)
+        assert data["error"]["code"] == "should_run_broken"
+        assert data["error"]["message"].startswith("mes could not tell whether the job this one waits for succeeded")
+        assert "run log" not in data["error"]["message"]
 
 
 def test_allow_network_for_the_selftest_allows_only_its_test_address(tmp_path):

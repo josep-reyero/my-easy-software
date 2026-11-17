@@ -17,8 +17,10 @@ plain pass or fail per claim:
   sandbox), writing data (not from a read request), the network (none, except the package index
   for the install step, never this computer or the local network; for the host-list job only its
   one address, with names only from its own hosts file), the host's service sockets (systemd,
-  D-Bus, resolved, Tailscale, Docker, ...), the gate's deploy socket, privileges, other accounts'
-  processes, and the system calls uv needs in the deploy sandbox.
+  D-Bus, resolved, Tailscale, Docker, ...; the install step sees exactly systemd-resolved's socket
+  and nothing else under /run), the gate's deploy socket, privileges, other accounts' processes,
+  and the system calls uv needs in the deploy sandbox. A blocked address passes only when the
+  filter itself refused it (EPERM or EACCES); any other failure is reported as ``todo``.
 - From the gate's side: that it refuses to run anything without the request sandboxes
   (``REQUIRE_SANDBOX_ON_SERVER`` is on), and what systemd says the host-list probe's address
   filter is (``IPAddressAllow``/``IPAddressDeny``).
@@ -28,7 +30,9 @@ reason, never as passed.
 
 Public API
 ----------
-``probe(layout, context) -> dict``     one sandbox's checklist (``context``: job, read, write, deploy).
+``probe(layout, context) -> dict``     one sandbox's checklist. ``context``: ``job`` (a job without
+    network), ``net`` (a job that lists hosts), ``read`` and ``write`` (the gate's request
+    sandboxes), ``deploy`` (the install step) and ``publish`` (the publish step).
 ``run_inside(where, run_child) -> dict``  the gate's side: every sandbox, plus the job probe.
 ``outside(layout) -> list[dict]``      the checks from the calling account.
 ``run(project, *, server_root, host, login_key) -> dict``  the whole checklist (``mes server selftest``).
@@ -157,17 +161,11 @@ def probe(layout: paths.ServerLayout, context: str) -> dict[str, Any]:
                 ok, what = _fails(lambda f=folder: os.listdir(f))
                 items.append(_item(pre + f"no-{name}", f"{where} cannot see the {name} folder", ok,
                                    f"{name}/ is not there for it ({what}).", f"It can list {name}/."))
-    hidden = [p for p in HOST_SOCKETS if os.path.lexists(p)]
-    items.append(_item(pre + "host-sockets", f"{where} cannot see the server's service sockets", not hidden,
-                       "None of systemd's, D-Bus's, the name service's, Tailscale's or the container tools' sockets "
-                       "is there.", "It can see: " + ", ".join(hidden[:8]) + "."))
+    items.append(_host_sockets(pre, where, context))
     if context == "deploy":
-        ok, what = _fails(lambda: _connect("127.0.0.1", 22))
-        items.append(_item(pre + "loopback", "the install step cannot reach this computer's own services", ok,
-                           f"127.0.0.1 is blocked ({what}).", "It can connect to 127.0.0.1."))
-        ok, what = _fails(lambda: _connect("192.168.1.1", 80))
-        items.append(_item(pre + "lan", "the install step cannot reach the local network", ok,
-                           f"192.168.0.0/16 is blocked ({what}).", "It can connect to 192.168.1.1."))
+        items.append(_filtered(pre + "loopback", "the install step cannot reach this computer's own services",
+                               "127.0.0.1", 22))
+        items.append(_filtered(pre + "lan", "the install step cannot reach the local network", "192.168.1.1", 80))
         items.append(_uv_syscalls(layout))
     elif context == "net":
         items += _net_checks(pre)
@@ -177,18 +175,83 @@ def probe(layout: paths.ServerLayout, context: str) -> dict[str, Any]:
         items.append(_item(pre + "network", f"{where} has no network", ok,
                            f"Nothing on the internet can be reached ({', '.join(r[1] for r in results)}).",
                            "It can reach the internet."))
-    euid = os.geteuid()
-    nnp = _status_field("NoNewPrivs")
-    cap = _status_field("CapEff")
-    items.append(_item(pre + "privileges", f"{where} runs without privileges", euid != 0 and nnp in ("1", None)
-                       and (cap is None or int(cap, 16) == 0),
-                       f"Not root (uid {euid}), no new privileges, no capabilities.",
-                       f"uid {euid}, NoNewPrivs {nnp}, capabilities {cap}."))
+    items.append(_privileges(pre, where))
     items.append(_item(pre + "processes", f"{where} cannot see other accounts' processes",
                        None if not os.path.isdir("/proc/self") else not os.path.exists("/proc/1"),
                        "The system's first process (root's) is invisible.", "skipped: /proc is not there."
                        if not os.path.isdir("/proc/self") else "It can see root's processes."))
     return {"context": context, "items": items}
+
+
+# The one host socket the install step sees on purpose (its units bind it for name lookups), and
+# the folders systemd makes on the way to it. Nothing else may be under /run there.
+INSTALL_SOCKETS = (units.RESOLVE_SOCKET,)
+
+
+def _allowed_run_paths(context: str) -> set[str]:
+    if context != "deploy":
+        return set()
+    out: set[str] = set()
+    for path in INSTALL_SOCKETS:
+        parts = Path(path).parts
+        out |= {str(Path(*parts[:i])) for i in range(3, len(parts) + 1)}  # /run/x, /run/x/y, ...
+    return out
+
+
+def _under_run(limit: int = 200) -> list[str]:
+    """Everything under /run, without following links (at most ``limit`` entries)."""
+    found: list[str] = []
+    for top, dirs, names in os.walk("/run", followlinks=False):
+        for n in sorted(dirs) + sorted(names):
+            found.append(os.path.join(top, n))
+            if len(found) >= limit:
+                return found
+    return found
+
+
+def _host_sockets(pre: str, where: str, context: str, *, exists=os.path.lexists, under_run=None) -> dict[str, Any]:
+    """No service socket of the host is there. The install step sees exactly the resolver's socket
+    (its unit binds it on purpose), and nothing else under /run."""
+    allowed = _allowed_run_paths(context)
+    seen = [p for p in HOST_SOCKETS if exists(p) and p not in allowed]
+    if context == "deploy":
+        seen += [p for p in (under_run or _under_run)() if p not in allowed and p not in seen]
+    note = " Only systemd-resolved's socket is there, for name lookups." if allowed else ""
+    return _item(pre + "host-sockets", f"{where} cannot see the server's service sockets", not seen,
+                 "None of systemd's, D-Bus's, the name service's, Tailscale's or the container tools' sockets "
+                 "is there." + note, "It can see: " + ", ".join(seen[:8]) + ".")
+
+
+def _filtered(id: str, title: str, host: str, port: int) -> dict[str, Any]:
+    """Blocked by systemd's address filter: only its own refusal at connect (EPERM or EACCES)
+    proves that. A timeout or a refused connection can happen without the filter."""
+    e = _errno_of(lambda: _connect(host, port))
+    if e is None:
+        return _item(id, title, False, "", f"It can connect to {host}.")
+    if e in ("EPERM", "EACCES"):
+        return _item(id, title, True, f"{host} is refused by the address filter ({e}).", "")
+    return protocol.item(id, title, "todo",
+                         f"todo: mes cannot tell whether the address filter blocks {host}: connecting failed with {e}, "
+                         "not with the filter's own refusal (EPERM or EACCES), and that can happen without the filter. "
+                         "Check the journal for 'BPF firewalling not supported' and that the kernel has cgroup BPF.")
+
+
+def _privileges(pre: str, where: str, status=None) -> dict[str, Any]:
+    euid = os.geteuid()
+    field = status or _status_field
+    nnp, cap = field("NoNewPrivs"), field("CapEff")
+    title = f"{where} runs without privileges"
+    if nnp is None or cap is None:
+        return protocol.item(pre + "privileges", title, "todo",
+                             f"todo: /proc/self/status could not be read (uid {euid}), so mes cannot tell whether the "
+                             "sandbox has no new privileges and no capabilities.")
+    try:
+        caps = int(cap, 16)
+    except ValueError:
+        caps = -1
+    ok = euid != 0 and nnp == "1" and caps == 0
+    return _item(pre + "privileges", title, ok, f"Not root (uid {euid}), no new privileges, no capabilities.",
+                 f"uid {euid}, NoNewPrivs {nnp}, capabilities {cap}.")
 
 
 def _install_target(layout: paths.ServerLayout) -> list[dict[str, Any]]:
@@ -205,10 +268,30 @@ def _install_target(layout: paths.ServerLayout) -> list[dict[str, Any]]:
                        ok if layout.releases.is_dir() else None,
                        f"code/releases/ is read-only for it ({what}).", "It can write code/releases/."
                        if layout.releases.is_dir() else "skipped: code/releases/ is not there."))
+    builds = _builds_allowed(layout)
     ok, what = _fails(lambda: _try_write(layout.uv_cache))
-    items.append(_item("deploy-uv-cache", "the install step can use uv's cache", not ok,
-                       "It can write uv's cache.", f"It cannot write uv's cache ({what})."))
+    if builds is None:
+        items.append(_item("deploy-uv-cache", "the install step uses the right uv cache", None, "",
+                           "skipped: the server settings could not be read, so mes cannot tell which cache it should use."))
+    elif builds:
+        items.append(_item("deploy-uv-cache", "the install step cannot change the shared uv cache (packages may be "
+                           "built on this server)", ok, f"The shared cache is not writable for it ({what}): build code "
+                           "gets a cache of the release's own.", "It can write the shared uv cache, so build code "
+                           "could leave files there for the next deploy."))
+    else:
+        items.append(_item("deploy-uv-cache", "the install step can use uv's cache", not ok,
+                           "It can write uv's cache.", f"It cannot write uv's cache ({what})."))
     return items
+
+
+def _builds_allowed(layout: paths.ServerLayout) -> bool | None:
+    from mes import deploy
+    from mes.errors import MesError
+
+    try:
+        return deploy.read_server_config(layout).get("allow_builds") is True
+    except (MesError, OSError):
+        return None
 
 
 def _errno_of(action) -> str | None:

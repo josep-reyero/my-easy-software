@@ -566,12 +566,103 @@ def test_deploy_sandbox_tools_are_out_of_reach_of_jobs(files, layout):
 
 
 def test_deploy_sandbox_cannot_reach_this_computer_or_the_local_network(files):
-    """Finding 8: uv sync ran with unrestricted network."""
-    deny = one(files["mes-demo.gate-deploy@.service"], "IPAddressDeny").split()
-    for net in ("127.0.0.0/8", "::1/128", "169.254.0.0/16", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
-                "100.64.0.0/10", "fc00::/7", "fe80::/10", "224.0.0.0/4", "ff00::/8"):
-        assert net in deny
-    assert values(files["mes-demo.gate-deploy@.service"], "IPAddressAllow") == []
+    """Finding 8: uv sync ran with unrestricted network. systemd's own sets cover this computer
+    (localhost), link-local and multicast in IPv4 and IPv6; private, Tailscale (CGNAT) and
+    unique-local ranges are listed. What cannot be known when rendering is said plainly."""
+    text = files["mes-demo.gate-deploy@.service"]
+    deny = one(text, "IPAddressDeny").split()
+    for net in ("localhost", "link-local", "multicast", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+                "100.64.0.0/10", "fc00::/7", "fec0::/10", "0.0.0.0/8", "240.0.0.0/4", "::/128"):
+        assert net in deny, net
+    assert values(text, "IPAddressAllow") == []
+    assert "# Not covered: this server's own public addresses and the global IPv6 addresses of other machines on" \
+        in text.split("\n")
+    import ipaddress
+
+    nets = [ipaddress.ip_network(n) for n in deny if "/" in n]
+    for addr in ("127.0.0.1", "10.1.2.3", "100.100.100.100", "192.168.1.1", "169.254.169.254", "fd7a:115c:a1e0::1"):
+        a = ipaddress.ip_address(addr)
+        assert any(a in n for n in nets) or a.is_loopback or a.is_link_local, addr
+
+
+def test_server_builds_get_no_shared_cache_or_python(project, layout):
+    """--allow-server-builds: package build code runs in the install step, so the shared
+    code/uv-cache and code/uv-python must not be writable there (nor visible): uv's cache and
+    Python are folders of the release being installed."""
+    plain = units.render_gate(project, layout=layout, mes=MES)["mes-demo.gate-deploy@.service"]
+    built = units.render_gate(project, layout=layout, mes=MES, allow_builds=True)["mes-demo.gate-deploy@.service"]
+    assert {str(layout.uv_cache), str(layout.uv_python)} <= set(_writable(plain))
+    assert _writable(built) == [str(layout.installing)]
+    hidden = " ".join(values(built, "InaccessiblePaths")).split()
+    assert f"-{layout.uv_cache}" in hidden and f"-{layout.uv_python}" in hidden
+    env = values(built, "Environment")
+    own = f"{layout.installing}/{units.INSTALL_UV_DIR}"
+    assert f'"UV_CACHE_DIR={own}/cache"' in env and f'"UV_PYTHON_INSTALL_DIR={own}/python"' in env
+    assert not any(str(layout.uv_cache) in e or str(layout.uv_python) in e for e in env)
+    # The plan, its fingerprint and the deploy's 'units changed' check all render the same thing.
+    from mes import deploy
+
+    rendered = units.render_project(project, layout=layout, mes=MES, allow_builds=True)
+    assert rendered["mes-demo.gate-deploy@.service"] == built
+    assert deploy.units_fingerprint(project, layout, MES, None, allow_builds=True) != \
+        deploy.units_fingerprint(project, layout, MES, None)
+
+
+# Each deploy step's sandbox: what it may read and write of the server folder and its network.
+# A change that widens one of them must change this table on purpose.
+DEPLOY_STEPS = {
+    # The install step: uv and mes's wheel unpacker, the package index.
+    "mes-demo.gate-deploy@.service": {
+        "read": {"etc", "code"}, "write": {"code/uv-cache", "code/uv-python", "code/installing"},
+        "network": "internet without this computer or the local network"},
+    # The describe step (a read request): the apps describe themselves, no network.
+    "mes-demo.gate-read@.service": {"read": {"code", "data", "state", "store"}, "write": set(), "network": "none"},
+    # The publish step: easy-ui writes ui/, no network.
+    "mes-demo.gate-publish@.service": {"read": {"etc", "code"}, "write": {"ui"}, "network": "none"},
+}
+
+
+def _server_parts(text: str, layout, key: str) -> set[str]:
+    base = str(layout.base) + "/"
+    out = set()
+    for v in values(text, key):
+        for w in v.split():
+            src = w.lstrip("-").split(":")[0]
+            if src.startswith(base):
+                out.add(src[len(base):])
+            elif src not in ("/opt/mes", "/usr/local/bin", "/usr/local/lib", "/usr/local/lib64", units.RESOLVE_SOCKET):
+                out.add(src)
+    return out
+
+
+def _network(text: str) -> str:
+    if values(text, "PrivateNetwork") == ["yes"] and one(text, "IPAddressDeny") == "any" \
+            and one(text, "RestrictAddressFamilies") == "AF_UNIX":
+        return "none"
+    if values(text, "PrivateNetwork") == [] and one(text, "IPAddressDeny") == " ".join(units.DEPLOY_DENY) \
+            and one(text, "RestrictAddressFamilies") == "AF_UNIX AF_INET AF_INET6" and not values(text, "IPAddressAllow"):
+        return "internet without this computer or the local network"
+    return "something else"
+
+
+@pytest.mark.parametrize("name", sorted(DEPLOY_STEPS))
+def test_each_deploy_step_has_exactly_the_access_it_needs(files, layout, name):
+    """The deploy end-to-end test runs every step in-process, without the sandboxes; this checks
+    the rendered units of those steps instead: readable, writable and network, nothing more."""
+    want = DEPLOY_STEPS[name]
+    text = files[name]
+    write = _server_parts(text, layout, "BindPaths") | _server_parts(text, layout, "ReadWritePaths")
+    read = _server_parts(text, layout, "BindReadOnlyPaths")
+    assert write == want["write"], name
+    assert read == want["read"], name
+    assert _network(text) == want["network"], name
+    runs = [b for b in " ".join(values(text, "BindReadOnlyPaths")).split() if units.RESOLVE_SOCKET in b]
+    assert bool(runs) == (want["network"] != "none"), name  # names only for the step with the internet
+    # Secrets inside what it sees stay hidden.
+    hidden = " ".join(values(text, "InaccessiblePaths")).split()
+    assert f"-{layout.webhook_key}" in hidden and f"-{layout.incoming}" in hidden
+    if name != "mes-demo.gate-deploy@.service":
+        assert f"-{layout.uv_cache}" in hidden
 
 
 def test_temporary_exit_is_skipped_and_stops_the_chain(files):
@@ -637,9 +728,18 @@ def test_run_as_prints_a_sandboxed_systemd_run(tmp_path, layout):
     assert "User=mes-demo" in props and f"BindReadOnlyPaths={layout.code}" in props
     assert f"BindPaths={layout.data} {layout.store} {layout.state}" in props
     assert cmd[cmd.index("--") + 1:] == [f"{layout.current_project}/.venv/bin/demo-app", "login", "--user", "me"]
-    assert any(x.startswith("IPAddressDeny=") and "127.0.0.0/8" in x for x in props)
-    off = units.interactive_command(p, layout, ["demo-app", "login"], network=False)
-    assert "PrivateNetwork=yes" in [off[i + 1] for i, w in enumerate(off) if w == "-p"]
+    # No network by default, and no resolver socket: not even local or tailnet names can be looked up.
+    assert "PrivateNetwork=yes" in props and "IPAddressDeny=any" in props
+    assert not any(units.RESOLVE_SOCKET in x for x in props)
+    anyhost = units.interactive_command(p, layout, ["demo-app", "login"], network="any")
+    aprops = [anyhost[i + 1] for i, w in enumerate(anyhost) if w == "-p"]
+    assert "IPAddressDeny=" + " ".join(units.DEPLOY_DENY) in aprops and "PrivateNetwork=yes" not in aprops
+    hosts = units.interactive_command(p, layout, ["demo-app", "login"], network="hosts", addresses=["93.184.216.34"])
+    hprops = [hosts[i + 1] for i, w in enumerate(hosts) if w == "-p"]
+    assert "IPAddressDeny=any" in hprops and "IPAddressAllow=93.184.216.34" in hprops
+    assert f"BindReadOnlyPaths=-{units.RESOLVE_SOCKET}" in hprops
+    with pytest.raises(Refused):
+        units.interactive_command(p, layout, ["demo-app", "login"], network="hosts", addresses=["192.168.1.5"])
     with pytest.raises(StopIteration):
         units.interactive_command(p, layout, ["not-an-app", "x"])
 

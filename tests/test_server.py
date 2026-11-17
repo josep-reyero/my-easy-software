@@ -889,3 +889,56 @@ def test_run_as_only_prints_the_command(proj, capsys):
     assert data["command"].endswith("/var/lib/mes/demo/code/current/project/.venv/bin/demo-app login")
     code = main(["--json", "server", "run-as", "demo", "--project-dir", str(proj), "--", "rm", "-rf"])
     assert code != 0
+
+
+def test_run_as_has_no_network_unless_asked(proj, capsys, monkeypatch):
+    """run-as had the internet (and the resolver, so local and tailnet names) by default. Now:
+    nothing by default; --network HOST only that host's internet addresses; --network any the
+    internet without what systemd can block locally, with a plain note of what it cannot."""
+    from mes import jobs
+    from mes.cli import run as main
+
+    base = ["--json", "server", "run-as", "demo", "--project-dir", str(proj)]
+    code = main([*base, "--", "demo-app", "login"])
+    data = json.loads(capsys.readouterr().out)
+    assert code == 0 and data["network"] == "none" and "-p PrivateNetwork=yes" in data["command"]
+    assert "resolve" not in data["command"] and "and no network." in data["message"]
+
+    def look(host, *a, **k):
+        table = {"login.example.com": ["93.184.216.34", "192.168.1.9"], "nas.home.arpa": ["192.168.1.20"]}
+        return [(None, None, None, "", (addr, 443)) for addr in table.get(host, [])]
+
+    monkeypatch.setattr(jobs.socket, "getaddrinfo", look)
+    code = main([*base, "--network", "login.example.com", "--", "demo-app", "login"])
+    data = json.loads(capsys.readouterr().out)
+    assert code == 0, data
+    assert "-p IPAddressAllow=93.184.216.34" in data["command"] and "192.168.1.9" not in data["command"]
+    assert "-p IPAddressDeny=any" in data["command"]
+    code = main([*base, "--network", "nas.home.arpa", "--", "demo-app", "login"])
+    assert code == 75 and json.loads(capsys.readouterr().out)["error"]["code"] == "dns_failed"
+    code = main([*base, "--network", "any", "--", "demo-app", "login"])
+    data = json.loads(capsys.readouterr().out)
+    assert code == 0 and "IPAddressDeny=localhost link-local multicast" in data["command"]
+    assert data["notes"] and "this server's own public addresses" in data["notes"][0]
+    assert "this server's own public addresses" in data["message"]
+    code = main([*base, "--network", "any", "--network", "login.example.com", "--", "demo-app", "login"])
+    assert code == 2
+    capsys.readouterr()
+
+
+def test_plan_header_says_what_the_install_steps_filter_does_not_cover(proj, keys, tmp_path):
+    head = server.render_script(_plan(proj, keys, tmp_path)).split(server.PLAN_MARKER)[0]
+    assert "# Not covered: this server's own public addresses and the global IPv6 addresses of other machines" in head
+    assert "--allow-server-builds" not in head
+
+
+def test_server_builds_change_the_install_unit_of_the_plan(proj, keys, tmp_path):
+    """--allow-server-builds was only a flag in server.toml: the install unit still let package
+    build code write the shared uv cache and Python. The plan now renders that unit for it."""
+    plain = server.build_plan(proj, "demo", tools={"mes": "/bin/sh", "uv": "/bin/sh"})
+    built = server.build_plan(proj, "demo", tools={"mes": "/bin/sh", "uv": "/bin/sh"}, allow_builds=True)
+    unit = "mes-demo.gate-deploy@.service"
+    assert "BindPaths=-/var/lib/mes/demo/code/uv-cache" in plain.units[unit]
+    assert "BindPaths=-/var/lib/mes/demo/code/installing\n" in built.units[unit]
+    assert plain.fingerprint != built.fingerprint
+    assert "build code runs while" in server.render_script(built).split(server.PLAN_MARKER)[0]

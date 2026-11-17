@@ -78,6 +78,9 @@ BindPaths=-/var/lib/mes/demo/code/uv-cache -/var/lib/mes/demo/code/uv-python -/v
 InaccessiblePaths=-/var/lib/mes/demo/etc/webhook.key -/var/lib/mes/demo/code/incoming
 # Names are looked up through systemd-resolved's socket (its address 127.0.0.53 is blocked).
 BindReadOnlyPaths=-/run/systemd/resolve/io.systemd.Resolve
-# uv needs the package index, but nothing on this computer or the local network.
+# uv needs the package index, but nothing on this computer or the local network: this computer,
+# link-local, multicast, private, Tailscale (100.64.0.0/10) and IPv6 unique-local addresses are blocked.
+# Not covered: this server's own public addresses and the global IPv6 addresses of other machines on
+# the local network (they cannot be known when this file is written).
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-IPAddressDeny=0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.168.0.0/16 224.0.0.0/4 240.0.0.0/4 ::/128 ::1/128 fc00::/7 fe80::/10 ff00::/8
+IPAddressDeny=localhost link-local multicast 0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 172.16.0.0/12 192.0.0.0/24 192.168.0.0/16 198.18.0.0/15 240.0.0.0/4 ::/128 64:ff9b:1::/48 fc00::/7 fec0::/10

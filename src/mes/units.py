@@ -62,7 +62,9 @@ Public API
 ----------
 ``UNIT_PREFIX``, ``SLICE``, ``RANDOM_DELAY_SEC``, ``JOB_ALLOW_LEVEL`` (``"write"``),
 ``MARKER_PROJECT``, ``MARKER_JOB``, ``MARKER_KIND``, ``HEADER``, ``UNIT_NAME_RE``,
-``JOB_UNIT_RE``, ``RUN_LOG_FILE``, ``DEFAULT_MES_PYTHON``, ``ROOT_ENV``, ``DEPLOY_DENY``.
+``JOB_UNIT_RE``, ``RUN_LOG_FILE``, ``DEFAULT_MES_PYTHON``, ``ROOT_ENV``, ``DEPLOY_DENY`` (the address
+filter of the install step and of ``run-as --network any``), ``NETWORK_NOT_COVERED`` (what that
+filter cannot block, in plain words), ``RESOLVE_SOCKET``, ``INSTALL_UV_DIR``.
 ``job_unit(project, job_id, suffix="service")``, ``net_unit(project, job_id)``,
 ``ui_refresh_unit(project)``, ``webhook_units(project) -> (socket, service)``,
 ``webhook_socket_path(project) -> str``, ``gate_units(project, level) -> (socket, template)``,
@@ -79,14 +81,18 @@ Public API
 ``render_net_service(project, job, *, mes_python) -> str``
 ``render_ui_refresh(project, *, layout, easy_ui) -> str``
 ``render_webhook(project, *, layout, mes) -> dict[str, str]``
-``render_gate(project, *, layout, mes) -> dict[str, str]``  the gate's per-request sandboxes.
+``render_gate(project, *, layout, mes, allow_builds=False) -> dict[str, str]``  the gate's per-request
+    sandboxes; with ``allow_builds`` the install step gets uv folders of the release being
+    installed (``install_uv_folders``) and none of the shared ones.
 ``render_selftest(project, *, layout, mes) -> dict[str, str]``
 ``check_web_params(answer, *, layout, easy_ui) -> dict``  what easy-ui says, checked.
 ``check_origin(value) -> bool``, ``web_exec_start(easy_ui, ui, auth, origins) -> list[str]``.
 ``render_web(project, *, layout, params) -> dict[str, str]``  the dashboard server's units.
-``render_project(project, *, layout, mes, mes_python=DEFAULT_MES_PYTHON, easy_ui=None) -> dict[str, str]``
+``render_project(project, *, layout, mes, mes_python=DEFAULT_MES_PYTHON, easy_ui=None, allow_builds=False) -> dict[str, str]``
     File name -> text for every mes unit of the project (not the dashboard server's units,
     which ``render_web`` makes once easy-ui's parameters are known).
+``interactive_command(project, layout, argv, *, network="none", addresses=()) -> list[str]``  the
+    ``systemd-run`` command of ``mes server run-as`` (``network``: none, hosts or any).
 ``read_markers(text) -> (project | None, job | None)``
 ``SANDBOX_LINES``  the sandbox settings shared by every unit that runs project code.
 """
@@ -135,10 +141,29 @@ DEFAULT_MES_PYTHON = "/opt/mes/my-easy-software/.venv/bin/python"
 # Everything root runs for a project starts with an empty environment: nothing the project's
 # account can write (HOME, PYTHONPATH, XDG folders, the working folder) reaches root.
 ROOT_ENV = ("/usr/bin/env", "-i", "PATH=/usr/bin:/bin", "LANG=C.UTF-8")
-# The deploy sandbox needs the package index, but nothing on this computer or the local network.
-DEPLOY_DENY = ("0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12",
-               "192.168.0.0/16", "224.0.0.0/4", "240.0.0.0/4", "::/128", "::1/128", "fc00::/7", "fe80::/10",
-               "ff00::/8")
+# The install step (and 'mes server run-as --network any') needs the internet, but nothing on this
+# computer or the local network that can be named when the unit is written: systemd's own sets for
+# this computer (localhost), link-local and multicast addresses, plus the private ranges, the
+# shared range Tailscale uses (100.64.0.0/10), benchmarking, reserved and IPv6 unique-local and
+# local NAT64 ranges. Not covered (NETWORK_NOT_COVERED): this computer's own public addresses and
+# the global IPv6 addresses of other machines on the local network, which differ per network and
+# can change while the server runs.
+DEPLOY_DENY = ("localhost", "link-local", "multicast", "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "172.16.0.0/12",
+               "192.0.0.0/24", "192.168.0.0/16", "198.18.0.0/15", "240.0.0.0/4", "::/128", "64:ff9b:1::/48",
+               "fc00::/7", "fec0::/10")
+NETWORK_NOT_COVERED = ("this server's own public addresses and the global IPv6 addresses of other machines on "
+                       "the local network are not blocked (they cannot be known when the unit is written)")
+NETWORK_NOTE_LINES = (
+    "# uv needs the package index, but nothing on this computer or the local network: this computer,",
+    "# link-local, multicast, private, Tailscale (100.64.0.0/10) and IPv6 unique-local addresses are blocked.",
+    "# Not covered: this server's own public addresses and the global IPv6 addresses of other machines on",
+    "# the local network (they cannot be known when this file is written).",
+)
+# The one socket of the host the install step (and 'mes server run-as' with network) may see:
+# systemd-resolved's, for name lookups.
+RESOLVE_SOCKET = "/run/systemd/resolve/io.systemd.Resolve"
+# With server builds, uv's cache and Python of the install step live in this folder of the release.
+INSTALL_UV_DIR = ".uv"
 WEB_SOCKET_DIR = "/run/mes"
 WEB_MEMORY_DEFAULT = "256M"
 MAX_ORIGINS = 8
@@ -537,6 +562,17 @@ def _hidden(project: Project, layout, *extra: Any, webhook_key: bool = True, uv_
     return "InaccessiblePaths=" + " ".join(f"-{line_path(p)}" for p in paths_)
 
 
+def install_uv_folders(layout, *, allow_builds: bool) -> tuple[str, str]:
+    """uv's cache and Python folders for the install step. Without server builds they are the
+    shared ``code/uv-cache`` and ``code/uv-python`` (no package code runs there); with them, folders
+    of the release being installed (reached through ``code/installing``), so nothing a package's
+    build code writes is used by another deploy."""
+    if allow_builds:
+        own = f"{sandbox_path(layout.installing)}/{INSTALL_UV_DIR}"
+        return sandbox_path(f"{own}/cache"), sandbox_path(f"{own}/python")
+    return sandbox_path(layout.uv_cache), sandbox_path(layout.uv_python)
+
+
 def _program(project: Project, layout, app: str) -> str:
     spec = project.app(app)
     return sandbox_path(f"{sandbox_path(layout.current_project)}/.venv/bin/{spec.program}")
@@ -905,13 +941,18 @@ def render_webhook(project: Project, *, layout, mes: str) -> dict[str, str]:
 
 
 def render_gate(project: Project, *, layout, mes: str, uv: str | None = None,
-                easy_ui: str | None = None) -> dict[str, str]:
+                easy_ui: str | None = None, allow_builds: bool = False) -> dict[str, str]:
     """Per-request sandboxes for the gate: one socket per level (only the project's account may
     connect, from an SSH session) and a template service that systemd starts once per connection.
 
     ``read`` and ``write`` run app commands (and ``read`` also asks a new release's apps to
     describe themselves); ``deploy`` only installs a new release (uv and mes's own wheel
-    unpacker, no project code); ``publish`` only publishes the dashboards (no network)."""
+    unpacker, no project code); ``publish`` only publishes the dashboards (no network).
+
+    With ``allow_builds`` (``mes server plan --allow-server-builds``) package build code runs in
+    the install step, so that step gets no shared cache or Python at all: uv's cache and Python
+    are folders inside the release being installed, and the shared ``code/uv-cache`` and
+    ``code/uv-python`` are hidden from it."""
     p = _check_project(project.name)
     mes = check_tool_path(mes, "the path of mes")
     root = sandbox_path(layout.root)
@@ -963,25 +1004,37 @@ def render_gate(project: Project, *, layout, mes: str, uv: str | None = None,
             f"RuntimeMaxSec={'1800' if level == 'deploy' else '600' if level == 'publish' else '3700'}",
         ]
         if level == "deploy":
+            cache, python = install_uv_folders(layout, allow_builds=allow_builds)
+            if allow_builds:
+                about = ["# store, gate or sign-in folder. Packages may be built here (--allow-server-builds), so their",
+                         "# build code runs here: uv's cache and Python are folders of the release being installed,",
+                         "# and the shared ones in code/ are not there for it."]
+                writable = [layout.installing]
+                hidden = _hidden(project, layout, layout.uv_python)
+            else:
+                about = ["# store, gate or sign-in folder. uv's cache and Python are in code/, which only this step writes."]
+                writable = [layout.uv_cache, layout.uv_python, layout.installing]
+                hidden = _hidden(project, layout, uv_cache=False)
             lines += [
                 "# Installs a new release and nothing else: uv puts the locked third-party packages into the new",
                 "# release's fresh environment, and mes unpacks the release's own wheels itself. No project code",
                 "# runs here (uv never starts the new environment's Python), and it sees no data, state, ui,",
-                "# store, gate or sign-in folder. uv's cache and Python are in code/, which only this step writes.",
-                f"Environment={env_assignment('UV_CACHE_DIR', sandbox_path(layout.uv_cache))}",
-                f"Environment={env_assignment('UV_PYTHON_INSTALL_DIR', sandbox_path(layout.uv_python))}",
+                *about,
+                f"Environment={env_assignment('UV_CACHE_DIR', cache)}",
+                f"Environment={env_assignment('UV_PYTHON_INSTALL_DIR', python)}",
                 f"Environment={env_assignment('UV_NO_CONFIG', '1')}",
                 f"Environment={env_assignment('UV_LINK_MODE', 'copy')}",
                 f"Environment={env_assignment('PYTHONNOUSERSITE', '1')}",
                 *hardening(syscalls=DEPLOY_SYSCALL_LINES),
                 *_view(layout, ro=[layout.etc, layout.code]),
-                "# Writable: uv's cache and Python, and the new release only: code/installing is a link the gate",
+                ("# Writable: the new release only" if allow_builds else "# Writable: uv's cache and Python, and the new "
+                 "release only") + ": code/installing is a link the gate",
                 "# points at releases/<n> just before this step; every other release stays read-only.",
-                "BindPaths=" + " ".join(f"-{line_path(x)}" for x in (layout.uv_cache, layout.uv_python, layout.installing)),
-                _hidden(project, layout, uv_cache=False),
+                "BindPaths=" + " ".join(f"-{line_path(x)}" for x in writable),
+                hidden,
                 "# Names are looked up through systemd-resolved's socket (its address 127.0.0.53 is blocked).",
-                "BindReadOnlyPaths=-/run/systemd/resolve/io.systemd.Resolve",
-                "# uv needs the package index, but nothing on this computer or the local network.",
+                f"BindReadOnlyPaths=-{RESOLVE_SOCKET}",
+                *NETWORK_NOTE_LINES,
                 "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
                 "IPAddressDeny=" + " ".join(DEPLOY_DENY),
                 "",
@@ -1054,16 +1107,32 @@ def render_selftest(project: Project, *, layout, mes: str, mes_python: str = DEF
     }
 
 
-def interactive_command(project: Project, layout, argv: Sequence[str], *, network: bool = True) -> list[str]:
+def interactive_command(project: Project, layout, argv: Sequence[str], *, network: str = "none",
+                        addresses: Sequence[str] = ()) -> list[str]:
     """``mes server run-as``: the ``systemd-run --pty`` command (for the owner to run with sudo)
     that runs one app command that needs a terminal, such as a login, as the project's account in
     a transient unit with the same hardening block as a job: data, state and store writable, the
-    code read-only, nothing else of the server. With ``network``: the internet but nothing on
-    this computer or the local network (names through systemd-resolved's socket), as a login
-    needs; without: no network at all. mes only prints it; it never runs sudo."""
+    code read-only, nothing else of the server. mes only prints it; it never runs sudo.
+
+    ``network``: ``"none"`` (the default) no network at all and no name lookups; ``"hosts"`` only
+    ``addresses`` (internet addresses the caller looked up for the hosts it was given), names
+    through systemd-resolved's socket; ``"any"`` the internet except what ``DEPLOY_DENY`` blocks
+    (see ``NETWORK_NOT_COVERED`` for what that does not cover)."""
+    import ipaddress
+
     p = _check_project(project.name)
     if not argv:
         raise ValueError("argv must not be empty")
+    if network not in ("none", "hosts", "any"):
+        raise ValueError(network)
+    allowed: list[str] = []
+    for a in addresses:
+        addr = ipaddress.ip_address(str(a))
+        if not addr.is_global or addr.is_multicast:
+            raise _refuse("the address", a, "only internet addresses may be allowed.", "Name internet hosts.")
+        allowed.append(str(addr))
+    if (network == "hosts") != bool(allowed):
+        raise ValueError("addresses go with network='hosts' only")
     program = _program(project, layout, next(a.name for a in project.apps.values() if a.program == argv[0]))
     for w in argv:
         _no_control("the command word", w)
@@ -1079,10 +1148,15 @@ def interactive_command(project: Project, layout, argv: Sequence[str], *, networ
         *[ln for ln in _view(layout, ro=[layout.code], rw=[layout.data, layout.store, layout.state]) if not ln.startswith("#")],
         _hidden(project, layout),
     ]
-    if network:
-        props += ["BindReadOnlyPaths=-/run/systemd/resolve/io.systemd.Resolve",
+    if network == "any":
+        props += [f"BindReadOnlyPaths=-{RESOLVE_SOCKET}",
                   "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6", "IPAddressDeny=" + " ".join(DEPLOY_DENY)]
+    elif network == "hosts":
+        props += [f"BindReadOnlyPaths=-{RESOLVE_SOCKET}", "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
+                  "IPAddressDeny=any", "IPAddressAllow=" + " ".join(dict.fromkeys(allowed))]
     else:
+        # No network and no resolver socket, so not even names on the local network or the tailnet
+        # can be looked up.
         props += ["PrivateNetwork=yes", "RestrictAddressFamilies=AF_UNIX", "IPAddressDeny=any"]
     out = ["systemd-run", "--pty", "--wait", "--collect", "--quiet", f"--slice={SLICE}",
            f"--unit=mes-{p}.run-as-{os.getpid()}"]
@@ -1235,10 +1309,10 @@ def render_web(project: Project, *, layout, params: dict[str, Any]) -> dict[str,
 
 
 def render_project(project: Project, *, layout, mes: str, mes_python: str = DEFAULT_MES_PYTHON,
-                   easy_ui: str | None = None) -> dict[str, str]:
+                   easy_ui: str | None = None, allow_builds: bool = False) -> dict[str, str]:
     check_tool_path(mes_python, "the Python of mes")
     files: dict[str, str] = {}
-    files.update(render_gate(project, layout=layout, mes=mes))
+    files.update(render_gate(project, layout=layout, mes=mes, allow_builds=allow_builds))
     files.update(render_selftest(project, layout=layout, mes=mes, mes_python=mes_python))
     for job in project.jobs.values():
         files[job_unit(project.name, job.id)] = render_job_service(project, job, layout=layout, mes=mes,

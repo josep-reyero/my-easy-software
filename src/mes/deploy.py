@@ -37,19 +37,22 @@ On the server (inside the gate, as the project's account)
 4. Refuses an archive for another project, one made before the newest accepted one, or one
    accepted before, checked against ``gate/accepted.json`` (the newest accepted creation time
    and the hashes of accepted archives), which does not depend on release folders still being
-   there. A release that was interrupted (never completed) is removed and never blocks sending
+   there. That record missing while release records exist, or damaged, stops every deploy until
+   the owner re-creates it from the release records (``sudo mes server rebuild-accepted <p>``). A release that was interrupted (never completed) is removed and never blocks sending
    the same archive again.
-5. Install step, in the deploy sandbox (``gate-deploy@``: the package index but nothing on this
-   computer or the local network; writable: only the new release, through the link
-   ``code/installing`` the gate points at it, and uv's cache and Python; no data, state, ui,
-   store or gate): refuses a stray ``pyproject.toml``/``uv.toml``/``.python-version`` in
+5. Install step, in the deploy sandbox (``gate-deploy@``: the package index but not this
+   computer, link-local, multicast, private, Tailscale or IPv6 unique-local addresses, see
+   ``units.DEPLOY_DENY`` and ``units.NETWORK_NOT_COVERED``; writable: only the new release,
+   through the link ``code/installing`` the gate points at it, and uv's cache and Python; no
+   data, state, ui, store or gate): refuses a stray ``pyproject.toml``/``uv.toml``/``.python-version`` in
    ``code/`` or ``code/releases/`` and an environment that already exists, then runs
    ``uv sync --frozen --no-build --no-dev --no-install-project`` (never for the project's own
    packages), which makes a fresh ``.venv`` without ever starting its Python, and unpacks the
    archive's own wheels with ``mes.wheels`` (standard library only; no Python is started). With
    ``mes server plan --allow-server-builds`` packages may be built (their build code then runs
-   here) with a cache and a Python of the release's own, so nothing they write is used by
-   another deploy.
+   here) with a cache and a Python of the release's own (``.uv/`` in the release); the install
+   unit then does not show the shared ``code/uv-cache`` and ``code/uv-python`` at all, so
+   nothing build code writes is used by another deploy.
 6. Describe step, in a read sandbox (no network; cannot change any release): finds every app of
    the release (as ``mes apps sync`` does) and asks each app's program to describe itself. The
    gate itself (no project code) then checks what the sandbox found, writes the release's own
@@ -81,8 +84,9 @@ Client: ``export_release(root, export) -> dict``, ``collect(exported, project, w
 Server: ``operation(where, command, args, *, stdin, timeout, run_child) -> dict``,
 ``receive(...)``, ``rollback(...)``, ``list_releases(layout) -> dict``, ``child_step(where, req, *, timeout) -> dict``,
 ``check_signers(path, project, base) -> list[str]``, ``read_server_config(layout) -> dict``,
-``units_fingerprint(project, layout, mes, easy_ui) -> str``, ``tree_digest(folder) -> str``,
-``read_accepted(layout) -> dict``.
+``units_fingerprint(project, layout, mes, easy_ui, mes_python, *, allow_builds=False) -> str``, ``tree_digest(folder) -> str``,
+``read_accepted(layout) -> dict``, ``rebuild_accepted(layout) -> dict`` (``mes server rebuild-accepted``,
+run by root), ``rebuild_accepted_command(layout) -> str``.
 """
 
 from __future__ import annotations
@@ -1010,20 +1014,46 @@ def _check_release(layout: paths.ServerLayout, folder: Path, sha: str) -> dict[s
 MAX_ACCEPTED = 1000
 
 
-def read_accepted(layout: paths.ServerLayout) -> dict[str, Any]:
+def rebuild_accepted_command(layout: paths.ServerLayout) -> str:
+    """The root command that re-creates ``gate/accepted.json`` from the releases' records."""
+    try:
+        mes = read_server_config(layout).get("mes") or "/usr/local/bin/mes"
+    except (MesError, OSError):
+        mes = "/usr/local/bin/mes"
+    return f"sudo {mes} server rebuild-accepted {layout.project} --server-root {units.sandbox_path(layout.root)}"
+
+
+def _record_files(layout: paths.ServerLayout) -> list[Path]:
+    try:
+        return sorted(p for p in layout.release_records.iterdir() if p.suffix == ".json" and p.stem.isdigit())
+    except OSError:
+        return []
+
+
+def read_accepted(layout: paths.ServerLayout, *, new_release: int | None = None) -> dict[str, Any]:
     """``gate/accepted.json``: ``{"newest_created_ns": int | None, "archives": [sha256, ...]}``.
-    Missing means nothing was accepted yet (or a server set up before this record existed); a
-    damaged one stops every deploy, because replays could then not be told apart."""
+    Missing on a project that has no release records yet means nothing was accepted (a fresh
+    project starts empty). Missing while releases were installed, or damaged, stops every deploy,
+    because replays could then not be told apart; the owner re-creates it from the releases'
+    records with ``rebuild_accepted_command``. ``new_release``: the release being recorded right
+    now (its own record does not count as an earlier one)."""
     empty = {"newest_created_ns": None, "archives": []}
     try:
         fd = os.open(layout.accepted, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     except FileNotFoundError:
-        return empty
+        earlier = [p for p in _record_files(layout) if p.stem != str(new_release)]
+        if not earlier and not [n for n in _complete(layout) if n != new_release]:
+            return empty
+        raise Refused("The server's record of accepted releases (gate/accepted.json) is missing although releases "
+                      "were installed, so nothing was installed: without it an old signed archive could be sent again.",
+                      hint="Ask the owner to re-create it from the releases' records, on the server: "
+                      + rebuild_accepted_command(layout), code="missing_record") from None
     except OSError:
         fd = -1
     damaged = Refused("The server's record of accepted releases (gate/accepted.json) is damaged, so nothing was "
                       "installed: without it an old signed archive could be sent again.",
-                      hint=f"Ask the owner to look at {layout.accepted} on the server.", code="damaged_record")
+                      hint=f"Ask the owner to look at {layout.accepted} on the server; to re-create it from the "
+                      f"releases' records: {rebuild_accepted_command(layout)}", code="damaged_record")
     if fd < 0:
         raise damaged
     with os.fdopen(fd, "rb") as f:
@@ -1040,8 +1070,61 @@ def read_accepted(layout: paths.ServerLayout) -> dict[str, Any]:
     return {"newest_created_ns": newest, "archives": archives}
 
 
-def _remember_accepted(layout: paths.ServerLayout, created_ns: int, sha: str) -> None:
-    seen = read_accepted(layout)
+def rebuild_accepted(layout: paths.ServerLayout) -> dict[str, Any]:
+    """``mes server rebuild-accepted``: re-create a missing or damaged ``gate/accepted.json`` from
+    the gate's records of complete releases (``gate/releases/<n>.json``). Run by root; the file
+    is given to the owner of gate/ (the project's account), as the gate writes it. Nothing is
+    followed through a link."""
+    try:
+        st = os.lstat(layout.gate)
+    except OSError:
+        st = None
+    if st is None or not stat.S_ISDIR(st.st_mode):
+        raise NotFound(f"The gate's folder of {layout.project} is not there (or is not a folder), so nothing was "
+                       "re-created.", hint="Check --server-root and the project's name.", code="no_gate")
+    try:
+        read_accepted(layout)
+    except Refused:
+        pass  # missing or damaged: that is what this repairs
+    else:
+        if os.path.lexists(layout.accepted):
+            raise Refused("The record of accepted releases is there and readable, so it was left as it is.",
+                          hint="Nothing to do.", code="record_fine")
+    created: list[int] = []
+    archives: list[str] = []
+    for path in _record_files(layout):
+        rec = _release_record(layout, int(path.stem))
+        if rec is None:
+            continue
+        c, sha = rec.get("created_ns"), rec.get("archive_sha256")
+        if isinstance(c, int) and not isinstance(c, bool) and isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{64}", sha):
+            created.append(c)
+            archives.append(sha)
+    if not archives:
+        raise NotFound("There are no readable release records to re-create the record of accepted releases from, so "
+                       "nothing was written.", hint="A project with no releases needs no record: deploy as usual.",
+                       code="no_records")
+    tmp = layout.gate / f".accepted.{secrets.token_hex(4)}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="ascii") as f:
+            if os.geteuid() == 0:
+                os.fchown(f.fileno(), st.st_uid, st.st_gid)
+            json.dump({"newest_created_ns": max(created), "archives": list(dict.fromkeys(archives))[-MAX_ACCEPTED:]}, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, layout.accepted)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+    return {"project": layout.project, "rebuilt": str(layout.accepted), "releases": len(archives),
+            "message": f"The record of accepted releases was re-created from {len(archives)} release records. "
+            "Deploys work again."}
+
+
+def _remember_accepted(layout: paths.ServerLayout, created_ns: int, sha: str, number: int) -> None:
+    seen = read_accepted(layout, new_release=number)
     newest = created_ns if seen["newest_created_ns"] is None else max(seen["newest_created_ns"], created_ns)
     archives = [a for a in seen["archives"] if a != sha] + [sha]
     layout.gate.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -1102,7 +1185,8 @@ def _units_note(layout: paths.ServerLayout, project: manifest_mod.Project, confi
         return None
     try:
         now = units_fingerprint(project, layout, config["mes"], config.get("easy_ui"),
-                                config.get("mes_python") or units.DEFAULT_MES_PYTHON)
+                                config.get("mes_python") or units.DEFAULT_MES_PYTHON,
+                                allow_builds=config.get("allow_builds") is True)
     except (MesError, KeyError):
         return None
     if now == planned:
@@ -1113,8 +1197,9 @@ def _units_note(layout: paths.ServerLayout, project: manifest_mod.Project, confi
 
 
 def units_fingerprint(project: manifest_mod.Project, layout: paths.ServerLayout, mes: str, easy_ui: str | None,
-                      mes_python: str = units.DEFAULT_MES_PYTHON) -> str:
-    files = units.render_project(project, layout=layout, mes=mes, mes_python=mes_python, easy_ui=easy_ui)
+                      mes_python: str = units.DEFAULT_MES_PYTHON, *, allow_builds: bool = False) -> str:
+    files = units.render_project(project, layout=layout, mes=mes, mes_python=mes_python, easy_ui=easy_ui,
+                                 allow_builds=allow_builds)
     h = hashlib.sha256()
     for name in sorted(files):
         h.update(name.encode() + b"\0" + files[name].encode("utf-8") + b"\0")
@@ -1192,7 +1277,7 @@ def receive(where: Any, signature: str, stdin: BinaryIO | None, *,
     _write_record(layout, number, {**{k: info.get(k) for k in (
         "project", "version", "created", "created_ns", "commit", "dirty", "archive_sha256", "signer", "received",
         "deps", "wheels")}, "tree_sha256": tree})
-    _remember_accepted(layout, int(info["created_ns"]), sha)
+    _remember_accepted(layout, int(info["created_ns"]), sha, number)
     previous = _current_number(layout)
     _switch(layout, number)
     project = manifest_mod.load(layout.current_project)
@@ -1558,10 +1643,11 @@ def child_step(where: Any, req: dict[str, Any], *, timeout: float) -> dict[str, 
         env = _tool_env(where)
         env.pop("MES_ROOT", None)
         notes: list[str] = []
-        private = release / ".uv"
+        private = release / units.INSTALL_UV_DIR
         if allow_builds:
-            # Build code of packages runs here: it gets a cache and a Python of this release's own,
-            # so nothing it writes is used by another deploy.
+            # Build code of packages runs here: it gets a cache and a Python of this release's own
+            # (the install unit does not even show it the shared ones), so nothing it writes is
+            # used by another deploy.
             env.update(UV_CACHE_DIR=str(private / "cache"), UV_PYTHON_INSTALL_DIR=str(private / "python"))
             notes.append("Packages may be built on the server (allowed by its plan): their build code ran in the "
                          "install step, with a cache and a Python of this release's own.")

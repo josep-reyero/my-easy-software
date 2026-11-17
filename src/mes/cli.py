@@ -115,6 +115,16 @@ def _command_list(sub: Any) -> list[dict[str, Any]]:
     return [{"name": a.dest, "help": a.help} for a in sub._choices_actions]
 
 
+def _parse_error(args: Sequence[str], e: MesError) -> MesError:
+    """A command line that cannot be read. For ``mes jobs should-run`` (systemd's
+    ``ExecCondition=``) that must not look like "skip this run", so it exits 255 instead."""
+    if list(args[:2]) == ["jobs", "should-run"]:
+        from mes.jobs import _should_run_broken
+
+        return _should_run_broken("its command line was not understood: " + e.message.rstrip("."))
+    return e
+
+
 def run(argv: Sequence[str] | None = None) -> int:
     args, json_mode = protocol.pop_json_flag(sys.argv[1:] if argv is None else argv)
     if json_mode and args[:1] == ["--version"]:
@@ -129,7 +139,7 @@ def run(argv: Sequence[str] | None = None) -> int:
         if extra and not getattr(ns, "_accept_extra", False):
             parser.error(f"unrecognized arguments: {' '.join(extra)}")
     except MesError as e:
-        return protocol.emit_error(e, json_mode=json_mode)
+        return protocol.emit_error(_parse_error(args, e), json_mode=json_mode)
 
     ns.json = json_mode
     func = getattr(ns, "func", None)

@@ -146,3 +146,106 @@ def test_long_paths_get_the_shell_trampoline(tmp_path):
     script = venv / "bin" / "demo"
     assert script.read_text().startswith("#!/bin/sh\n")
     assert subprocess.run([str(script)], capture_output=True, text=True).stdout.strip() == "deep ran"
+
+
+# --------------------------------------------------------------------------- .data parts and names
+
+
+@pytest.mark.parametrize("scheme", ["headers", "data", "platlib"])
+def test_data_parts_outside_site_packages_are_refused_plainly(tmp_path, scheme):
+    """headers crashed with FileNotFoundError; data wrote into the environment's own folder. mes
+    installs only purelib and scripts of a release's own wheels and refuses the rest plainly."""
+    venv = _venv(tmp_path)
+    whl = _wheel(tmp_path, {"demo/__init__.py": b"", f"demo-0.1.0.data/{scheme}/demo/x.h": b"x"})
+    with pytest.raises(Refused) as e:
+        wheels.install(whl, venv)
+    assert e.value.code == "bad_wheel" and f"a {scheme} file" in e.value.message
+    assert not any(wheels.site_packages(venv).iterdir()) and sorted(p.name for p in venv.iterdir()) == \
+        ["bin", "lib", "pyvenv.cfg"]
+
+
+def test_purelib_and_scripts_parts_are_installed(tmp_path):
+    venv = _venv(tmp_path)
+    whl = _wheel(tmp_path, {"demo/__init__.py": b"", "demo-0.1.0.data/purelib/demo_extra.py": b"X = 1\n",
+                            "demo-0.1.0.data/scripts/demo-tool": b"#!python\nprint('tool ran')\n"})
+    wheels.install(whl, venv)
+    assert (wheels.site_packages(venv) / "demo_extra.py").read_text() == "X = 1\n"
+    tool = venv / "bin" / "demo-tool"
+    assert str(venv / "bin" / "python") in "".join(tool.read_text().splitlines(True)[:2])
+    assert subprocess.run([str(tool)], capture_output=True, text=True).stdout.strip() == "tool ran"
+    (tmp_path / "w2").mkdir()
+    nested = _wheel(tmp_path / "w2", {"demo2/__init__.py": b"", "demo2-0.1.0.data/scripts/sub/x": b"x"}, name="demo2")
+    with pytest.raises(Refused):
+        wheels.install(nested, venv)
+
+
+@pytest.mark.parametrize("name,version", [("..", "0.1.0"), (".", "0.1.0"), ("demo", ".."), ("a..b", "1"),
+                                          ("_demo", "1"), ("demo.pkg", "1"), ("demo", "1..0")])
+def test_wheel_names_follow_the_normalised_grammar(tmp_path, name, version):
+    """'..' as a name passed and its headers went into include/site/python3.X/.., one folder up."""
+    venv = _venv(tmp_path)
+    whl = _wheel(tmp_path, {"x/__init__.py": b"", f"{name}-{version}.data/headers/x.h": b"x"},
+                 name=name, version=version)
+    with pytest.raises(Refused) as e:
+        wheels.install(whl, venv)
+    assert e.value.code == "bad_wheel" and "wheel format" in e.value.message
+    assert not (venv / "include").exists() and not any(wheels.site_packages(venv).iterdir())
+
+
+def test_the_dist_info_must_match_the_file_name(tmp_path):
+    venv = _venv(tmp_path)
+    whl = _wheel(tmp_path, {"demo/__init__.py": b""}, version="0.2.0")
+    renamed = whl.with_name("demo-0.1.0-py3-none-any.whl")
+    whl.rename(renamed)
+    with pytest.raises(Refused) as e:
+        wheels.install(renamed, venv)
+    assert "another package or version" in e.value.message
+    for ok in ("my_easy_software-0.1.0", "Demo_App-1.0rc1", "demo-2!1.0.post1+local.3"):
+        assert wheels._WHEEL_NAME_RE.match(f"{ok}-py3-none-any.whl"), ok
+
+
+# --------------------------------------------------------------------------- the real uv
+
+
+def test_a_fresh_uv_sync_never_starts_the_new_environments_python(tmp_path, report_note):
+    """The install step relies on this: the one uv command, run in a release folder with no
+    environment yet, makes a fresh .venv and installs the locked packages without ever starting
+    that environment's Python (which would run every .pth startup file of what it installs).
+    Checked with the uv installed here, offline, against a local wheel (from a local --find-links
+    folder) whose .pth writes a marker."""
+    import shutil
+
+    from mes import deploy
+
+    uv = shutil.which("uv")
+    if uv is None:
+        pytest.skip("uv is not installed here, so the real install command cannot be checked")
+    version = subprocess.run([uv, "--version"], capture_output=True, text=True, check=False).stdout.strip()
+    marker = tmp_path / "marker"
+    found = tmp_path / "wheels"
+    found.mkdir()
+    pth = f"import pathlib; pathlib.Path({str(marker)!r}).write_text('ran')\n".encode()
+    _wheel(found, {"zz_marker.pth": pth, "markerpkg/__init__.py": b""}, name="markerpkg")
+    release = tmp_path / "release" / "project"
+    release.mkdir(parents=True)
+    py = f"{sys.version_info.major}.{sys.version_info.minor}"
+    (release / "pyproject.toml").write_text(
+        f'[project]\nname = "rel"\nversion = "0.1.0"\nrequires-python = ">={py}"\ndependencies = ["markerpkg"]\n')
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(tmp_path / "home"), "LANG": "C.UTF-8",
+           "UV_CACHE_DIR": str(tmp_path / "cache"), "UV_NO_CONFIG": "1", "UV_LINK_MODE": "copy", "UV_OFFLINE": "1",
+           "UV_PYTHON_DOWNLOADS": "never", "UV_PYTHON": os.path.realpath(sys._base_executable),
+           "UV_NO_PROGRESS": "1", "PYTHONNOUSERSITE": "1", "UV_NO_INDEX": "1", "UV_FIND_LINKS": str(found)}
+    lock = subprocess.run([uv, "lock"], cwd=release, env=env, capture_output=True, text=True, check=False)
+    if lock.returncode != 0:
+        pytest.skip(f"uv ({version}) could not lock the local test wheel offline: {lock.stderr.strip()[-300:]}")
+    assert not (release / ".venv").exists() and not marker.exists()
+    argv = deploy.install_argv(uv, release, wheels=True, allow_builds=False)
+    done = subprocess.run(argv, cwd=release, env=env, capture_output=True, text=True, check=False)
+    assert done.returncode == 0, done.stderr
+    site = wheels.site_packages(release / ".venv")
+    assert (site / "zz_marker.pth").is_file()  # the startup file is installed ...
+    assert not marker.exists(), f"{version} started the new environment's Python during 'uv sync'"  # ... never run
+    # The stand-in works: starting that Python on purpose runs it.
+    subprocess.run([str(release / ".venv" / "bin" / "python"), "-c", "pass"], env=env, check=True)
+    assert marker.exists()
+    report_note(f"uv checked by test_a_fresh_uv_sync_never_starts_the_new_environments_python: {version}")

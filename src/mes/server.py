@@ -37,7 +37,10 @@ virtual environment: the plan is root's, so it must come from the system-install
 ``check`` verifies the result as a checklist without root. ``remove`` renders the matching
 removal script (data is kept unless ``--delete-data``). ``selftest`` asks the real units what
 they can reach (see ``mes.selftest``). ``analyze`` renders a script of ``systemd-analyze verify``
-and ``systemd-analyze security`` calls for every unit.
+and ``systemd-analyze security`` calls for every unit. ``run-as`` prints the ``sudo systemd-run``
+command for an app command that needs a terminal (no network unless ``--network HOST`` or
+``--network any``). ``rebuild-accepted`` (run with sudo) re-creates a missing or damaged
+``gate/accepted.json`` from the releases' records.
 
 Public API
 ----------
@@ -53,6 +56,7 @@ Public API
 ``per_app(project) -> list[dict]``  each app's jobs with their network hosts, memory and time limits.
 ``plan_fingerprint(script) -> str``   the SHA-256 the header names.
 ``run_check(project_name, *, server_root, units_dir, project_dir, probe) -> checklist``
+``run_as(project_dir, name, argv, *, server_root, network=()) -> dict``
 ``register(subparsers)``
 """
 
@@ -82,7 +86,7 @@ from mes import __version__, paths, protocol, siblings, units
 from mes.buildinfo import build_id
 from mes import manifest as manifest_mod
 from mes.app import check_allowed
-from mes.errors import MesError, NotFound, Refused, UsageError
+from mes.errors import MesError, NotFound, Refused, TemporaryFailure, UsageError
 
 MAX_SERVER_NAME = 24
 MIN_SYSTEMD = 249  # PrivateIPC=, ProtectProc=, ProcSubset=, ExecCondition=
@@ -344,10 +348,11 @@ def build_plan(project_dir: str | os.PathLike[str] | None, name: str, *, server_
                 code="same_key",
             )
     plan.units = units.render_project(project, layout=layout, mes=checked["mes"], mes_python=checked["mes_python"],
-                                      easy_ui=checked["easy_ui"])
+                                      easy_ui=checked["easy_ui"], allow_builds=plan.allow_builds)
     from mes.deploy import units_fingerprint
 
-    plan.fingerprint = units_fingerprint(project, layout, checked["mes"], checked["easy_ui"], checked["mes_python"])
+    plan.fingerprint = units_fingerprint(project, layout, checked["mes"], checked["easy_ui"], checked["mes_python"],
+                                         allow_builds=plan.allow_builds)
     if project.has_dashboards and checked["easy_ui"]:
         plan.web_units, notes = _web_units(project, root_dir, layout, checked["easy_ui"], web_origins)
         plan.notes += notes
@@ -879,6 +884,13 @@ def render_script(plan: PlanInput) -> str:
         "# What each app of the project may do in its jobs (network, memory, time):",
         *[f"#   {line}" for line in _per_app_lines(plan.project)],
         "#",
+        "# Installing a release (mes deploy) may reach the internet for the package index, but not this",
+        "# computer, link-local, multicast, private, Tailscale (100.64.0.0/10) or IPv6 unique-local addresses.",
+        "# Not covered: this server's own public addresses and the global IPv6 addresses of other machines",
+        "# on the local network (they cannot be known when this plan is written).",
+        *(["# Packages may be built on this server (--allow-server-builds): their build code runs while",
+           "# installing, with a cache and a Python of that release's own."] if plan.allow_builds else []),
+        "#",
         "# It touches nothing else on this server. Running it again is safe: it brings everything back",
         "# to this plan. Undo it with the script from: mes server remove " + p,
         "#",
@@ -1172,7 +1184,7 @@ def run_check(name: str, *, server_root: str = str(paths.SERVER_ROOT), units_dir
         try:
             plan = build_plan(project_dir, p, server_root=server_root,
                               tools={k: cfg.get(k) for k in ("mes", "mes_python", "uv", "easy_ui")},
-                              units_dir=units_dir)
+                              units_dir=units_dir, allow_builds=cfg.get("allow_builds") is True)
             expected = {**plan.units, **plan.web_units}
         except MesError as e:
             items.append(_item("units-plan", "The units can be compared with the plan", None, "",
@@ -1393,6 +1405,19 @@ def _cmd_selftest(args: argparse.Namespace) -> Any:
     return selftest.run(args.project, server_root=args.server_root, host=args.host, login_key=args.login_key)
 
 
+def _cmd_rebuild_accepted(args: argparse.Namespace) -> Any:
+    from mes import deploy
+
+    check_allowed("admin")
+    layout = paths.server_layout(check_server_name(args.project), units.sandbox_path(args.server_root))
+    if os.geteuid() != 0:
+        raise Refused("This command re-creates a file in the gate's folder, which only root (or the gate) may change, "
+                      "so it was not run.", hint="Run it on the server with sudo: " + deploy.rebuild_accepted_command(layout),
+                      code="needs_root")
+    result = deploy.rebuild_accepted(layout)
+    return result if args.json else result["message"]
+
+
 def _cmd_selftest_probe(args: argparse.Namespace) -> Any:
     from mes import selftest
 
@@ -1446,10 +1471,14 @@ def first_publish(project: str, *, server_root: str, easy_ui: str,
 
 
 def run_as(project_dir: str | None, name: str, argv: list[str], *, server_root: str = str(paths.SERVER_ROOT),
-           network: bool = True) -> dict[str, Any]:
+           network: list[str] = (), resolver=None) -> dict[str, Any]:
     """The command an owner runs (with sudo, in a terminal) for an app command that needs a
-    terminal, as the project's account in a sandbox. mes only prints it."""
-    from mes.jobs import load_project
+    terminal, as the project's account in a sandbox. mes only prints it.
+
+    ``network``: empty (the default) gives no network at all; host names give only the internet
+    addresses they have now (looked up here, when the command is printed); ``["any"]`` gives
+    the internet except what systemd can block of this computer and the local network."""
+    from mes.jobs import load_project, resolve_hosts
 
     _, project = load_project(project_dir)
     if project.name != name:
@@ -1462,14 +1491,47 @@ def run_as(project_dir: str | None, name: str, argv: list[str], *, server_root: 
                          hint="For example: mes server run-as " + name + " -- " + (next(iter(programs), "<app>"))
                          + " login. The programs are: " + ", ".join(programs) + ".")
     layout = paths.server_layout(name, units.sandbox_path(server_root))
-    cmd = units.interactive_command(project, layout, argv, network=network)
+    hosts = list(dict.fromkeys(network))
+    notes: list[str] = []
+    if not hosts:
+        mode, addresses, said = "none", [], "and no network."
+        what = "none"
+    elif hosts == ["any"]:
+        mode, addresses = "any", []
+        what = "internet, not this computer or the local network as far as systemd can block them"
+        said = ("and the internet, but not this computer, link-local, multicast, private, Tailscale or IPv6 "
+                "unique-local addresses.")
+        notes.append("Not covered: " + units.NETWORK_NOT_COVERED + ". Name the hosts the command needs with "
+                     "--network HOST instead, to allow only those.")
+    elif "any" in hosts:
+        raise UsageError('--network any cannot be combined with host names.',
+                         hint="Use either --network any or one --network HOST per host.")
+    else:
+        try:
+            units.check_hosts(hosts)
+        except MesError:
+            raise UsageError("A --network value is not a host name.",
+                             hint="For example: --network login.example.com (or --network any).") from None
+        found = resolve_hosts(hosts, resolver=resolver)
+        addresses = list(dict.fromkeys(a for addrs in found.values() for a in addrs))
+        missing = [h for h, a in found.items() if not a]
+        if missing:
+            raise TemporaryFailure(
+                f"{', '.join(missing)} could not be looked up to an internet address, so no command was printed.",
+                hint="Check the host names and the server's internet connection. Hosts on this computer or the local "
+                "network cannot be allowed here.", code="dns_failed")
+        mode, what = "hosts", "only " + ", ".join(hosts)
+        said = f"and only {', '.join(hosts)} on the network (their addresses now: {', '.join(addresses)})."
+        notes.append("The addresses were looked up now; if the command cannot connect later, print it again.")
+    cmd = units.interactive_command(project, layout, argv, network=mode, addresses=addresses)
     text = "sudo " + " ".join(shlex.quote(w) for w in cmd)
-    return {"project": name, "app": programs[argv[0]], "network": "internet, not this computer or the local network"
-            if network else "none", "command": text,
-            "message": "Run this on the server, in a terminal, with sudo (mes never runs sudo itself). It runs the "
-            f"command as {layout.account} with the same sandbox as a job: the project's data, state and store, its "
-            "code read-only, nothing else of the server" + (", and the internet but nothing on this computer or the "
-            "local network." if network else ", and no network.")}
+    message = ("Run this on the server, in a terminal, with sudo (mes never runs sudo itself). It runs the command as "
+               f"{layout.account} with the same sandbox as a job: the project's data, state and store, its code "
+               f"read-only, nothing else of the server, {said}")
+    if notes:
+        message += " " + " ".join(notes)
+    return {"project": name, "app": programs[argv[0]], "network": what, "command": text, "notes": notes,
+            "message": message}
 
 
 def _cmd_run_as(args: argparse.Namespace) -> Any:
@@ -1477,7 +1539,7 @@ def _cmd_run_as(args: argparse.Namespace) -> Any:
     words = list(args.words)
     if words and words[0] == "--":
         words = words[1:]
-    result = run_as(args.project_dir, args.project, words, server_root=args.server_root, network=not args.no_network)
+    result = run_as(args.project_dir, args.project, words, server_root=args.server_root, network=args.network)
     return result if args.json else f"{result['message']}\n\n{result['command']}"
 
 
@@ -1561,11 +1623,20 @@ def register(subparsers: Any) -> None:
     pr.add_argument("--server-root", required=True, metavar="DIR")
     pr.set_defaults(func=_cmd_selftest_probe)
 
+    rb = sub.add_parser("rebuild-accepted", help="(Run with sudo on the server.) Re-create the record of accepted "
+                        "releases (gate/accepted.json) from the releases' own records.")
+    rb.add_argument("project", help="the project's name")
+    rb.add_argument("--server-root", default=str(paths.SERVER_ROOT), metavar="DIR",
+                    help="where projects live on the server (default /var/lib/mes)")
+    rb.set_defaults(func=_cmd_rebuild_accepted)
+
     ra = sub.add_parser("run-as", help="Print the sudo command that runs an app command needing a terminal (such as "
                         "a login) as the project's account, in a sandbox.")
     common(ra)
     ra.add_argument("--project-dir", default=None, metavar="DIR", help="the project's folder (default: here)")
-    ra.add_argument("--no-network", action="store_true", help="no network at all (default: the internet, nothing local)")
+    ra.add_argument("--network", action="append", default=[], metavar="HOST",
+                    help="a host the command may reach (repeatable), or 'any' for the internet without this computer "
+                    "and the local network (default: no network at all)")
     ra.add_argument("words", nargs="*", help="-- <app program> <command> [options]")
     ra.set_defaults(func=_cmd_run_as)
 

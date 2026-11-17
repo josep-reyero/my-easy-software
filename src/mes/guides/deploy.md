@@ -34,11 +34,18 @@ On the server the gate (which itself runs no project code):
 2. unpacks with a hardened extractor (plain files and folders only, size and count limits);
 3. refuses an archive accepted before or made before the newest accepted one (kept in
    `gate/accepted.json`, which no sandbox can change, so it holds even when old releases were
-   removed); a release that was interrupted is removed and never blocks sending it again;
-4. **install step**, in the deploy sandbox: the package index but nothing on this computer or the
-   local network; writable: only the new release (the link `code/installing` the gate points at
-   it) and uv's cache and Python under `code/`; no data, state, ui, store or gate folder; no user
-   settings. `uv sync --frozen --no-build --no-dev --no-install-project` puts the locked
+   removed); a release that was interrupted is removed and never blocks sending it again. If
+   that record is missing while releases were installed, or is damaged, every deploy stops
+   (exit 5 `missing_record` or `damaged_record`) until the owner re-creates it from the
+   releases' own records with the command the error names
+   (`sudo /usr/local/bin/mes server rebuild-accepted <project>`); a project with no releases
+   yet starts with an empty record;
+4. **install step**, in the deploy sandbox: the package index, but not this computer, link-local,
+   multicast, private, Tailscale (`100.64.0.0/10`) or IPv6 unique-local addresses (not covered:
+   this server's own public addresses and the global IPv6 addresses of other machines on the
+   local network, which cannot be known when the units are written); writable: only the new
+   release (the link `code/installing` the gate points at it) and uv's cache and Python under
+   `code/`; no data, state, ui, store or gate folder; no user settings. `uv sync --frozen --no-build --no-dev --no-install-project` puts the locked
    third-party packages into the release's fresh `.venv` without ever starting its Python (which
    would run every `.pth` startup file of those packages), then mes unpacks the archive's own
    wheels itself, with no Python started;
@@ -57,8 +64,9 @@ On the server the gate (which itself runs no project code):
 What remains: third-party packages come from the package index during `uv sync` (checked
 against the hashes in `uv.lock`); a package that has only source code fails unless the plan was
 made with `--allow-server-builds`, and then its build code runs in the install step (with the
-internet and the new release writable; it gets a cache and a Python of the release's own, so
-nothing it writes is used by another deploy). The install step finds names through
+internet and the new release writable). Its install step then gets a cache and a Python of the
+release's own (`.uv/` inside the release), and the shared `code/uv-cache` and `code/uv-python`
+are not there for it at all, so nothing build code writes is used by another deploy. The install step finds names through
 systemd-resolved's socket (the default on Arch); a name server on this computer or the local
 network is blocked, so such a server cannot reach the index.
 

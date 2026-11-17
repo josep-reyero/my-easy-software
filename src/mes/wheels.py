@@ -9,9 +9,15 @@ mes unpacks these wheels itself, with the standard library only:
 - only pure-Python wheels (``*-none-any.whl``) whose ``WHEEL`` says ``Wheel-Version: 1.x``;
 - every member is a plain file with a safe relative name (no absolute paths, ``..``, backslashes,
   control characters or links), listed in ``RECORD`` with the right SHA-256 and size;
-- files go into the environment's single ``lib/python3.*/site-packages`` folder (``.data/``
-  parts into ``bin/``, the environment folder or ``include/``), never over an existing file,
-  through real folders only (``O_NOFOLLOW``, ``O_EXCL``);
+- the file name follows the wheel format: a normalised distribution name (letters and digits in
+  runs joined by single ``_``, so never ``.`` or ``..``), a version that starts with a digit, and
+  the ``.dist-info`` folder has exactly that name and version;
+- files go into the environment's single ``lib/python3.*/site-packages`` folder, never over an
+  existing file, through real folders only (``O_NOFOLLOW``, ``O_EXCL``). Of the ``.data/``
+  parts, ``purelib`` goes into site-packages too and ``scripts`` into the environment's ``bin/``
+  (one plain file name each, a ``#!python`` first line replaced by the environment's Python);
+  ``platlib``, ``headers`` and ``data`` are refused with a plain error (a pure-Python release
+  has no use for them, and they would write outside site-packages and ``bin/``);
 - console scripts from ``entry_points.txt`` are written the way installers write them, with the
   environment's own Python on the first line (uv's long-path form when that line would be too
   long); ``RECORD`` is rewritten with what was installed, and ``INSTALLER`` says ``mes``.
@@ -42,13 +48,20 @@ from mes.errors import Refused
 MAX_FILES = 20_000
 MAX_BYTES = 200 * 1024**2
 MAX_SHEBANG = 127
-_WHEEL_NAME_RE = re.compile(r"^(?P<name>[A-Za-z0-9_.]+)-(?P<version>[A-Za-z0-9_.!+]+)(?:-[0-9][A-Za-z0-9_.]*)?"
+# The wheel format's file name: {distribution}-{version}(-{build})?-{python}-{abi}-{platform}.whl, the
+# distribution name normalised (runs of "-", "_" and "." become one "_"), so it is never "." or "..".
+_DIST_NAME = r"[A-Za-z0-9]+(?:_[A-Za-z0-9]+)*"
+_VERSION = r"[0-9][A-Za-z0-9!+]*(?:[._][A-Za-z0-9!+]+)*"
+_WHEEL_NAME_RE = re.compile(rf"^(?P<name>{_DIST_NAME})-(?P<version>{_VERSION})(?:-[0-9][A-Za-z0-9_]*)?"
                             r"-(?P<py>[A-Za-z0-9_.]+)-none-any\.whl\Z")
+_DIST_INFO_RE = re.compile(rf"^(?P<name>{_DIST_NAME})-(?P<version>{_VERSION})\.dist-info\Z")
 _SEGMENT_RE = re.compile(r"^[A-Za-z0-9_.+@=,~-]+\Z")
 _SCRIPT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}\Z")
 _ENTRY_RE = re.compile(r"^(?P<module>[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)"
                        r":(?P<attr>[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)\s*(?:\[[^\]]*\])?\Z")
-_SCHEMES = ("purelib", "platlib", "scripts", "data", "headers")
+# The .data/ parts mes installs; platlib, headers and data are refused (see the module's text).
+_SCHEMES = ("purelib", "scripts")
+_REFUSED_SCHEMES = ("platlib", "headers", "data")
 
 
 class WheelError(Refused):
@@ -143,6 +156,9 @@ def install(wheel: str | os.PathLike[str], venv: str | os.PathLike[str]) -> dict
     wheel_path, venv = Path(wheel), Path(venv)
     label = wheel_path.name
     m = _WHEEL_NAME_RE.match(label)
+    if not m and label.endswith("-none-any.whl"):
+        raise _bad(label, "has a file name that does not follow the wheel format (<name>-<version>-py3-none-any.whl, "
+                   "the name made only of letters, digits and single '_')")
     if not m or not (m["py"].startswith("py3") or m["py"].startswith("py2.py3")):
         raise _bad(label, "is not a pure-Python wheel (its name must end in -none-any.whl)")
     site = site_packages(venv)
@@ -170,9 +186,10 @@ def install(wheel: str | os.PathLike[str], venv: str | os.PathLike[str]) -> dict
         if len(dist_infos) != 1:
             raise _bad(label, "does not have exactly one .dist-info folder")
         dist_info = dist_infos.pop()
+        dm = _DIST_INFO_RE.match(dist_info)
+        if not dm or dm["name"].lower() != m["name"].lower() or dm["version"].lower() != m["version"].lower():
+            raise _bad(label, "has a .dist-info folder of another package or version")
         data_dir = dist_info[: -len(".dist-info")] + ".data"
-        if dist_info.split("-", 1)[0].lower() != m["name"].lower():
-            raise _bad(label, "has a .dist-info folder of another package")
         try:
             wheel_meta = zf.read(f"{dist_info}/WHEEL").decode("utf-8")
             record_text = zf.read(f"{dist_info}/RECORD").decode("utf-8")
@@ -205,21 +222,18 @@ def install(wheel: str | os.PathLike[str], venv: str | os.PathLike[str]) -> dict
             first, _, rest = name.partition("/")
             if first == data_dir:
                 scheme, _, inner = rest.partition("/")
+                if scheme in _REFUSED_SCHEMES:
+                    raise _bad(label, f"holds {name[:80]!r}, a {scheme} file; mes installs only the Python code "
+                               "(purelib) and programs (scripts) of a release's own wheels")
                 if scheme not in _SCHEMES or not inner:
                     raise _bad(label, f"holds {name[:80]!r} in a part of the wheel mes does not install")
                 rel = PurePosixPath(inner)
-                if scheme in ("purelib", "platlib"):
+                if scheme == "purelib":
                     plan.append((name, site, rel, False))
-                elif scheme == "scripts":
+                else:
                     if len(rel.parts) != 1 or not _SCRIPT_NAME_RE.match(rel.name):
                         raise _bad(label, f"has a script with a name mes does not accept ({inner[:80]!r})")
                     plan.append((name, venv / "bin", rel, True))
-                elif scheme == "data":
-                    if rel.parts[0] in ("bin", "lib", "lib64", "include", "pyvenv.cfg"):
-                        raise _bad(label, f"would put {inner[:80]!r} over the environment's own folders")
-                    plan.append((name, venv, rel, False))
-                else:
-                    plan.append((name, venv / "include" / "site" / site.parent.name / m["name"], rel, False))
             else:
                 plan.append((name, site, PurePosixPath(name), False))
 

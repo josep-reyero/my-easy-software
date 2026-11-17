@@ -85,8 +85,8 @@ the project or its environment), in a copy of the project:
 
 `--allow-host NAME` (or `--origin https://NAME[:PORT]`) is the address the dashboards are opened
 with. `--allow-server-builds` lets deploys build packages that exist only as source code on the
-server (off by default; their build code then runs in the install step, see `mes guide
-deploy`). `--no-start` switches on nothing that runs jobs (their timers, webhook triggers and the
+server (off by default; their build code then runs in the install step, which then gets a cache
+and a Python of the release's own instead of the shared ones, see `mes guide deploy`). `--no-start` switches on nothing that runs jobs (their timers, webhook triggers and the
 webhook receiver) and prints the exact `systemctl enable --now` line to run later; use it for a
 first install on a server that is getting an existing archive (section 6). The script's last
 lines say which timers and triggers are running. The header of `plan.sh` names the mes version
@@ -124,6 +124,13 @@ Tailscale, Docker, containerd, Podman, nscd, CUPS, Avahi) can be reached. A job 
 has a private network, with its own abstract unix sockets. A job that lists hosts shares the
 server's network, where other programs' abstract unix sockets live, so it may not open unix
 sockets at all (socket pairs inside the job still work).
+
+The install step of a deploy (and `mes server run-as --network any`) has the internet, but not
+this computer, link-local, multicast, private, Tailscale (`100.64.0.0/10`) or IPv6 unique-local
+addresses. Not covered, because they cannot be known when the units are written and can change
+while the server runs: this server's own public addresses (a service listening on all addresses
+can be reached through them) and the global IPv6 addresses of other machines on the local
+network. The plan's header says the same.
 
 ## 5. Check and prove
 
@@ -175,8 +182,15 @@ the owner with `systemd-run --pty`. mes prints the exact command (it never runs 
 
 Run the `sudo systemd-run --pty ...` line it prints, on the server, in a terminal. The command
 sees the project's data, state and store (writable), its code (read-only) and nothing else of
-the server; it has the internet but nothing on this computer or the local network
-(`--no-network`: no network at all).
+the server. It has no network at all unless asked, and then cannot even look names up:
+
+- `--network HOST` (repeatable): only the internet addresses those hosts have now (looked up
+  when the command is printed; print it again if they change), with names through
+  systemd-resolved's socket. A host that has only local-network addresses is refused.
+- `--network any`: the internet, but not this computer, link-local, multicast, private,
+  Tailscale (`100.64.0.0/10`) or IPv6 unique-local addresses. Not covered: this server's own
+  public addresses and the global IPv6 addresses of other machines on the local network; the
+  command it prints says so too.
 
 ## 8. Remove
 

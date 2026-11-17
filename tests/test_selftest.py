@@ -41,6 +41,11 @@ def layout(tmp_path):
     return lay
 
 
+def _server_toml(layout, *, builds):
+    (layout.etc / "server.toml").write_text(f'[server]\nproject = "demo"\nallow_builds = {str(builds).lower()}\n')
+    os.chmod(layout.etc / "server.toml", 0o644)
+
+
 def _by_id(result):
     return {i["id"]: i for i in result["items"]}
 
@@ -70,8 +75,13 @@ def test_install_probe_expects_only_the_new_release_to_be_writable(layout):
     target.mkdir(parents=True)
     os.symlink("releases/.selftest-install", layout.installing)
     layout.uv_cache.mkdir()
+    assert _by_id(selftest.probe(layout, "deploy"))["deploy-uv-cache"]["status"] == "skipped"  # no settings here
+    _server_toml(layout, builds=False)
     items = _by_id(selftest.probe(layout, "deploy"))
     assert items["deploy-new-release"]["status"] == "done" and items["deploy-uv-cache"]["status"] == "done"
+    # With server builds the shared cache must NOT be writable (build code gets the release's own).
+    _server_toml(layout, builds=True)
+    assert _by_id(selftest.probe(layout, "deploy"))["deploy-uv-cache"]["status"] == "todo"
     assert items["deploy-other-releases"]["status"] == "todo"  # writable outside a sandbox
     assert items["deploy-no-data"]["status"] == "todo"  # data/ is visible here
     assert "deploy-syscalls" in items and "deploy-loopback" in items and "deploy-network" not in items
@@ -211,3 +221,72 @@ def test_plan_output_mentions_the_selftest(tmp_path):
     proj = helpers.write(tmp_path / "demo", PROJECT_TOML, {"demo_app": APP_TOML})
     script = server.render_script(server.build_plan(proj, "demo", tools={"mes": "/bin/sh", "uv": "/bin/sh"}))
     assert "mes server selftest demo" in script
+
+
+def _rendered_run_binds(layout, level_or_unit):
+    """What the real rendered unit binds under /run (the sandbox's /run is otherwise empty)."""
+    project = helpers.load(layout.root.parent / "proj-binds", PROJECT_TOML, {"demo_app": APP_TOML})
+    files = units.render_project(project, layout=layout, mes="/usr/local/bin/mes")
+    text = files[level_or_unit]
+    binds = []
+    for line in text.splitlines():
+        if line.startswith(("BindPaths=", "BindReadOnlyPaths=")):
+            binds += [w.lstrip("-").split(":")[-1] for w in line.split("=", 1)[1].split()]
+    return [b for b in binds if b.startswith("/run/")]
+
+
+def _sandbox_fs(binds):
+    """The paths a sandbox shows under /run: each bound path and the folders systemd makes for it."""
+    shown = set()
+    for b in binds:
+        parts = b.split("/")
+        shown |= {"/".join(parts[:i]) for i in range(3, len(parts) + 1)}
+    return shown
+
+
+def test_the_install_steps_resolver_socket_is_allowed_and_nothing_else(layout):
+    """The real HOST_SOCKETS list held /run/systemd/resolve, which the install unit binds on
+    purpose (its resolver socket), so deploy-host-sockets always failed. Checked here with the
+    real list and the real rendered unit's binds."""
+    binds = _rendered_run_binds(layout, "mes-demo.gate-deploy@.service")
+    assert binds == [units.RESOLVE_SOCKET]
+    shown = _sandbox_fs(binds)
+    exists = shown.__contains__
+    item = selftest._host_sockets("deploy-", "the install step", "deploy", exists=exists,
+                                  under_run=lambda: sorted(shown))
+    assert item["status"] == "done", item
+    # Anything else under /run fails: a host socket of the list, or any other entry.
+    for extra in ("/run/dbus/system_bus_socket", "/run/systemd/resolve/other", "/run/whatever"):
+        more = shown | _sandbox_fs([extra])
+        item = selftest._host_sockets("deploy-", "the install step", "deploy", exists=more.__contains__,
+                                      under_run=lambda m=more: sorted(m))
+        assert item["status"] == "todo" and extra in item["why"], extra
+    # A job binds nothing under /run, and the same resolver socket there is a failure.
+    assert _rendered_run_binds(layout, "mes-demo.job.demo-app.sync.service") == []
+    assert selftest._host_sockets("job-", "a job", "job", exists=exists)["status"] == "todo"
+    assert selftest._host_sockets("job-", "a job", "job", exists=lambda p: False)["status"] == "done"
+
+
+@pytest.mark.parametrize("err,status", [(1, "done"), (13, "done"), (111, "todo"), (110, "todo"), (None, "todo")])
+def test_install_step_blocks_count_only_the_filters_own_refusal(layout, monkeypatch, err, status):
+    """A refused connection or a timeout happens without any filter: only EPERM/EACCES at connect
+    proves the address filter blocks this computer and the local network."""
+    def connect(host, port):
+        if err is not None:
+            raise OSError(err, "x")
+
+    monkeypatch.setattr(selftest, "_connect", connect)
+    items = _by_id(selftest.probe(layout, "deploy"))
+    for claim in ("deploy-loopback", "deploy-lan"):
+        assert items[claim]["status"] == status, (claim, items[claim])
+    if err in (111, 110):
+        assert "cannot tell" in items["deploy-loopback"]["why"]
+
+
+def test_privileges_are_not_passed_when_proc_cannot_be_read():
+    assert selftest._privileges("job-", "a job", status=lambda name: None)["status"] == "todo"
+    good = {"NoNewPrivs": "1", "CapEff": "0000000000000000"}
+    if os.geteuid() != 0:
+        assert selftest._privileges("job-", "a job", status=good.get)["status"] == "done"
+    assert selftest._privileges("job-", "a job", status={**good, "NoNewPrivs": "0"}.get)["status"] == "todo"
+    assert selftest._privileges("job-", "a job", status={**good, "CapEff": "00000000a80425fb"}.get)["status"] == "todo"

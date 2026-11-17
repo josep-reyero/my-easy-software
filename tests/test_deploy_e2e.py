@@ -670,3 +670,39 @@ def test_the_install_step_refuses_a_release_it_is_not_pointed_at_or_with_an_envi
         assert e.value.code == "stray_environment"
     finally:
         os.unlink(layout.installing)
+
+
+def test_a_missing_accepted_record_with_releases_is_damage_not_a_fresh_start(world, capsys):
+    """Deleting gate/accepted.json made the server forget every accepted archive, so an old
+    signed archive installed again once the release folders were gone. A missing record while
+    release records exist now stops deploys, and says how the owner re-creates it (a root command
+    that reads the releases' records). A project with no releases at all still starts empty."""
+    w = world
+    assert deploy.read_accepted(paths.server_layout("demo", w.root)) == {"newest_created_ns": None, "archives": []}
+    old, old_sig = _signed(w, name="old.tgz")
+    w.write_project("0.2.0")
+    new, new_sig = _signed(w, name="new.tgz")
+    assert deploy._send("mes-demo@my-server", ["mes", "deploy", "--signature", new_sig], new, 60)["release"] == 1
+    accepted = w.base / "gate" / "accepted.json"
+    before = json.loads(accepted.read_text())
+    accepted.unlink()
+    shutil.rmtree(w.base / "code" / "releases" / "1")  # the release folder is gone too: only its record is left
+    with pytest.raises(Refused) as e:
+        deploy._send("mes-demo@my-server", ["mes", "deploy", "--signature", old_sig], old, 60)
+    assert e.value.code == "missing_record"
+    assert f"sudo /usr/local/bin/mes server rebuild-accepted demo --server-root {w.root}" in e.value.hint
+    assert not accepted.exists()
+    # The owner's repair: it must run as root (refused otherwise), and rebuilds from the records.
+    from mes import cli
+
+    if os.geteuid() != 0:
+        code = cli.run(["--json", "server", "rebuild-accepted", "demo", "--server-root", str(w.root)])
+        assert code == 5 and json.loads(capsys.readouterr().out)["error"]["code"] == "needs_root"
+    out = deploy.rebuild_accepted(paths.server_layout("demo", w.root))
+    assert out["releases"] == 1 and json.loads(accepted.read_text()) == before
+    with pytest.raises(Refused) as e:
+        deploy._send("mes-demo@my-server", ["mes", "deploy", "--signature", old_sig], old, 60)
+    assert e.value.code == "older_release"
+    with pytest.raises(Refused) as e:
+        deploy.rebuild_accepted(paths.server_layout("demo", w.root))
+    assert e.value.code == "record_fine"
