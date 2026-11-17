@@ -1,34 +1,7 @@
 # my-easy-software
 
-### The new shape: apps inside a project
-
-This branch builds the first of those changes ([contract](docs/apps-contract.md)). A **project** is
-what you deploy and the only security boundary (its own accounts, data folder and keys). An **app**
-is a Python package with an `app.toml`, either in the project's `apps/` folder or installed into
-its environment. In short:
-
-```
-my-notes/
-  project.toml          [project] apps = ["my_notes_main", ...], shared [tables] and [views],
-                        [settings.<app>] overrides of an app's jobs, [ui] dashboards
-  apps/my_notes_main/   app.toml (its tables, jobs and dashboards), cli.py, AGENTS.md
-  ui/dashboards/        the project's dashboards; apps can add sections to them
-  apps.lock.json        written by "mes apps sync" (never committed)
-```
-
-- One shared SQLite database per project. Shared tables are declared in `project.toml`; every
-  row says which app wrote it, and dashboards read views over them (`mes db`, `ctx.db()`).
-- Jobs belong to apps and have ids `<app>.<job>`; `after` may name another app's job.
-- One command per project: `my-notes main add "..."`, `my-notes describe`; the gate accepts
-  `["my-notes", "main", "notes", "--json"]`.
-- `mes new <name>` makes a project with one app, `mes new-app <name>` adds one, `mes apps sync`
-  writes the list of installed apps. `examples/fitlab` is a worked example with two apps.
-- The old one-file `project.toml` (`[apps.*]`, `[jobs.*]`, `[ui] data`) is refused with a plain
-  message saying what to move where (`mes guide apps`).
-
-> **Consumer apps should ship APIs that let people consume their own data.
-> People then set up their own dashboards and own their data, in an AI-native,
-> fully flexible way.**
+> Consumer apps should ship APIs that let people consume their own data. People then set up their own
+> dashboards and own their data, in an AI-native, fully flexible way.
 
 That is the idea behind this project. Today most apps keep your data behind their own screens:
 you see what they chose to show, the way they chose to show it. We think it should work the
@@ -51,6 +24,32 @@ is a `mes` command, such as `mes new` or `mes deploy`.
 You do not need to be a developer. Setup is guided by an AI agent that explains each step in
 plain words, installs what is needed with your permission, and keeps your apps private to your
 own devices unless you choose to share them.
+
+## Projects and apps
+
+A **project** is
+what you deploy and the only security boundary (its own accounts, data folder and keys). An **app**
+is a Python package with an `app.toml`, either in the project's `apps/` folder or installed into
+its environment. In short:
+
+```
+my-notes/
+  project.toml          [project] apps = ["my_notes_main", ...], shared [tables] and [views],
+                        [settings.<app>] overrides of an app's jobs, [ui] dashboards
+  apps/my_notes_main/   app.toml (its tables, jobs and dashboards), cli.py, AGENTS.md
+  ui/dashboards/        the project's dashboards; apps can add sections to them
+  apps.lock.json        written by "mes apps sync" (never committed)
+```
+
+- One shared SQLite database per project. Shared tables are declared in `project.toml`; every
+  row says which app wrote it, and dashboards read views over them (`mes db`, `ctx.db()`).
+- Jobs belong to apps and have ids `<app>.<job>`; `after` may name another app's job.
+- One command per project: `my-notes main add "..."`, `my-notes describe`; the gate accepts
+  `["my-notes", "main", "notes", "--json"]`.
+- `mes new <name>` makes a project with one app, `mes new-app <name>` adds one, `mes apps sync`
+  writes the list of installed apps. `examples/fitlab` is a worked example with two apps.
+
+The exact rules are in the [contract](docs/apps-contract.md).
 
 ## Status
 
