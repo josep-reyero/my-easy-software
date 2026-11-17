@@ -1,7 +1,7 @@
 # my-easy-software
 
-> Consumer apps should ship APIs that let people consume their own data. People then set up their own
-> dashboards and own their data, in an AI-native, fully flexible way.
+> **Consumer apps should ship APIs that let people consume their own data. People then set up their own
+> dashboards and own their data, in an AI-native, fully flexible way.**
 
 That is the idea behind this project. Today most apps keep your data behind their own screens:
 you see what they chose to show, the way they chose to show it. We think it should work the
