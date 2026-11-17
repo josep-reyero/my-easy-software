@@ -126,7 +126,7 @@ RESERVED_SHORT_NAMES = ("describe", "guide", "apps", "help", "sqlite", "mes")
 # Table names (and so app table prefixes) that belong to SQLite or to mes itself.
 RESERVED_TABLE_PREFIXES = ("sqlite_", "mes_")
 RESERVED_FOLDERS = ("store", "logs", "state", "ui", "backup", "tmp")
-TOP_KEYS = ("project", "tables", "views", "settings", "ui", "storage")
+TOP_KEYS = ("project", "tables", "views", "settings", "ui", "storage", "backup")
 PROJECT_KEYS = ("name", "title", "version", "apps")
 TABLE_KEYS = ("columns", "key", "prefer")
 VIEW_KEYS = ("sql",)
@@ -134,9 +134,21 @@ SETTINGS_KEYS = ("jobs",)
 SETTINGS_JOB_KEYS = ("schedule", "enabled", "memory", "timeout", "add_network")
 UI_KEYS = ("accent", "dashboards", "tables", "refresh_after")
 STORAGE_KEYS = ("bucket",)
+BACKUP_KEYS = ("exclude",)
+# Extra advice for keys that belong somewhere else (the unknown-key message adds it to its hint).
+TOP_KEY_HINTS = {
+    "apps": "Apps are listed by package name under [project] apps; each app has its own app.toml in its "
+            "package folder (see: mes guide apps).",
+    "jobs": "Jobs belong in an app's app.toml ([jobs.<name>]); the project changes them in [settings.<app>].",
+    "app": "[app] belongs in an app's own app.toml, not in project.toml.",
+    "data": "[data] belongs in an app's own app.toml; the shared tables are [tables.<name>] here.",
+}
+UI_KEY_HINTS = {
+    "data": "Every project has one shared database, <project>.sqlite, in its data folder; it is not named here.",
+}
 APP_TOP_KEYS = ("app", "data", "jobs", "ui")
 APP_KEYS = ("name", "title", "version", "cli", "command")
-DATA_KEYS = ("folder", "writes", "tables", "rebuild")
+DATA_KEYS = ("folder", "writes", "tables", "rebuild", "no_backup")
 APP_UI_KEYS = ("dashboards", "tables", "contributes")
 CONTRIBUTES_KEYS = ("sections",)
 JOB_KEYS = ("run", "schedule", "after", "manual", "webhook", "memory", "timeout", "network", "local_network",
@@ -159,6 +171,12 @@ DEFAULT_WRITES = ("data", "state")
 WRITE_TARGETS = ("data", "state")
 DEFAULT_VERSION = "0.0.0"
 MAX_HOSTS = 32
+# Paths a backup leaves out ([data] no_backup in app.toml, [backup] exclude in project.toml): each
+# starts with "data/" or "state/" (the project's data or state folder, exactly as in a backup
+# archive), then plain path parts; "*" stands for any characters within one part.
+MAX_BACKUP_RULES = 32
+BACKUP_RULE_PARTS = ("data", "state")
+_BACKUP_SEGMENT_RE = re.compile(r"^[A-Za-z0-9._*+=@,~-]{1,100}\Z")
 MAX_MANIFEST_BYTES = 256 * 1024
 MAX_APP_TOML_BYTES = 64 * 1024
 MAX_LOCK_BYTES = 64 * 1024
@@ -297,6 +315,7 @@ class ProjectFile:
     storage: Storage | None = None
     path: Path | None = None
     sha256: str | None = None
+    backup_exclude: tuple[str, ...] = ()
 
     @property
     def root(self) -> Path | None:
@@ -326,10 +345,11 @@ class AppData:
     writes: tuple[str, ...] = ()
     tables: tuple[str, ...] = ()
     rebuild: str | None = None
+    no_backup: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {"folder": self.folder, "writes": list(self.writes), "tables": list(self.tables),
-                "rebuild": self.rebuild}
+                "rebuild": self.rebuild, "no_backup": list(self.no_backup)}
 
 
 @dataclass(frozen=True)
@@ -480,6 +500,7 @@ class Project:
     path: Path | None = None
     lock_used: bool = False
     warnings: tuple[str, ...] = ()
+    backup_exclude: tuple[str, ...] = ()
 
     @property
     def root(self) -> Path | None:
@@ -634,17 +655,19 @@ def _fail(source: str, where: str, problem: str, hint: str, code: str | None = N
     )
 
 
-def _check_keys(table: dict[str, Any], allowed: tuple[str, ...], source: str, where: str) -> None:
+def _check_keys(table: dict[str, Any], allowed: tuple[str, ...], source: str, where: str,
+                hints: dict[str, str] | None = None) -> None:
     for key in table:
         if key not in allowed:
             close = difflib.get_close_matches(key, allowed, n=1)
             maybe = f' Did you mean "{close[0]}"?' if close else ""
+            extra = f" {hints[key]}" if hints and key in hints else ""
             raise _fail(
                 source,
                 where,
                 f'it has a setting this version of mes does not know: "{key}". '
                 "Unknown settings are not ignored, because a typo could silently switch off a safety limit.",
-                f"Allowed settings here: {', '.join(allowed)}.{maybe}",
+                f"Allowed settings here: {', '.join(allowed)}.{maybe}{extra}",
             )
 
 
@@ -734,41 +757,6 @@ def table_prefix(short: str) -> str:
 
 
 # --------------------------------------------------------------------------- project.toml
-
-
-def _removed_forms(data: dict[str, Any], source: str) -> None:
-    """The old [apps.*] / [jobs.*] / [ui] data forms are refused with a plain migration message."""
-    old_apps = data.get("apps")
-    if isinstance(old_apps, dict):
-        name = next(iter(old_apps), "<name>")
-        package = str(name).replace("-", "_") if isinstance(name, str) else "<package>"
-        raise ManifestError(
-            f"{source} still has the old [apps.{name}] section. Apps are now Python packages, each with its own "
-            "app.toml, and the project lists them under [project] apps. The project cannot be used until this is "
-            "changed.",
-            hint=f"Move the app into apps/{package}/ with an app.toml (see: mes guide apps), write apps = "
-            f'["{package}"] under [project], and remove [apps.{name}].',
-            code="manifest_old_apps",
-        )
-    old_jobs = data.get("jobs")
-    if isinstance(old_jobs, dict):
-        name = next(iter(old_jobs), "<name>")
-        raise ManifestError(
-            f"{source} still has [jobs.{name}]. Jobs now belong to the app that runs them, in its app.toml, so they "
-            "are no longer read here.",
-            hint=f"Move the job to [jobs.{name}] in the app's app.toml and drop the app's name from its run line. "
-            "To change a schedule from the project, use [settings.<app>].",
-            code="manifest_old_jobs",
-        )
-    ui = data.get("ui")
-    if isinstance(ui, dict) and "data" in ui:
-        name = (data.get("project") or {}).get("name") if isinstance(data.get("project"), dict) else None
-        raise ManifestError(
-            f"[ui] data is no longer used: every project has one shared database, "
-            f"{name if isinstance(name, str) else '<project>'}.sqlite, in its data folder.",
-            hint="Remove the data line from [ui].",
-            code="manifest_old_ui_data",
-        )
 
 
 def _parse_columns(value: Any, source: str, where: str) -> tuple[Column, ...]:
@@ -981,7 +969,7 @@ def _parse_settings(value: Any, source: str) -> dict[str, dict[str, JobSetting]]
 
 def _parse_ui(value: Any, source: str) -> UI:
     table = _table(value, source, "[ui]", '[ui] followed by dashboards = ["overview"]')
-    _check_keys(table, UI_KEYS, source, "[ui]")
+    _check_keys(table, UI_KEYS, source, "[ui]", UI_KEY_HINTS)
     accent = table.get("accent")
     if accent is not None and (not isinstance(accent, str) or not UI_ACCENT_RE.match(accent)):
         raise _fail(source, "[ui]", f'"accent" is {accent!r}, which is not a colour written as # and six hex digits.',
@@ -1006,13 +994,50 @@ def _parse_storage(table: Any, source: str) -> Storage:
     return Storage(bucket=bucket)
 
 
+def backup_paths(value: Any, source: str, where: str, key: str) -> tuple[str, ...]:
+    """Paths a backup leaves out: ``data/<path>`` or ``state/<path>``, plain parts only (no "..",
+    no "." and no empty part, no absolute path, no backslash), "*" only inside one part."""
+    example = '["data/.state/tokens.json"]'
+    if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+        raise _fail(source, where, f'"{key}" must be a list of paths, for example {key} = {example}.',
+                    f"Write {key} = {example}.")
+    if len(value) > MAX_BACKUP_RULES or len(set(value)) != len(value):
+        raise _fail(source, where, f'"{key}" lists a path more than once (or more than {MAX_BACKUP_RULES} paths).',
+                    "List each path once.")
+    for v in value:
+        parts = v.split("/")
+        why = None
+        if len(v) > 300 or any(ord(c) < 32 or ord(c) == 127 for c in v):
+            why = "it is too long or has invisible characters"
+        elif v.startswith("/") or "\\" in v:
+            why = "it is not a path inside the project's folders (no leading / and no backslash)"
+        elif parts[0] not in BACKUP_RULE_PARTS or len(parts) < 2:
+            why = 'it does not start with "data/" (the project\'s data folder) or "state/" (its state folder)'
+        elif any(p in ("", ".", "..") for p in parts[1:]):
+            why = 'it has an empty part, "." or ".."'
+        elif "**" in v:
+            why = '"**" is not allowed: "*" stands for any characters within one part only'
+        elif not all(_BACKUP_SEGMENT_RE.match(p) for p in parts[1:]):
+            why = 'it has characters mes does not accept in these paths (only letters, digits, "._+=@,~-" and "*")'
+        if why:
+            raise _fail(source, where, f'"{key}" has {v[:80]!r}, which mes cannot use: {why}.',
+                        f"Write {key} = {example}: paths in the project's data or state folder, as a backup "
+                        "lists them.")
+    return tuple(value)
+
+
+def _parse_backup(table: Any, source: str) -> tuple[str, ...]:
+    table = _table(table, source, "[backup]", '[backup] followed by exclude = ["data/<path>"]')
+    _check_keys(table, BACKUP_KEYS, source, "[backup]")
+    return backup_paths(table.get("exclude", []), source, "[backup]", "exclude")
+
+
 def parse(data: dict[str, Any], *, source: str = MANIFEST_FILE, path: Path | None = None,
           sha256: str | None = None) -> ProjectFile:
     """``project.toml`` (as a dict) -> ``ProjectFile``. No app is read."""
     if not isinstance(data, dict):
         raise _fail(source, "", "it is not a table of settings.", "Start the file with a [project] section.")
-    _removed_forms(data, source)
-    _check_keys(data, TOP_KEYS, source, "")
+    _check_keys(data, TOP_KEYS, source, "", TOP_KEY_HINTS)
     proj = data.get("project")
     if not isinstance(proj, dict):
         raise _fail(
@@ -1054,8 +1079,10 @@ def parse(data: dict[str, Any], *, source: str = MANIFEST_FILE, path: Path | Non
     settings = _parse_settings(data["settings"], source) if "settings" in data else {}
     ui = _parse_ui(data["ui"], source) if "ui" in data else None
     storage = _parse_storage(data["storage"], source) if "storage" in data else None
+    backup_exclude = _parse_backup(data["backup"], source) if "backup" in data else ()
     return ProjectFile(name=name, title=title, version=version, packages=packages, tables=tables, views=views,
-                       settings=settings, ui=ui, storage=storage, path=path, sha256=sha256)
+                       settings=settings, ui=ui, storage=storage, path=path, sha256=sha256,
+                       backup_exclude=backup_exclude)
 
 
 def _toml(text: str, source: str, what: str) -> dict[str, Any]:
@@ -1324,7 +1351,8 @@ def parse_app(data: dict[str, Any], *, source: str = APP_FILE, path: Path | None
     if rebuild is not None and (not isinstance(rebuild, str) or not COMMAND_WORD_RE.match(rebuild)):
         raise _fail(source, "[data]", f'"rebuild" = {str(rebuild)[:60]!r} is not the name of one of the app\'s commands.',
                     'Write rebuild = "<command>" (a write command that rebuilds what the app wrote), or leave it out.')
-    app_data = AppData(folder=folder, writes=writes, tables=tables, rebuild=rebuild)
+    no_backup = backup_paths(data_t.get("no_backup", []), source, "[data]", "no_backup")
+    app_data = AppData(folder=folder, writes=writes, tables=tables, rebuild=rebuild, no_backup=no_backup)
     jobs_t = _table(data.get("jobs", {}), source, "[jobs]", '[jobs.<name>] followed by run = "<command>"')
     if len(jobs_t) > MAX_JOBS_PER_APP:
         raise _fail(source, "[jobs]", f"an app can have at most {MAX_JOBS_PER_APP} jobs.", "Use fewer jobs.")
@@ -1556,7 +1584,8 @@ def compose(pf: ProjectFile, located: list[Located], *, lock_used: bool = False)
         apps[af.name] = AppSpec(
             package=loc.package, name=af.name, title=af.title, version=af.version, short=short, prefix=prefix,
             program=af.program, cli=af.cli, command=af.command, folder=loc.folder, in_project=loc.in_project,
-            data=AppData(folder=folder, writes=af.data.writes, tables=af.data.tables, rebuild=af.data.rebuild),
+            data=AppData(folder=folder, writes=af.data.writes, tables=af.data.tables, rebuild=af.data.rebuild,
+                         no_backup=af.data.no_backup),
             ui=af.ui,
         )
 
@@ -1671,7 +1700,8 @@ def compose(pf: ProjectFile, located: list[Located], *, lock_used: bool = False)
                          f"Use job ids from: {', '.join(jobs) or 'none'}.")
     project = Project(name=pf.name, title=pf.title, version=pf.version, packages=pf.packages, apps=apps, jobs=jobs,
                       disabled=tuple(disabled), tables=pf.tables, views=pf.views, ui=pf.ui, storage=pf.storage,
-                      path=pf.path, lock_used=lock_used, warnings=tuple(warnings))
+                      path=pf.path, lock_used=lock_used, warnings=tuple(warnings),
+                      backup_exclude=pf.backup_exclude)
     if pf.ui is not None and pf.ui.tables is not None:
         full = Project(**{**project.__dict__, "ui": UI()}).allowlist()
         extra = [t for t in pf.ui.tables if t not in full]

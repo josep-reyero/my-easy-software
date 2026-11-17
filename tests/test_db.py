@@ -213,7 +213,7 @@ def test_reset_rebuilds_a_shared_table_but_never_an_apps_table(proj, tmp_path):
 def test_a_table_where_a_view_belongs_is_refused(proj, tmp_path):
     path = tmp_path / "pp.sqlite"
     conn = sqlite3.connect(path)
-    conn.execute("CREATE TABLE days (date TEXT)")  # the old one-file form
+    conn.execute("CREATE TABLE days (date TEXT)")  # a table where project.toml has a view
     conn.commit()
     conn.close()
     with pytest.raises(db.SchemaError) as e:

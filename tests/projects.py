@@ -47,7 +47,7 @@ def spec(name: str, program: str | None = None, project: str = "demo", package: 
                    folder=None, in_project=True, data=AppData(folder=short), ui=AppUI())
 
 
-# --------------------------------------------------------------------------- the old one-file form
+# --------------------------------------------------------------------------- a compact form for tests
 
 def _toml_value(v) -> str:
     import json as _json

@@ -11,7 +11,11 @@ and, next to it, ``<archive>.sig``: an ``ssh-keygen -Y sign -n mes-backup`` sign
 the person's signing key (the same key as for deploys: ``--key``, ``[deploy] key`` in the config
 file, or ``~/.ssh/mes-sign``) whenever one is set up (``--no-sign`` leaves it out).
 
-Only regular files are copied; links and special files are skipped and listed. Every file is
+Only regular files are copied; links and special files are skipped and listed. Left out on
+purpose (and listed under ``excluded``): what the apps' ``[data] no_backup`` and the project's
+``[backup] exclude`` name (such as a saved login), lock files (``*.lock``) and SQLite's side files
+(``-journal``, ``-wal``, ``-shm`` next to their database). Every SQLite database is copied with
+SQLite's own backup. A restore never writes those named paths and keeps what is there in place. Every file is
 opened without following links, one folder at a time from the project's own folder, and hashed
 from the same open file that is packed. The store is never copied file by file while it may be
 in use: ``mybucket snapshot`` makes a consistent copy, ``mybucket verify`` checks it, and only
@@ -51,6 +55,7 @@ Public API
 ``BACKUP_INFO`` (``"MES-BACKUP.json"``), ``RESTORE_LIMITS``, ``BACKUP_NAMESPACE`` (``"mes-backup"``).
 ``Target``: ``name``, ``data``, ``state``, ``store``, ``project`` (Project | None), ``root``
     (project folder | None), ``server`` (bool), ``default_dest``, ``base`` (server folder | None).
+``Rule(pattern, source)``, ``exclusion_rules(target) -> (rules, packages not read)``.
 ``resolve(project=None, *, project_dir=None, server_root=None) -> Target``
 ``backup(target, *, dest=None, include_store=True, key=None, sign=True) -> dict``
 ``verify_archive(path_or_file, *, limits=RESTORE_LIMITS) -> dict``  re-reads and checks every hash.
@@ -65,6 +70,7 @@ import argparse
 import ctypes
 import datetime as _dt
 import errno
+import fnmatch
 import gzip
 import hashlib
 import io
@@ -98,13 +104,36 @@ WORK_PREFIX = ".mes-backup-"
 CHUNK = 1024 * 1024
 MAX_SIGNATURE_BYTES = 16 * 1024
 # Never copied into a backup, never restored, never moved aside, never written into: the run
-# log (and its anchor), the gate's log and locks, and the old place of server backups.
+# log (and its anchor), the gate's log and locks, and a backups folder (server backups never live there).
 STATE_RESERVED = frozenset({"runs.jsonl", "runs.jsonl.head", "gate", "backups"})
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _DIRECTORY = getattr(os, "O_DIRECTORY", 0)
 _NONBLOCK = getattr(os, "O_NONBLOCK", 0)
 _KEY_B64_RE = re.compile(r"^[A-Za-z0-9+/]{60,400}={0,3}\Z")
 _FINGERPRINT_RE = re.compile(r"^SHA256:[A-Za-z0-9+/=]{20,80}\Z")
+ALWAYS = "always left out"
+SQLITE_SIDE_FILES = ("-journal", "-wal", "-shm")
+_SQLITE_MAGIC = b"SQLite format 3\x00"
+
+
+@dataclass(frozen=True)
+class Rule:
+    """A path a backup leaves out: ``data/...`` or ``state/...``, ``*`` within one part. A rule
+    that names a folder leaves out everything in it."""
+
+    pattern: str
+    source: str
+
+    def matches(self, path: list[str]) -> bool:
+        parts = self.pattern.split("/")
+        return len(path) >= len(parts) and all(fnmatch.fnmatchcase(p, r) for p, r in zip(path, parts))
+
+    def to_dict(self) -> dict[str, str]:
+        return {"rule": self.pattern, "from": self.source}
+
+
+def _matching(rules: list[Rule], path: list[str]) -> Rule | None:
+    return next((r for r in rules if r.matches(path)), None)
 
 
 @dataclass(frozen=True)
@@ -118,6 +147,7 @@ class Target:
     server: bool
     default_dest: Path
     base: Path | None = None
+    apps_dir: Path | None = None  # where the apps are read from on a server (the running release)
 
     def folder(self, part: str) -> Path:
         return {"data": self.data, "state": self.state, "store": self.store}[part]
@@ -150,7 +180,7 @@ def resolve(project: str | None = None, *, project_dir: str | os.PathLike[str] |
                              hint="For example: mes backup myproject --server-root /var/lib/mes")
         layout = paths.server_layout(project, server_root)
         return Target(project, layout.data, layout.state, layout.store, _load_manifest(layout.current_project),
-                      None, True, layout.base / "backups", layout.base)
+                      None, True, layout.base / "backups", layout.base, layout.current_project)
     found: Path | None
     if project_dir is not None:
         found = Path(project_dir).expanduser().resolve() / manifest_mod.MANIFEST_FILE
@@ -175,6 +205,50 @@ def resolve(project: str | None = None, *, project_dir: str | os.PathLike[str] |
                   paths.state_home().parent / "mes-backups" / name)
 
 
+# --------------------------------------------------------------------------- what is left out
+
+
+def exclusion_rules(target: Target) -> tuple[list[Rule], list[str]]:
+    """The paths this project leaves out of backups: ``[backup] exclude`` in project.toml and each
+    installed app's ``[data] no_backup`` (read from the app.toml files; no project code runs).
+    Returns ``(rules, packages whose app.toml could not be found)``. A broken app.toml raises."""
+    if target.project is None:
+        return [], []
+    pf = target.project
+    rules = [Rule(r, "project.toml [backup] exclude") for r in pf.backup_exclude]
+    folder = target.root or target.apps_dir
+    if folder is None:
+        return rules, list(pf.packages)
+    try:
+        apps = [(s.name, s.data.no_backup) for s in manifest_mod.load(folder).apps.values()]
+        missing: list[str] = []
+    except MesError:
+        # For example apps that are installed packages whose list (apps.lock.json) is not written or
+        # out of date: read the in-project ones (a broken one raises), and say which could not be read.
+        apps, missing = [], []
+        for package in pf.packages:
+            app_toml = Path(folder) / manifest_mod.APPS_DIR / package / manifest_mod.APP_FILE
+            if app_toml.is_file() and not app_toml.is_symlink():
+                af = manifest_mod.load_app_file(app_toml, package=package)
+                apps.append((af.name, af.data.no_backup))
+            else:
+                missing.append(package)
+    for name, paths_ in apps:
+        rules += [Rule(r, f"the app {name} ([data] no_backup)") for r in paths_]
+    return rules, missing
+
+
+def _always_left_out(name: str, siblings_: set[str]) -> str | None:
+    """Files no backup ever holds: lock files, and SQLite's side files next to their database
+    (a database is copied with SQLite's own backup, which already holds what they had)."""
+    if name.endswith(".lock"):
+        return "*.lock (lock files)"
+    for suffix in SQLITE_SIDE_FILES:
+        if name.endswith(suffix) and name[: -len(suffix)] in siblings_:
+            return f"*{suffix} (a SQLite side file next to its database)"
+    return None
+
+
 # --------------------------------------------------------------------------- who runs it
 
 
@@ -183,7 +257,8 @@ def _check_runner() -> None:
         raise Refused(
             "Backups and restores are never run as root: root would follow whatever the project's own code left "
             "in its folders (links to other places), so nothing was done.",
-            hint="Run it as the account that owns the project's folders (on a server: sudo -u mes-<project> mes ...).",
+            hint="Run it as the account that owns the project's folders (on a server: "
+            "cd / && sudo -u mes-<project> /usr/local/bin/mes ...).",
             code="as_root",
         )
 
@@ -240,26 +315,39 @@ def _ustar_ok(name: str) -> bool:
     return False
 
 
-def _walk(root_fd: int, prefix: str, target: Target | None, skipped: list[dict[str, str]]) -> list[list[str]]:
+def _walk(root_fd: int, prefix: str, target: Target | None, skipped: list[dict[str, str]],
+          rules: list[Rule] = (), excluded: list[dict[str, str]] | None = None) -> list[list[str]]:
     """The plain files below the open folder ``root_fd``, as path parts, read with ``os.fwalk``
-    (one open folder at a time, links never followed)."""
+    (one open folder at a time, links never followed). Paths the project leaves out of backups
+    (``rules``) and files no backup holds (lock files, SQLite side files) go to ``excluded``."""
     out: list[list[str]] = []
+    excluded = [] if excluded is None else excluded
     for dirpath, dirnames, filenames, dirfd in os.fwalk(".", dir_fd=root_fd, follow_symlinks=False):
         here = [x for x in dirpath.split("/") if x not in ("", ".")]
         keep = []
         for d in sorted(dirnames):
             if (not here and target is not None and target.reserved(prefix, d)) or d.startswith(WORK_PREFIX):
                 continue
+            rule = _matching(list(rules), [prefix, *here, d])
+            if rule is not None:
+                excluded.append({"path": "/".join([prefix, *here, d]) + "/", **rule.to_dict()})
+                continue
             if stat.S_ISLNK(os.stat(d, dir_fd=dirfd, follow_symlinks=False).st_mode):
                 skipped.append({"path": "/".join([prefix, *here, d]), "why": "a link to somewhere else"})
                 continue
             keep.append(d)
         dirnames[:] = keep
+        names = set(filenames)
         for f in sorted(filenames):
             parts = [*here, f]
             if not here and target is not None and target.reserved(prefix, f):
                 continue
             rel = "/".join([prefix, *parts])
+            rule = _matching(list(rules), [prefix, *parts])
+            always = _always_left_out(f, names) if target is not None and rule is None else None
+            if rule is not None or always is not None:
+                excluded.append({"path": rel, **(rule.to_dict() if rule else {"rule": always, "from": ALWAYS})})
+                continue
             st = os.stat(f, dir_fd=dirfd, follow_symlinks=False)
             if not stat.S_ISREG(st.st_mode):
                 why = "a link to somewhere else" if stat.S_ISLNK(st.st_mode) else "not a plain file"
@@ -325,6 +413,22 @@ def _snapshot_store(store: Path, workdir: Path) -> Path:
     siblings.run_json([mybucket, "--json", "--store", str(snap), "verify"],
                       timeout=3600, what="Checking the copy of the store (mybucket verify)")
     return snap
+
+
+def _is_sqlite(root_fd: int, parts: list[str]) -> bool:
+    """Whether the file starts like a SQLite database (opened without following links)."""
+    try:
+        parent = _walk_to(root_fd, parts[:-1])
+        try:
+            fd = os.open(parts[-1], os.O_RDONLY | _NOFOLLOW | _NONBLOCK, dir_fd=parent)
+        finally:
+            os.close(parent)
+    except OSError:
+        return False
+    try:
+        return stat.S_ISREG(os.fstat(fd).st_mode) and os.read(fd, len(_SQLITE_MAGIC)) == _SQLITE_MAGIC
+    finally:
+        os.close(fd)
 
 
 def _snapshot_db(source: Path, target: Path) -> bool:
@@ -502,6 +606,23 @@ def backup(target: Target, *, dest: str | os.PathLike[str] | None = None, includ
     out_dir = _check_dest(target, Path(dest) if dest is not None else target.default_dest)
     notes: list[str] = []
     skipped: list[dict[str, str]] = []
+    excluded: list[dict[str, str]] = []
+    try:
+        rules, unread = exclusion_rules(target)
+    except MesError as e:
+        raise Refused(
+            "mes could not read the project's apps, so it cannot tell which files they leave out of backups (such "
+            "as a saved login). No backup was written, so nothing private ends up in one by mistake.",
+            hint=e.hint or "Fix the app.toml it names, then run the backup again.", code="apps_unreadable",
+            detail=e.message) from None
+    if unread:
+        notes.append(f"mes could not find the app.toml of {', '.join(unread)} (run: mes apps sync), so the files "
+                     "those apps leave out of backups ([data] no_backup) were not left out this time. If one of them "
+                     "keeps a saved login, it may be in this backup.")
+    if target.project is None:
+        notes.append("No project.toml was found for this project here, so only lock files and SQLite side files were "
+                     "left out: the apps' own lists of files to leave out ([data] no_backup) were not applied. Run "
+                     "mes backup in the project's folder.")
     store_in_data = target.store.parent == target.data
     has_store = _has_contents(target.store)
     opened: list[int] = []
@@ -514,23 +635,39 @@ def backup(target: Target, *, dest: str | os.PathLike[str] | None = None, includ
             if fd is None:
                 continue
             opened.append(fd)
-            found = _walk(fd, part, target, skipped)
-            if part == "data" and [f"{target.name}.sqlite"] in found:
-                # The project's shared database: a consistent copy (SQLite's own backup), never half
-                # of a transaction; its journal is then not needed.
-                db_name = f"{target.name}.sqlite"
-                snap_db = work / db_name
-                if _snapshot_db(target.data / db_name, snap_db):
-                    work_fd = _open_own(work)
+            found = _walk(fd, part, target, skipped, rules, excluded)
+            work_fd: int | None = None
+            for parts in found:
+                # Every SQLite database (the project's shared one and any an app keeps): a consistent
+                # copy made with SQLite's own backup, never half of a transaction. Its side files
+                # (-journal, -wal, -shm) are then not needed and are never copied.
+                shared = part == "data" and parts == [f"{target.name}.sqlite"]
+                if not _is_sqlite(fd, parts):
+                    if shared:
+                        notes.append(f"{parts[0]} is not a readable SQLite database, so it was copied as it is. "
+                                     "Check it with: mes db check")
+                    sources.append((part, fd, parts))
+                    continue
+                if work_fd is None:
+                    (work / part).mkdir(mode=0o700)
+                    work_fd = _open_own(work / part)
                     assert work_fd is not None
                     opened.append(work_fd)
-                    leftovers = {f"{db_name}-journal", f"{db_name}-wal", f"{db_name}-shm"}
-                    sources += [("data", work_fd, parts) if parts == [db_name] else (part, fd, parts)
-                                for parts in found if not (len(parts) == 1 and parts[0] in leftovers)]
-                    continue
-                notes.append(f"{db_name} is not a readable SQLite database, so it was copied as it is. "
-                             "Check it with: mes db check")
-            sources += [(part, fd, parts) for parts in found]
+                source_db = folder.joinpath(*parts)
+                if os.path.realpath(source_db.parent) != os.path.join(os.path.realpath(folder), *parts[:-1]):
+                    raise MesError("A folder changed or was replaced while the backup was being written, so no "
+                                   "backup was written. Nothing else was changed.",
+                                   hint="Run the backup again, ideally while no job of the project is running.",
+                                   code="backup_changed")
+                snap_db = (work / part).joinpath(*parts)
+                snap_db.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                if _snapshot_db(source_db, snap_db):
+                    sources.append((part, work_fd, parts))
+                else:
+                    notes.append(f"{'/'.join([part, *parts])} " + ("is not a readable SQLite database" if shared else
+                                 "looks like a SQLite database but could not be read as one")
+                                 + ", so it was copied as it is." + (" Check it with: mes db check" if shared else ""))
+                    sources.append((part, fd, parts))
         store_used = False
         if has_store and include_store:
             if not store_in_data and _open_own(target.store) is None:
@@ -550,7 +687,10 @@ def backup(target: Target, *, dest: str | os.PathLike[str] | None = None, includ
                            "nothing to back up.", hint="Use the project first (for example run its jobs).",
                            code="nothing_to_back_up")
         info = {"format": 1, "project": target.name, "created": _dt.datetime.now(_dt.UTC).isoformat(timespec="seconds"),
-                "server": target.server, "store": store_used}
+                "server": target.server, "store": store_used,
+                "left_out_rules": [r.to_dict() for r in rules] + [
+                    {"rule": "*.lock (lock files)", "from": ALWAYS},
+                    {"rule": "*-journal, *-wal, *-shm (SQLite side files next to their database)", "from": ALWAYS}]}
         stamp = _now_stamp()
         path = out_dir / f"{target.name}-{stamp}.tar.gz"
         n = 2
@@ -602,6 +742,11 @@ def backup(target: Target, *, dest: str | os.PathLike[str] | None = None, includ
     if skipped:
         notes.append(f"{len(skipped)} item(s) were not copied because they are links or special files: see "
                      "'skipped'.")
+    by_rule = [e for e in excluded if e["from"] != ALWAYS]
+    if by_rule:
+        notes.append(f"{len(by_rule)} item(s) were left out on purpose, because the project or one of its apps says "
+                     "they do not belong in a backup (such as a saved login): see 'excluded'. After restoring this "
+                     "backup on a new computer, sign in to those apps again.")
     if signature is None:
         notes.append("This backup is not signed (no signing key is set up here, or --no-sign). Its check proves it is "
                      "complete and unchanged (integrity), not who made it (origin). Write down its SHA-256 and compare "
@@ -618,6 +763,7 @@ def backup(target: Target, *, dest: str | os.PathLike[str] | None = None, includ
         "store": store_used,
         "verified": True,
         "skipped": skipped,
+        "excluded": excluded,
         "notes": notes,
         "message": f'The data and state of "{target.name}" are backed up in {path}, and the backup was read back '
         "and checked file by file" + (f", and signed ({signature.name})" if signature else "") + ". Keep a copy on "
@@ -753,7 +899,7 @@ def _names(fd: int, target: Target, part: str) -> list[str]:
 
 
 def _stage(held: BinaryIO, part: str, folder_fd: int, staging: str, target: Target,
-           expected: dict[str, tuple[int, str]]) -> tuple[int, list[str]]:
+           expected: dict[str, tuple[int, str]], rules: list[Rule] = ()) -> tuple[int, list[str], list[str]]:
     """Unpack the files of one part into ``staging`` (a new folder inside the destination, so
     moving them in is a rename), with mes's hardened reader, hashing every file. Names mes never
     restores are left out and listed."""
@@ -761,6 +907,7 @@ def _stage(held: BinaryIO, part: str, folder_fd: int, staging: str, target: Targ
     stage_fd = os.open(staging, os.O_RDONLY | _DIRECTORY | _NOFOLLOW, dir_fd=folder_fd)
     found: dict[str, tuple[int, str]] = {}
     left_out: list[str] = []
+    by_rule: list[str] = []
     made: set[tuple[str, ...]] = set()
     try:
         for name, kind, mode, size, chunks in archive.read_members(held, RESTORE_LIMITS):
@@ -775,6 +922,14 @@ def _stage(held: BinaryIO, part: str, folder_fd: int, staging: str, target: Targ
                     pass
                 if kind == "file":
                     left_out.append(name)
+                    expected.pop(name, None)
+                continue
+            if _matching(list(rules), parts) is not None:
+                # The project leaves this out of backups (a saved login, say): what is there now stays.
+                for _ in chunks:
+                    pass
+                if kind == "file":
+                    by_rule.append(name)
                     expected.pop(name, None)
                 continue
             dirs = rel if kind == "folder" else rel[:-1]
@@ -816,7 +971,102 @@ def _stage(held: BinaryIO, part: str, folder_fd: int, staging: str, target: Targ
     wanted = {k: v for k, v in expected.items() if k.split("/", 1)[0] == part}
     if found != wanted:
         raise _broken("its files do not match its recorded list and fingerprints")
-    return len(found), left_out
+    return len(found), left_out, by_rule
+
+
+def _only_left_out(folder_fd: int, part: str, name: str, rules: list[Rule]) -> bool:
+    """Whether everything in the entry ``name`` is a file the project leaves out of backups (so the
+    folder counts as empty for a restore)."""
+    if _matching(rules, [part, name]) is not None:
+        return True
+    st = os.stat(name, dir_fd=folder_fd, follow_symlinks=False)
+    if not stat.S_ISDIR(st.st_mode):
+        return False
+    fd = os.open(name, os.O_RDONLY | _DIRECTORY | _NOFOLLOW, dir_fd=folder_fd)
+    try:
+        hits = 0
+        for dirpath, dirnames, filenames, _dfd in os.fwalk(".", dir_fd=fd, follow_symlinks=False):
+            here = [part, name, *[x for x in dirpath.split("/") if x not in ("", ".")]]
+            for d in list(dirnames):
+                if _matching(rules, [*here, d]) is not None:
+                    dirnames.remove(d)
+                    hits += 1
+            for f in filenames:
+                if _matching(rules, [*here, f]) is None:
+                    return False
+                hits += 1
+        return hits > 0
+    finally:
+        os.close(fd)
+
+
+def _dirs_in(live_fd: int, parts: list[str]) -> int | None:
+    """An open folder ``parts`` below ``live_fd``, made where missing (0700); None when something
+    on the way is not a real folder (a file, or a link)."""
+    fd = os.dup(live_fd)
+    try:
+        for part in parts:
+            try:
+                os.mkdir(part, 0o700, dir_fd=fd)
+            except FileExistsError:
+                pass
+            try:
+                nxt = os.open(part, os.O_RDONLY | _DIRECTORY | _NOFOLLOW, dir_fd=fd)
+            except OSError:
+                os.close(fd)
+                return None
+            os.close(fd)
+            fd = nxt
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _keep_left_out(aside_fd: int, live_fd: int, part: str, rules: list[Rule]) -> tuple[list[str], list[str]]:
+    """Move the files the project leaves out of backups back from the moved-aside folder to where
+    they were (they are not in the backup, so the restore must not take them away). Only plain
+    files and folders are moved, each with a rename relative to open folders, never over a name.
+    Returns (paths put back, paths that had to stay aside)."""
+    kept: list[str] = []
+    stayed: list[str] = []
+    emptied: list[list[str]] = []
+    for dirpath, dirnames, filenames, dfd in os.fwalk(".", dir_fd=aside_fd, follow_symlinks=False):
+        here = [x for x in dirpath.split("/") if x not in ("", ".")]
+        for name in [*sorted(dirnames), *sorted(filenames)]:
+            rel = [part, *here, name]
+            if _matching(rules, rel) is None:
+                continue
+            if name in dirnames:
+                dirnames.remove(name)
+            st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+            if not (stat.S_ISREG(st.st_mode) or stat.S_ISDIR(st.st_mode)):
+                stayed.append("/".join(rel))
+                continue
+            parent = _dirs_in(live_fd, here)
+            if parent is None:
+                stayed.append("/".join(rel))
+                continue
+            try:
+                _rename_noreplace(dfd, name, parent, name)
+                kept.append("/".join(rel))
+                emptied.append(here)
+            except (Refused, OSError):
+                stayed.append("/".join(rel))
+            finally:
+                os.close(parent)
+    # Folders inside the moved-aside folder that held only those files are removed again (they
+    # were made empty by the moves above; anything else in them stays).
+    for here in sorted(emptied, key=len, reverse=True):
+        for i in range(len(here), 0, -1):
+            parent = _walk_to(aside_fd, here[:i - 1])
+            try:
+                os.rmdir(here[i - 1], dir_fd=parent)
+            except OSError:
+                break
+            finally:
+                os.close(parent)
+    return kept, stayed
 
 
 def _read_signature(src: Path, given: str | None) -> str | None:
@@ -906,14 +1156,23 @@ def restore(target: Target, archive_path: str | os.PathLike[str], *, yes: bool =
             )
         when = _created(info["created"]).astimezone(_dt.UTC).strftime("%Y-%m-%d %H:%M UTC")
         expected = {f["path"]: (f["size"], f["sha256"]) for f in info["files"]}
+        try:
+            rules, _ = exclusion_rules(target)
+        except MesError:
+            rules = [Rule(r, "project.toml [backup] exclude") for r in (target.project.backup_exclude
+                                                                         if target.project else ())]
         parts = [p for p in PARTS if any(k.startswith(p + "/") for k in expected)]
         for p in parts:
             fd = _open_own(target.folder(p), create=True)
             assert fd is not None
             folder_fds[p] = fd
         busy = {p: _names(folder_fds[p], target, p) for p in parts}
+        # What is there and only holds files the project leaves out of backups does not count as
+        # contents: it is moved aside and back, so it stays where it is.
+        real = {p: [n for n in busy[p] if not rules or p not in ("data", "state")
+                    or not _only_left_out(folder_fds[p], p, n, rules)] for p in parts}
         stamp = _now_stamp()
-        full = [p for p in parts if busy[p]]
+        full = [p for p in parts if real[p]]
         if full and not replace:
             names = ", ".join(f"{p} ({target.folder(p)})" for p in full)
             raise Refused(
@@ -923,11 +1182,15 @@ def restore(target: Target, archive_path: str | os.PathLike[str], *, yes: bool =
                 f"{ASIDE_PREFIX}<time> inside each folder, never deleted.",
                 code="not_empty",
             )
-        never = [k for k in expected if target.reserved(k.split("/")[0], k.split("/")[1])]
+        never = [k for k in expected if target.reserved(k.split("/")[0], k.split("/")[1])
+                 or _matching(rules, k.split("/")) is not None]
         counts = {p: sum(1 for f in expected if f.startswith(p + "/") and f not in never) for p in parts}
         plan = [f"{p}: {counts[p]} file(s) from the backup go into {target.folder(p)}" +
-                (f"; its current {len(busy[p])} item(s) are moved into {ASIDE_PREFIX}{stamp}" if busy[p] else "")
+                (f"; its current {len(real[p])} item(s) are moved into {ASIDE_PREFIX}{stamp}" if real[p] else "")
                 for p in parts]
+        if rules:
+            plan.append("files the project leaves out of backups (" + ", ".join(r.pattern for r in rules[:8])
+                        + ") stay where they are")
         origin = (f"It is signed by {signed_by}, so it was made with a key you trust." if signed_by else
                   "It is NOT signed: its check proves it is complete and unchanged since it was written, not who "
                   f"made it. Its SHA-256 is {archive_sha}; compare it with the one mes backup printed.")
@@ -953,10 +1216,15 @@ def restore(target: Target, archive_path: str | os.PathLike[str], *, yes: bool =
                 rerun=rerun,
             )
         left_out: list[str] = []
+        by_rule: list[str] = []
+        kept: list[str] = []
+        stayed: list[str] = []
         for p in parts:
             staged[p] = f"{TEMP_PREFIX}{secrets.token_hex(6)}"
-            _, skipped_names = _stage(held, p, folder_fds[p], staged[p], target, expected)
+            _, skipped_names, ruled = _stage(held, p, folder_fds[p], staged[p], target, expected,
+                                             rules if p in ("data", "state") else [])
             left_out += skipped_names
+            by_rule += ruled
         moved: dict[str, str] = {}
         for p in parts:
             ffd = folder_fds[p]
@@ -977,6 +1245,20 @@ def restore(target: Target, archive_path: str | os.PathLike[str], *, yes: bool =
             finally:
                 os.close(stage_fd)
             os.rmdir(staged.pop(p), dir_fd=ffd)
+            if busy[p] and rules and p in ("data", "state"):
+                aside = f"{ASIDE_PREFIX}{stamp}"
+                aside_fd = os.open(aside, os.O_RDONLY | _DIRECTORY | _NOFOLLOW, dir_fd=ffd)
+                try:
+                    back, left = _keep_left_out(aside_fd, ffd, p, rules)
+                finally:
+                    os.close(aside_fd)
+                kept += back
+                stayed += left
+                try:
+                    os.rmdir(aside, dir_fd=ffd)  # only when nothing else was in it
+                    moved.pop(p, None)
+                except OSError:
+                    pass
     finally:
         for p, name in staged.items():
             with _suppress():
@@ -990,6 +1272,9 @@ def restore(target: Target, archive_path: str | os.PathLike[str], *, yes: bool =
         "files": sum(counts.values()),
         "moved_aside": moved,
         "not_restored": left_out,
+        "left_out_by_rule": by_rule,
+        "kept": kept,
+        "kept_aside": stayed,
         "verified": True,
         "signed": signed_by is not None,
         "signed_by": signed_by,

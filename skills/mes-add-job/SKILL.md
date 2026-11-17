@@ -1,6 +1,6 @@
 ---
 name: mes-add-job
-description: Add or change a job in a my-easy-software project (the [jobs] of an app's app.toml, with ids like <app>.<job>, and [settings.<app>] in project.toml) that runs on a schedule, after another job, on request or from a signed webhook, with network and memory limits. Use when the user wants something to happen automatically, every day or hour, after a sync, or when an outside service calls in.
+description: Add or change a job in a **my-easy-software** project (the [jobs] of an app's app.toml, with ids like <app>.<job>, and [settings.<app>] in project.toml) that runs on a schedule, after another job, on request or from a signed webhook, with network and memory limits. Use when the user wants something to happen automatically, every day or hour, after a sync, or when an outside service calls in.
 ---
 
 # Add a job

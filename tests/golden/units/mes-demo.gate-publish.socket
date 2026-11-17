@@ -1,0 +1,22 @@
+# Made by my-easy-software (mes). Do not edit: run 'mes server plan' again and the script it writes instead.
+# mes-project: demo
+# mes-unit: gate-publish
+# Each connection gets its own sandboxed instance of mes-demo.gate-publish@.service.
+# Only the gate's own deploy steps use it (no SSH key has this level).
+# Only the account mes-demo can connect, and each instance accepts only an SSH
+# session of that account (never a job). No unit that runs project code can see this socket's folder.
+
+[Unit]
+Description=Sandboxed publish requests of the mes gate for project demo (socket)
+
+[Socket]
+ListenStream=/run/mes-demo-gate/publish.sock
+SocketUser=mes-demo
+SocketGroup=mes-demo
+SocketMode=0600
+DirectoryMode=0755
+Accept=yes
+MaxConnections=1
+
+[Install]
+WantedBy=sockets.target

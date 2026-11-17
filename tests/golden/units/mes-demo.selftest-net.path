@@ -1,0 +1,14 @@
+# Made by my-easy-software (mes). Do not edit: run 'mes server plan' again and the script it writes instead.
+# mes-project: demo
+# mes-unit: selftest
+# Started by 'mes server selftest' through the gate.
+
+[Unit]
+Description=Start the mes self-test probe of project demo (a job that lists hosts)
+
+[Path]
+PathModified=/var/lib/mes/demo/gate/selftest-net-request
+Unit=mes-demo.selftest-net.service
+
+[Install]
+WantedBy=paths.target

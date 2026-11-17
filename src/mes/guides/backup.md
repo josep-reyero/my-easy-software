@@ -27,7 +27,18 @@ back and checks every file's size and SHA-256 against the list inside it (`verif
   before restoring.
 - Never in a backup: the run log (`state/runs.jsonl`) and the gate's log (`state/gate/`). They
   record what happened, so a restore must not replace them.
-- If the project has a my-bucket-storage store, mes asks `mybucket snapshot` for a consistent
+- **Left out on purpose.** Files that must not travel with a backup, such as an app's saved login
+  or token: an app lists them in its `app.toml` (`[data] no_backup = ["data/.state/tokens.json"]`),
+  the project in `project.toml` (`[backup] exclude = ["state/cache/*.tmp"]`). Each entry is a path
+  in the project's data folder (`data/...`) or state folder (`state/...`), as the archive lists it;
+  `*` stands for any characters within one part, and a folder leaves out everything in it. Always
+  left out: lock files (`*.lock`) and SQLite's side files (`-journal`, `-wal`, `-shm` next to
+  their database). The answer lists everything left out under `excluded` (with the rule and who
+  asked for it), and the archive records the rules. Tell the user plainly: after a total loss,
+  restoring such a backup brings the data back, but those apps need a fresh sign-in.
+- Every SQLite database in the data and state folders (the shared one and any an app keeps) is
+  copied with SQLite's own backup, so a copy never holds half of a transaction.
+- If the project has a **my-bucket-storage** store, mes asks `mybucket snapshot` for a consistent
   copy, checks it with `mybucket verify`, and packs that copy. Without mybucket installed, mes
   refuses rather than copy a store that may be in use; `--no-store` leaves the store out (and
   says so).
@@ -35,7 +46,7 @@ back and checks every file's size and SHA-256 against the list inside it (`verif
   archive mode 0600). Use `--to` for another disk: a backup on the same disk does not survive
   the disk. mes refuses to write a backup inside the project's own folders.
 - On a server, run it as the project's account with `--server-root /var/lib/mes`
-  (`sudo -u mes-<project> mes backup <project> --server-root /var/lib/mes`). The default place
+  (`cd / && sudo -u mes-<project> /usr/local/bin/mes backup <project> --server-root /var/lib/mes`). The default place
   is then `/var/lib/mes/<project>/backups/`, which the root script makes and which no job or gate
   request can see or change (never `state/`, which the project's own jobs can write).
 - Only the account that owns the project's folders may run it, and never root: as root, mes
@@ -73,12 +84,18 @@ mes --json restore myproject /media/backup-disk/mes/myproject-20260101T080000Z.t
 5. The run log, the gate's log and mes's own working folders are never restored, never moved
    aside and never written into, even when an (old or hostile) archive holds them; they are
    listed under `not_restored`.
+6. Files the project leaves out of backups (`[data] no_backup`, `[backup] exclude`) stay where
+   they are: with `--replace` they are put back after the rest is moved aside (`kept`), and an
+   archive that holds such a path (an older backup) never writes over it (`left_out_by_rule`). A
+   folder that only holds such files counts as empty, so after a total loss the user can sign in
+   to the app again first and then restore without `--replace`.
 
-Only the account that owns the project's folders may restore, never root. Kind: `admin` (it
+Only the account that owns the project's folders may restore, never root (on a server:
+`cd / && sudo -u mes-<project> /usr/local/bin/mes restore <project> <archive> --server-root /var/lib/mes`). Kind: `admin` (it
 replaces the project's data), so sessions with `MES_ALLOW=read` or `write` cannot restore.
 
 ## Off-machine copies
 
 Copy the archive (and its `.sig`) to another disk or computer you own. For a project with a
-store, my-bucket-storage's own replication (`mybucket sync`) is the other way to keep a second
+store, **my-bucket-storage**'s own replication (`mybucket sync`) is the other way to keep a second
 copy of the store.

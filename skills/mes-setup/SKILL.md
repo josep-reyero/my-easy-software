@@ -1,6 +1,6 @@
 ---
 name: mes-setup
-description: Get a computer ready for my-easy-software (mes) projects, one safe step at a time, and serve a project's dashboard privately with Tailscale. Use when the user wants to install or set up mes, uv, git or Tailscale, asks why "mes" is not found, runs "mes setup" or "mes doctor", or wants to open their dashboard from their phone on their private network.
+description: Get a computer ready for **my-easy-software** (mes) projects, one safe step at a time, and serve a project's dashboard privately with Tailscale. Use when the user wants to install or set up mes, uv, git or Tailscale, asks why "mes" is not found, runs "mes setup" or "mes doctor", or wants to open their dashboard from their phone on their private network.
 ---
 
 # Set up mes

@@ -4,7 +4,7 @@
 # Started by 'mes server selftest' through the gate.
 
 [Unit]
-Description=Start the mes self-test probe of project demo
+Description=Start the mes self-test probe of project demo (a job)
 
 [Path]
 PathModified=/var/lib/mes/demo/gate/selftest-request

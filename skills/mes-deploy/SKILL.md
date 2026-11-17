@@ -1,6 +1,6 @@
 ---
 name: mes-deploy
-description: Put a my-easy-software project on the user's own Linux server and keep it updated - "mes server plan" (a root script the user runs once with sudo), "mes server check", signed "mes deploy", rollback, and backups with "mes backup". Use when the user wants their project to run all the time, on a server, VPS or home server, or to update, roll back or back it up.
+description: Put a **my-easy-software** project on the user's own Linux server and keep it updated - "mes server plan" (a root script the user runs once with sudo), "mes server check", signed "mes deploy", rollback, and backups with "mes backup". Use when the user wants their project to run all the time, on a server, VPS or home server, or to update, roll back or back it up.
 ---
 
 # Deploy to a server

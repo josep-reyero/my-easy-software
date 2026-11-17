@@ -500,8 +500,9 @@ def serve_commands(serve: DashboardServe, ts: TailscaleState, plat: Platform) ->
         "serve": f"{sudo}tailscale serve --bg {https} unix:{socket}",
         "status": "tailscale serve status",
         "stop": f"{sudo}tailscale serve {https} off",
-        "allow_host": f"--allow-host {host}",
-        "plan": f"mes server plan {serve.project} --allow-host {host}",
+        "allow_host": f"--allow-host {host}" if port == 443 else f"--origin https://{host}:{port}",
+        "plan": f"/usr/local/bin/mes server plan {serve.project} "
+        + (f"--allow-host {host}" if port == 443 else f"--origin https://{host}:{port}"),
         "host": host,
         "host_known": known,
         "url": url,
@@ -526,7 +527,9 @@ def check_tailscale_serve(plat: Platform, ts: TailscaleState, mode: str | None,
                      f"on the server). The dashboard then opens at {cmd['url']} on your own devices.")
     why = " ".join([
         texts["why_todo"].format(project=f'"{serve.project}"'),
-        f"Run this once on the server: `{cmd['serve']}`.",
+        f"First look at what the server already serves with `{cmd['status']}`: serving on port {serve.port} "
+        "replaces whatever is served there now; if that port is taken, use another one (--port).",
+        f"Then run this once on the server: `{cmd['serve']}`.",
         f"The dashboard server only answers to names it knows, so make its units (mes-{serve.project}-web) "
         f"with that private name: `{cmd['plan']}` (it passes `{cmd['allow_host']}` to `easy-ui units`), "
         "then run the script it prints as before.",

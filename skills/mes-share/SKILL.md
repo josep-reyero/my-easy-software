@@ -1,6 +1,6 @@
 ---
 name: mes-share
-description: Share chosen dashboards of a my-easy-software project with other people with "mes expose" (Cloudflare Pages, Netlify or Vercel; only named people, anyone with the link, or public), or take a shared site down with "mes expose --remove". Use when the user wants to show a dashboard to a friend, family, a coach or the public, or to stop sharing it.
+description: Share chosen dashboards of a **my-easy-software** project with other people with "mes expose" (Cloudflare Pages, Netlify or Vercel; only named people, anyone with the link, or public), or take a shared site down with "mes expose --remove". Use when the user wants to show a dashboard to a friend, family, a coach or the public, or to stop sharing it.
 ---
 
 # Share dashboards

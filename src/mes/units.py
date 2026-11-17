@@ -115,14 +115,23 @@ HEADER = ("# Made by my-easy-software (mes). Do not edit: run 'mes server plan' 
           "writes instead.")
 _JOB_ID = r"[a-z][a-z0-9-]{1,30}\.[a-z][a-z0-9-]{0,30}"
 UNIT_NAME_RE = re.compile(rf"^mes-[a-z][a-z0-9-]{{1,30}}\.(?:job\.{_JOB_ID}\.(?:service|timer|path)|"
-                          rf"net\.{_JOB_ID}\.service|ui-refresh\.service|webhook\.(?:socket|service)|"
-                          r"selftest\.(?:path|service)|gate-(?:read|write|deploy)(?:\.socket|@\.service))\Z")
+                          rf"net\.(?:{_JOB_ID}|selftest)\.service|ui-refresh\.service|webhook\.(?:socket|service)|"
+                          r"selftest(?:-net)?\.(?:path|service)|gate-(?:read|write|deploy|publish)(?:\.socket|@\.service))\Z")
+# The levels an SSH key can have.
 GATE_LEVELS = ("read", "write", "deploy")
+# The request sandboxes the gate hands work to: the three key levels, plus "publish", which only
+# the gate's own deploy steps use (no key has it).
+SANDBOX_LEVELS = ("read", "write", "deploy", "publish")
+# The host-list self-test probe may reach only this name, which its network helper maps to an
+# address of the documentation range (RFC 5737): allowed by the filter, but routed nowhere.
+SELFTEST_HOST = "selftest.invalid"
+SELFTEST_ADDRESS = "192.0.2.1"
 JOB_UNIT_RE = re.compile(r"^mes-(?P<project>[a-z][a-z0-9-]{1,30})\.job\.(?P<app>[a-z][a-z0-9-]{1,30})\."
                          r"(?P<job>[a-z][a-z0-9-]{0,30})\.service\Z")
-# Where root's own copy of mes runs from: the Python of the root-owned tool install
-# (UV_TOOL_DIR=/opt/mes/tools, see: mes guide server). 'mes server plan --mes-python' changes it.
-DEFAULT_MES_PYTHON = "/opt/mes/tools/my-easy-software/bin/python"
+# Where root's own copy of mes runs from: the Python of the root-owned, locked install
+# (/opt/mes/my-easy-software, see: mes guide server). 'mes server plan' reads it from the first
+# line of the mes program; --mes-python changes it.
+DEFAULT_MES_PYTHON = "/opt/mes/my-easy-software/.venv/bin/python"
 # Everything root runs for a project starts with an empty environment: nothing the project's
 # account can write (HOME, PYTHONPATH, XDG folders, the working folder) reaches root.
 ROOT_ENV = ("/usr/bin/env", "-i", "PATH=/usr/bin:/bin", "LANG=C.UTF-8")
@@ -146,9 +155,10 @@ _SECONDS = {"s": 1, "m": 60, "h": 3600}
 # there, or the units hide them (ProtectHome=yes).
 UNSAFE_TOOL_ROOTS = ("/tmp", "/var/tmp", "/dev/shm", "/run/shm", "/home", "/root", "/run/user")
 
-# The sandbox shared by every unit that runs the project's own code (jobs, the dashboard data
-# refresh, the webhook receiver, the gate's requests). Network settings and folders are added
-# per unit.
+# The sandbox shared by every unit that runs the project's own code or a tool on the project's
+# files (jobs, the dashboard data refresh, the webhook receiver, the gate's requests, the
+# dashboard server, the self-test probes). Network settings and folders are added per unit; only
+# UMask=, SystemCallFilter= and TasksMax= may differ (see HARDENING_OVERRIDABLE).
 SANDBOX_LINES = (
     "UMask=0077",
     "NoNewPrivileges=yes",
@@ -159,6 +169,7 @@ SANDBOX_LINES = (
     "PrivateTmp=yes",
     "PrivateDevices=yes",
     "DevicePolicy=closed",
+    "PrivateIPC=yes",
     "ProtectKernelTunables=yes",
     "ProtectKernelModules=yes",
     "ProtectKernelLogs=yes",
@@ -180,7 +191,35 @@ SANDBOX_LINES = (
     "LimitCORE=0",
     "TasksMax=256",
 )
-# The deploy sandbox runs uv: it may set ownership of its own files (unpacking Python) and raise
+# Secrets of the system and of other services in /etc. What Python, TLS roots, names, accounts
+# and time zones need (resolv.conf, hosts, nsswitch.conf, passwd, group, localtime, ssl/certs,
+# ca-certificates) stays readable.
+HIDDEN_ETC = (
+    "/etc/shadow", "/etc/shadow-", "/etc/gshadow", "/etc/gshadow-", "/etc/sudoers", "/etc/sudoers.d",
+    "/etc/ssh", "/etc/ssl/private", "/etc/pki/tls/private", "/etc/letsencrypt", "/etc/credstore",
+    "/etc/credstore.encrypted", "/etc/NetworkManager", "/etc/wireguard", "/etc/systemd/network", "/etc/netctl",
+    "/etc/wpa_supplicant", "/etc/iwd", "/etc/openvpn", "/etc/ppp", "/etc/ipsec.d", "/etc/ipsec.secrets",
+    "/etc/krb5.keytab", "/etc/docker", "/etc/containers", "/etc/tailscale", "/etc/libvirt", "/etc/samba",
+    "/etc/cups", "/etc/polkit-1", "/etc/security", "/etc/crypttab",
+)
+# What the rest of the filesystem looks like inside: /var (other services' data, and every other
+# project under /var/lib/mes), /run (every service's sockets: systemd, D-Bus, resolved, userdb,
+# the journal, Tailscale, Docker, containerd, Podman, nscd, CUPS, Avahi, the gate's own sockets),
+# /opt and /usr/local are empty read-only folders; only /opt/mes (the tools) and the program
+# folders of /usr/local come back, read-only; /srv, /mnt, /media, /boot and /efi are not there at
+# all. The project's own folders are bound back per unit (_view), and a job that lists hosts gets
+# its own hosts file. Output goes to the journal through the stream systemd connects before the
+# sandbox is set up, so it needs no socket in /run; account lookups read /etc/passwd.
+FS_LINES = (
+    "TemporaryFileSystem=/var:ro /run:ro /opt:ro /usr/local:ro",
+    "BindReadOnlyPaths=-/opt/mes -/usr/local/bin -/usr/local/lib -/usr/local/lib64",
+    "InaccessiblePaths=-/srv -/mnt -/media -/boot -/efi",
+    "InaccessiblePaths=" + " ".join(f"-{p}" for p in HIDDEN_ETC),
+)
+# Where the tools (mes, its Python, uv, easy-ui) may be: everything else is hidden from the units.
+TOOL_ROOTS = ("/usr", "/bin", "/sbin", "/lib", "/lib64", "/opt/mes")
+HARDENING_OVERRIDABLE = ("UMask=", "SystemCallFilter=", "TasksMax=")
+# The install step runs uv: it may set ownership of its own files (unpacking Python) and raise
 # its own open-file limit, so these two groups come back; nothing else is relaxed. To be
 # confirmed on a real Linux server (mes server selftest reports it).
 DEPLOY_SYSCALL_LINES = (
@@ -188,6 +227,28 @@ DEPLOY_SYSCALL_LINES = (
     "SystemCallFilter=~@privileged",
     "SystemCallFilter=@chown",
 )
+
+
+def hardening(*, umask: str = "0077", syscalls: Sequence[str] | None = None, tasks: int = 256) -> list[str]:
+    """The one hardening block of every unit that runs project code (see SANDBOX_LINES, FS_LINES)."""
+    if not re.fullmatch(r"0[0-7]{3}", umask):
+        raise ValueError(umask)
+    out: list[str] = []
+    first_filter = True
+    for line in SANDBOX_LINES:
+        if line.startswith("UMask="):
+            out.append(f"UMask={umask}")
+        elif line.startswith("SystemCallFilter="):
+            if syscalls is None:
+                out.append(line)
+            elif first_filter:
+                out += list(syscalls)
+            first_filter = False
+        elif line.startswith("TasksMax="):
+            out.append(f"TasksMax={int(tasks)}")
+        else:
+            out.append(line)
+    return out + list(FS_LINES)
 
 
 def _refuse(what: str, value: object, why: str, hint: str) -> Refused:
@@ -255,8 +316,8 @@ def webhook_socket_path(project: str) -> str:
 
 
 def gate_units(project: str, level: str) -> tuple[str, str]:
-    if level not in GATE_LEVELS:
-        raise ValueError("level must be read, write or deploy")
+    if level not in SANDBOX_LEVELS:
+        raise ValueError("level must be read, write, deploy or publish")
     p = _check_project(project)
     return f"{UNIT_PREFIX}-{p}.gate-{level}.socket", f"{UNIT_PREFIX}-{p}.gate-{level}@.service"
 
@@ -267,8 +328,8 @@ def gate_socket_dir(project: str) -> str:
 
 
 def gate_socket_path(project: str, level: str) -> str:
-    if level not in GATE_LEVELS:
-        raise ValueError("level must be read, write or deploy")
+    if level not in SANDBOX_LEVELS:
+        raise ValueError("level must be read, write, deploy or publish")
     return f"{gate_socket_dir(project)}/{level}.sock"
 
 
@@ -454,10 +515,13 @@ def _project_env(project: Project, layout, *, home: str | None = None) -> list[s
 
 
 def _view(layout, *, ro: Sequence[Any] = (), rw: Sequence[Any] = ()) -> list[str]:
-    """What the unit sees of the server folder: nothing but these folders of its own project."""
+    """What the unit sees of the server folder: /var is an empty read-only folder (FS_LINES), and
+    only these folders of its own project are bound back, read-only unless listed as writable."""
+    seen = {str(p) for p in (*ro, *rw)}
+    absent = "other projects and the gate's own folder are not" if str(layout.auth) in seen else \
+        "other projects, the sign-in folder and the gate's own folder are not"
     lines = ["# Of all the projects' folders, only these of this project are there (read-only unless listed",
-             "# as writable); other projects, the sign-in folder and the gate's own folder are not.",
-             f"TemporaryFileSystem={line_path(layout.root)}:ro"]
+             f"# as writable); {absent}."]
     if ro:
         lines.append("BindReadOnlyPaths=" + " ".join(line_path(p) for p in ro))
     if rw:
@@ -466,8 +530,10 @@ def _view(layout, *, ro: Sequence[Any] = (), rw: Sequence[Any] = ()) -> list[str
     return lines
 
 
-def _hidden(project: Project, layout, *extra: Any) -> str:
-    paths_ = [gate_socket_dir(project.name), layout.webhook_key, *extra]
+def _hidden(project: Project, layout, *extra: Any, webhook_key: bool = True, uv_cache: bool = True) -> str:
+    """Inside the folders a unit sees: the webhook secret, the incoming archives and uv's cache."""
+    paths_ = ([layout.webhook_key] if webhook_key else []) + [layout.incoming] + \
+        ([layout.uv_cache] if uv_cache else []) + list(extra)
     return "InaccessiblePaths=" + " ".join(f"-{line_path(p)}" for p in paths_)
 
 
@@ -476,10 +542,37 @@ def _program(project: Project, layout, app: str) -> str:
     return sandbox_path(f"{sandbox_path(layout.current_project)}/.venv/bin/{spec.program}")
 
 
+def selftest_net_unit(project: str) -> str:
+    """The network helper of the host-list self-test probe."""
+    return f"{UNIT_PREFIX}-{_check_project(project)}.net.selftest.service"
+
+
+def selftest_net_units(project: str) -> tuple[str, str]:
+    p = _check_project(project)
+    return f"{UNIT_PREFIX}-{p}.selftest-net.path", f"{UNIT_PREFIX}-{p}.selftest-net.service"
+
+
+def selftest_hosts_file(project: str) -> str:
+    return f"{net_run_dir(project)}/selftest/hosts"
+
+
+def should_run_line(project: str, layout, mes_python: str, upstream: Sequence[str]) -> str:
+    """``ExecCondition=+``: root asks systemd how the job that started this one ended, and skips
+    this run when that one only stopped for a temporary problem (exit 75, recorded as skipped)."""
+    p = _check_project(project)
+    ids = [_check_job(u) for u in upstream]
+    return exec_line(root_command(mes_python, "jobs", "should-run", "--project", p, "--server-root",
+                                  sandbox_path(layout.root), "--", *ids))
+
+
 def render_job_service(project: Project, job: Job, *, layout, mes: str,
-                       mes_python: str = DEFAULT_MES_PYTHON, selftest: bool = False) -> str:
+                       mes_python: str = DEFAULT_MES_PYTHON, selftest: str | bool | None = None) -> str:
     p = _check_project(project.name)
     name = _check_job(job.id)
+    if selftest is True:
+        selftest = "job"
+    if selftest not in (None, False, "job", "net"):
+        raise ValueError("selftest must be 'job' or 'net'")
     hosts = check_hosts(job.network)
     local = check_hosts(getattr(job, "local_network", ()))
     all_hosts = list(dict.fromkeys(hosts + local))
@@ -489,14 +582,21 @@ def render_job_service(project: Project, job: Job, *, layout, mes: str,
     root = sandbox_path(layout.root)
     current = sandbox_path(layout.current_project)
     pre = None
+    condition = None
     if selftest:
-        start = exec_line([mes, "server", "selftest-probe", p, "--context", "job", "--server-root", root])
+        start = exec_line([mes, "server", "selftest-probe", p, "--context", selftest, "--server-root", root])
         record = None
         kind = "selftest"
+        helper = selftest_net_unit(p)
+        hosts_file = selftest_hosts_file(p)
     else:
         start = exec_line([_program(project, layout, job.app), "--json", *job.argv])
         record = exec_line(root_command(mes_python, "jobs", "record", "--project", p, "--server-root", root, name))
         kind = "job"
+        helper = net_unit(p, name)
+        hosts_file = net_hosts_file(p, name)
+        if job.after:
+            condition = should_run_line(p, layout, mes_python, [job.after])
         if "data" in writes:
             pre = exec_line(account_command(mes_python, [
                 ("MES_PROJECT", p), ("MES_DATA_DIR", sandbox_path(layout.data)),
@@ -512,12 +612,12 @@ def render_job_service(project: Project, job: Job, *, layout, mes: str,
                        + (f"; {', '.join(local)} may be on the local network" if local else "") + ")")
     else:
         net_comment = "network: none"
+    description = {"job": f"mes self-test probe of project {p} (a job's sandbox)",
+                   "net": f"mes self-test probe of project {p} (the sandbox of a job that lists hosts)"}
     lines = _header(p, kind, None if selftest else name, [net_comment])
-    lines += ["", "[Unit]",
-              f"Description=mes self-test probe of project {p} (a job's sandbox)" if selftest
-              else f"Description=mes job {name} of project {p}"]
+    lines += ["", "[Unit]", "Description=" + (description[selftest] if selftest else f"mes job {name} of project {p}")]
     if all_hosts:
-        lines += [f"Requires={net_unit(p, name)}", f"After={net_unit(p, name)}"]
+        lines += [f"Requires={helper}", f"After={helper}"]
     if after_success:
         lines.append("OnSuccess=" + " ".join(after_success))
     lines += [
@@ -527,6 +627,13 @@ def render_job_service(project: Project, job: Job, *, layout, mes: str,
         f"User={layout.account}",
         f"Group={layout.account}",
     ]
+    if not selftest:
+        lines += ["# Exit code 75 means \"a temporary problem, try again later\": the run counts as skipped, not",
+                  "# failed, and the jobs that wait for this one do not start.",
+                  "SuccessExitStatus=75"]
+    if condition:
+        lines += ["# Root skips this run when the job before it only stopped for a temporary problem.",
+                  f"ExecCondition=+{condition}"]
     if pre:
         lines += ["# First the shared database is brought in line with project.toml, by mes itself, as this",
                   "# account, with an empty environment and Python's isolated mode.",
@@ -548,24 +655,29 @@ def render_job_service(project: Project, job: Job, *, layout, mes: str,
         f"MemoryMax={_memory(job)}",
         "MemorySwapMax=0",
         f"TimeoutStartSec={timeout}",
-        *SANDBOX_LINES,
+        *hardening(),
     ]
     folders = {"data": [layout.data, layout.store], "state": [layout.state]}
     rw = [f for w in writes for f in folders[w]]
     ro = [layout.code] + [f for w in ("data", "state") if w not in writes for f in folders[w]]
     lines += _view(layout, ro=ro, rw=rw)
+    if selftest:
+        # Its answer goes to gate/selftest/, which no job can see, so no job can forge a pass.
+        answer = sandbox_path(f"{sandbox_path(layout.gate)}/selftest")
+        lines += [f"BindPaths=-{line_path(answer)}"]
+    lines.append(_hidden(project, layout))
     if all_hosts:
         lines += [
             "# The job's own /etc/hosts, written just before the run: the only names it can look up. It has",
             "# no DNS server and no access to the system's name service.",
-            f"BindReadOnlyPaths={line_path(net_hosts_file(p, name))}:/etc/hosts",
-            _hidden(project, layout, "/run/systemd/resolve", "/run/dbus"),
-            "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
+            f"BindReadOnlyPaths={line_path(hosts_file)}:/etc/hosts",
+            "# It shares the server's network (where other programs' abstract unix sockets live), so it",
+            "# cannot open unix sockets at all; socket pairs inside the job still work.",
+            "RestrictAddressFamilies=AF_INET AF_INET6",
             "IPAddressDeny=any",
         ]
     else:
-        lines += [_hidden(project, layout), "PrivateNetwork=yes", "RestrictAddressFamilies=AF_UNIX",
-                  "IPAddressDeny=any"]
+        lines += ["PrivateNetwork=yes", "RestrictAddressFamilies=AF_UNIX", "IPAddressDeny=any"]
     lines.append("")
     return "\n".join(lines)
 
@@ -613,18 +725,9 @@ def render_job_path(project: Project, job: Job, *, layout) -> str:
     return "\n".join(lines)
 
 
-def render_net_service(project: Project, job: Job, *, mes_python: str = DEFAULT_MES_PYTHON, layout=None) -> str:
-    p = _check_project(project.name)
-    name = _check_job(job.id)
-    hosts = check_hosts(job.network)
-    local = check_hosts(getattr(job, "local_network", ()))
-    if not hosts and not local:
-        raise ValueError(f"job {name!r} lists no hosts")
-    argv = ["jobs", "allow-network", "--unit", job_unit(p, name), "--hosts-file", net_hosts_file(p, name)]
-    for h in local:
-        argv += ["--local", h]
-    start = exec_line(root_command(mes_python, *argv, "--", *dict.fromkeys(hosts + local)))
-    lines = _header(p, "net", name, [
+def _net_lines(p: str, *, marker: str | None, description: str, before: str, runtime: str, start: str,
+               layout) -> list[str]:
+    lines = _header(p, "net", marker, [
         "Runs as root just before each start of the job, with an empty environment: it looks up the",
         "job's hosts, writes the job's own hosts file and lets the job reach only those addresses.",
         "Addresses on this computer or the local network are dropped, except for hosts listed in",
@@ -632,14 +735,14 @@ def render_net_service(project: Project, job: Job, *, mes_python: str = DEFAULT_
     ]) + [
         "",
         "[Unit]",
-        f"Description=Allow the network hosts of mes job {name} of project {p}",
-        f"Before={job_unit(p, name)}",
+        f"Description={description}",
+        f"Before={before}",
         "",
         "[Service]",
         "Type=oneshot",
         f"ExecStart={start}",
         "WorkingDirectory=/",
-        f"RuntimeDirectory=mes-{p}-net/{name}",
+        f"RuntimeDirectory={runtime}",
         "RuntimeDirectoryMode=0755",
         "RuntimeDirectoryPreserve=yes",
         "TimeoutStartSec=60",
@@ -666,13 +769,47 @@ def render_net_service(project: Project, job: Job, *, mes_python: str = DEFAULT_
         "SystemCallFilter=@system-service",
         "",
     ]
-    return "\n".join(lines)
+    return lines
 
 
-def render_ui_refresh(project: Project, *, layout, easy_ui: str) -> str:
+def render_net_service(project: Project, job: Job, *, mes_python: str = DEFAULT_MES_PYTHON, layout=None) -> str:
+    p = _check_project(project.name)
+    name = _check_job(job.id)
+    hosts = check_hosts(job.network)
+    local = check_hosts(getattr(job, "local_network", ()))
+    if not hosts and not local:
+        raise ValueError(f"job {name!r} lists no hosts")
+    argv = ["jobs", "allow-network", "--unit", job_unit(p, name), "--hosts-file", net_hosts_file(p, name)]
+    for h in local:
+        argv += ["--local", h]
+    start = exec_line(root_command(mes_python, *argv, "--", *dict.fromkeys(hosts + local)))
+    return "\n".join(_net_lines(p, marker=name, description=f"Allow the network hosts of mes job {name} of project {p}",
+                                before=job_unit(p, name), runtime=f"mes-{p}-net/{name}", start=start, layout=layout))
+
+
+def render_selftest_net(project: Project, *, layout, mes_python: str = DEFAULT_MES_PYTHON) -> str:
+    """The network helper of the host-list self-test probe: exactly a job's helper, but its one
+    host (SELFTEST_HOST) is mapped to SELFTEST_ADDRESS without a lookup."""
+    p = _check_project(project.name)
+    probe = selftest_net_units(p)[1]
+    start = exec_line(root_command(mes_python, "jobs", "allow-network", "--selftest", "--unit", probe,
+                                   "--hosts-file", selftest_hosts_file(p), "--", SELFTEST_HOST))
+    return "\n".join(_net_lines(p, marker=None, description=f"Allow the one test address of the self-test probe of {p}",
+                                before=probe, runtime=f"mes-{p}-net/selftest", start=start, layout=layout))
+
+
+def render_ui_refresh(project: Project, *, layout, easy_ui: str, mes_python: str = DEFAULT_MES_PYTHON) -> str:
     p = _check_project(project.name)
     easy_ui = check_tool_path(easy_ui, "the path of easy-ui")
-    start = exec_line([easy_ui, "--json", "--project-dir", sandbox_path(layout.current_project), "data", "build"])
+    root = sandbox_path(layout.root)
+    current = sandbox_path(layout.current_project)
+    start = exec_line([easy_ui, "--json", "--project-dir", current, "data", "build"])
+    first = exec_line(account_command(mes_python, [
+        ("MES_PROJECT", p), ("MES_DATA_DIR", sandbox_path(layout.data)), ("MES_STATE_DIR", sandbox_path(layout.state)),
+        ("MES_STORE_DIR", sandbox_path(layout.store)), ("MES_PROJECT_DIR", current), ("MES_ROOT", root),
+        ("MES_ALLOW", "write"),
+    ], "server", "first-publish", p, "--server-root", root, "--easy-ui", easy_ui))
+    upstream = list(project.ui.refresh_after) if project.ui is not None else []
     lines = _header(p, "ui-refresh") + [
         "",
         "[Unit]",
@@ -682,18 +819,25 @@ def render_ui_refresh(project: Project, *, layout, easy_ui: str) -> str:
         "Type=oneshot",
         f"User={layout.account}",
         f"Group={layout.account}",
+    ]
+    if upstream:
+        lines += ["# Root skips the refresh when the job that started it only stopped for a temporary problem.",
+                  f"ExecCondition=+{should_run_line(p, layout, mes_python, upstream)}"]
+    lines += [
         f"ExecStart={start}",
+        "# The first time there is data, the dashboards are also published (a deploy before the first",
+        "# data could not publish them). mes asks easy-ui and publishes only when nothing is published.",
+        f"ExecStartPost={first}",
         f"WorkingDirectory={line_path(layout.current_project)}",
         *_project_env(project, layout),
         # easy-ui finds <root>/<project>/ui and /data through MES_ROOT (the server layout).
-        f"Environment={env_assignment('MES_ROOT', sandbox_path(layout.root))}",
+        f"Environment={env_assignment('MES_ROOT', root)}",
         f"Environment={env_assignment('MES_ALLOW', 'read')}",
         f"Slice={SLICE}",
         "MemoryMax=512M",
         "TimeoutStartSec=600",
-        *[line for line in SANDBOX_LINES if not line.startswith("UMask=")],
         "# The dashboard server's account reads ui/ through its group, so new files are group-readable.",
-        "UMask=0027",
+        *hardening(umask="0027"),
         *_view(layout, ro=[layout.code, layout.data, layout.state], rw=[layout.ui]),
         _hidden(project, layout),
         "PrivateNetwork=yes",
@@ -749,9 +893,8 @@ def render_webhook(project: Project, *, layout, mes: str) -> dict[str, str]:
         f"Slice={SLICE}",
         "MemoryMax=128M",
         "RuntimeMaxSec=3600",
-        *SANDBOX_LINES,
+        *hardening(),
         *_view(layout, ro=[layout.etc], rw=[layout.webhook]),
-        f"InaccessiblePaths=-{line_path(gate_socket_dir(p))}",
         "# No network of its own: requests arrive only through the socket.",
         "PrivateNetwork=yes",
         "RestrictAddressFamilies=AF_UNIX",
@@ -764,17 +907,22 @@ def render_webhook(project: Project, *, layout, mes: str) -> dict[str, str]:
 def render_gate(project: Project, *, layout, mes: str, uv: str | None = None,
                 easy_ui: str | None = None) -> dict[str, str]:
     """Per-request sandboxes for the gate: one socket per level (only the project's account may
-    connect, from an SSH session) and a template service that systemd starts once per connection."""
+    connect, from an SSH session) and a template service that systemd starts once per connection.
+
+    ``read`` and ``write`` run app commands (and ``read`` also asks a new release's apps to
+    describe themselves); ``deploy`` only installs a new release (uv and mes's own wheel
+    unpacker, no project code); ``publish`` only publishes the dashboards (no network)."""
     p = _check_project(project.name)
     mes = check_tool_path(mes, "the path of mes")
     root = sandbox_path(layout.root)
     files: dict[str, str] = {}
-    for level in GATE_LEVELS:
+    for level in SANDBOX_LEVELS:
         socket_name, service_name = gate_units(p, level)
+        who = (["Only the gate's own deploy steps use it (no SSH key has this level)."] if level == "publish" else [])
         socket = _header(p, f"gate-{level}", None, [
-            f"Each connection gets its own sandboxed instance of {service_name}.",
-            f"Only the account {layout.account} can connect, and each instance accepts only an SSH session of",
-            "that account (never a job). No unit that runs project code can see this socket's folder.",
+            f"Each connection gets its own sandboxed instance of {service_name}.", *who,
+            f"Only the account {layout.account} can connect, and each instance accepts only an SSH",
+            "session of that account (never a job). No unit that runs project code can see this socket's folder.",
         ]) + [
             "",
             "[Unit]",
@@ -787,7 +935,7 @@ def render_gate(project: Project, *, layout, mes: str, uv: str | None = None,
             "SocketMode=0600",
             "DirectoryMode=0755",
             "Accept=yes",
-            f"MaxConnections={1 if level == 'deploy' else 4}",
+            f"MaxConnections={1 if level in ('deploy', 'publish') else 4}",
             "",
             "[Install]",
             "WantedBy=sockets.target",
@@ -808,65 +956,66 @@ def render_gate(project: Project, *, layout, mes: str, uv: str | None = None,
             "StandardOutput=socket",
             "StandardError=journal",
             "WorkingDirectory=/",
-            *_project_env(project, layout, home="/nonexistent" if level == "deploy" else None),
+            *_project_env(project, layout, home="/nonexistent" if level in ("deploy", "publish") else None),
             f"Slice={SLICE}",
             "MemoryMax=2G",
             "MemorySwapMax=0",
-            f"RuntimeMaxSec={'1800' if level == 'deploy' else '3700'}",
+            f"RuntimeMaxSec={'1800' if level == 'deploy' else '600' if level == 'publish' else '3700'}",
         ]
         if level == "deploy":
             lines += [
-                "# The deploy tools' own folders are in code/, which jobs and the write gate see read-only.",
+                "# Installs a new release and nothing else: uv puts the locked third-party packages into the new",
+                "# release's fresh environment, and mes unpacks the release's own wheels itself. No project code",
+                "# runs here (uv never starts the new environment's Python), and it sees no data, state, ui,",
+                "# store, gate or sign-in folder. uv's cache and Python are in code/, which only this step writes.",
                 f"Environment={env_assignment('UV_CACHE_DIR', sandbox_path(layout.uv_cache))}",
                 f"Environment={env_assignment('UV_PYTHON_INSTALL_DIR', sandbox_path(layout.uv_python))}",
                 f"Environment={env_assignment('UV_NO_CONFIG', '1')}",
                 f"Environment={env_assignment('UV_LINK_MODE', 'copy')}",
                 f"Environment={env_assignment('PYTHONNOUSERSITE', '1')}",
-                f"Environment={env_assignment('MES_ROOT', sandbox_path(layout.root))}",
-                *[line for line in SANDBOX_LINES if not line.startswith(("UMask=", "SystemCallFilter="))],
-                *DEPLOY_SYSCALL_LINES,
-                "# The dashboard server's account reads ui/ through its group, so new files are group-readable.",
-                "UMask=0027",
-                *_view(layout, ro=[layout.etc, layout.data], rw=[layout.code, layout.ui]),
-                _hidden(project, layout, layout.incoming),
+                *hardening(syscalls=DEPLOY_SYSCALL_LINES),
+                *_view(layout, ro=[layout.etc, layout.code]),
+                "# Writable: uv's cache and Python, and the new release only: code/installing is a link the gate",
+                "# points at releases/<n> just before this step; every other release stays read-only.",
+                "BindPaths=" + " ".join(f"-{line_path(x)}" for x in (layout.uv_cache, layout.uv_python, layout.installing)),
+                _hidden(project, layout, uv_cache=False),
+                "# Names are looked up through systemd-resolved's socket (its address 127.0.0.53 is blocked).",
+                "BindReadOnlyPaths=-/run/systemd/resolve/io.systemd.Resolve",
                 "# uv needs the package index, but nothing on this computer or the local network.",
                 "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
                 "IPAddressDeny=" + " ".join(DEPLOY_DENY),
                 "",
             ]
+        elif level == "publish":
+            lines += [
+                "# Publishes the dashboards of the running release: easy-ui reads the code (read-only) and",
+                "# writes ui/. No network, no data, no state.",
+                f"Environment={env_assignment('MES_ROOT', root)}",
+                "# The dashboard server's account reads ui/ through its group, so new files are group-readable.",
+                *hardening(umask="0027"),
+                *_view(layout, ro=[layout.etc, layout.code], rw=[layout.ui]),
+                _hidden(project, layout),
+                "PrivateNetwork=yes", "RestrictAddressFamilies=AF_UNIX", "IPAddressDeny=any", "",
+            ]
         else:
-            lines += list(SANDBOX_LINES)
+            lines += hardening()
             if level == "write":
                 lines += _view(layout, ro=[layout.code], rw=[layout.data, layout.state, layout.store])
             else:
                 lines.append("# Read requests see the data and state folders read-only.")
                 lines += _view(layout, ro=[layout.code, layout.data, layout.state, layout.store])
-            lines += [_hidden(project, layout, layout.incoming), "PrivateNetwork=yes",
+            lines += [_hidden(project, layout), "PrivateNetwork=yes",
                       "RestrictAddressFamilies=AF_UNIX", "IPAddressDeny=any", ""]
         files[socket_name] = "\n".join(socket)
         files[service_name] = "\n".join(lines)
     return files
 
 
-def render_selftest(project: Project, *, layout, mes: str) -> dict[str, str]:
-    """``mes server selftest``: the gate asks for a run by touching ``gate/selftest-request``
-    (a folder only the gate itself can write); the probe runs with a job's exact sandbox (no
-    network, data and state writable) and leaves its answer in ``gate/selftest/job.json``, the only
-    part of gate/ it sees."""
-    p = _check_project(project.name)
-    path_name, service_name = selftest_units(p)
-    app = next(iter(project.apps))
-    probe = Job(id=f"{app}.selftest", name="selftest", app=app, run="selftest", argv=("selftest",),
-                trigger="manual", memory="128M", timeout="2m", network=(), writes=("data", "state"))
-    service = render_job_service(project, probe, layout=layout, mes=mes, selftest=True)
-    # Its answer goes to gate/selftest/, which no job can see, so no job can forge a pass.
-    answer = sandbox_path(f"{sandbox_path(layout.gate)}/selftest")
-    service = service.replace("\nInaccessiblePaths=", f"\nBindPaths=-{answer}\nInaccessiblePaths=", 1)
-    request = sandbox_path(f"{sandbox_path(layout.gate)}/selftest-request")
-    path = _header(p, "selftest", None, ["Started by 'mes server selftest' through the gate."]) + [
+def _selftest_path(p: str, path_name: str, service_name: str, request: str, what: str) -> str:
+    return "\n".join(_header(p, "selftest", None, ["Started by 'mes server selftest' through the gate."]) + [
         "",
         "[Unit]",
-        f"Description=Start the mes self-test probe of project {p}",
+        f"Description=Start the mes self-test probe of project {p} ({what})",
         "",
         "[Path]",
         f"PathModified={request.replace('%', '%%')}",
@@ -875,8 +1024,71 @@ def render_selftest(project: Project, *, layout, mes: str) -> dict[str, str]:
         "[Install]",
         "WantedBy=paths.target",
         "",
+    ])
+
+
+def render_selftest(project: Project, *, layout, mes: str, mes_python: str = DEFAULT_MES_PYTHON) -> dict[str, str]:
+    """``mes server selftest``: the gate asks for a run by touching ``gate/selftest-request`` (or
+    ``gate/selftest-net-request``), in a folder only the gate itself can write; each probe runs
+    with a job's exact sandbox and leaves its answer in ``gate/selftest/``, the only part of gate/
+    it sees. One probe is a job without network; the other is a job that lists one host
+    (SELFTEST_HOST, mapped to a documentation address that leads nowhere), like real jobs with
+    ``network = [...]``."""
+    p = _check_project(project.name)
+    path_name, service_name = selftest_units(p)
+    net_path, net_service = selftest_net_units(p)
+    app = next(iter(project.apps))
+    probe = Job(id=f"{app}.selftest", name="selftest", app=app, run="selftest", argv=("selftest",),
+                trigger="manual", memory="128M", timeout="2m", network=(), writes=("data", "state"))
+    net_probe = Job(id=f"{app}.selftest", name="selftest", app=app, run="selftest", argv=("selftest",),
+                    trigger="manual", memory="128M", timeout="2m", network=(SELFTEST_HOST,), writes=("data", "state"))
+    gate = sandbox_path(layout.gate)
+    return {
+        path_name: _selftest_path(p, path_name, service_name, sandbox_path(f"{gate}/selftest-request"), "a job"),
+        service_name: render_job_service(project, probe, layout=layout, mes=mes, mes_python=mes_python, selftest="job"),
+        net_path: _selftest_path(p, net_path, net_service, sandbox_path(f"{gate}/selftest-net-request"),
+                                 "a job that lists hosts"),
+        net_service: render_job_service(project, net_probe, layout=layout, mes=mes, mes_python=mes_python,
+                                        selftest="net"),
+        selftest_net_unit(p): render_selftest_net(project, layout=layout, mes_python=mes_python),
+    }
+
+
+def interactive_command(project: Project, layout, argv: Sequence[str], *, network: bool = True) -> list[str]:
+    """``mes server run-as``: the ``systemd-run --pty`` command (for the owner to run with sudo)
+    that runs one app command that needs a terminal, such as a login, as the project's account in
+    a transient unit with the same hardening block as a job: data, state and store writable, the
+    code read-only, nothing else of the server. With ``network``: the internet but nothing on
+    this computer or the local network (names through systemd-resolved's socket), as a login
+    needs; without: no network at all. mes only prints it; it never runs sudo."""
+    p = _check_project(project.name)
+    if not argv:
+        raise ValueError("argv must not be empty")
+    program = _program(project, layout, next(a.name for a in project.apps.values() if a.program == argv[0]))
+    for w in argv:
+        _no_control("the command word", w)
+    props = [
+        f"User={layout.account}", f"Group={layout.account}",
+        f"WorkingDirectory={sandbox_path(layout.current_project)}",
+        f"Environment=MES_PROJECT={p}", f"Environment=MES_DATA_DIR={sandbox_path(layout.data)}",
+        f"Environment=MES_STATE_DIR={sandbox_path(layout.state)}", f"Environment=MES_STORE_DIR={sandbox_path(layout.store)}",
+        f"Environment=MES_PROJECT_DIR={sandbox_path(layout.current_project)}", f"Environment=HOME={sandbox_path(layout.state)}",
+        "Environment=LANG=C.UTF-8", "Environment=PYTHONDONTWRITEBYTECODE=1",
+        "MemoryMax=512M", "MemorySwapMax=0",
+        *hardening(),
+        *[ln for ln in _view(layout, ro=[layout.code], rw=[layout.data, layout.store, layout.state]) if not ln.startswith("#")],
+        _hidden(project, layout),
     ]
-    return {path_name: "\n".join(path), service_name: service}
+    if network:
+        props += ["BindReadOnlyPaths=-/run/systemd/resolve/io.systemd.Resolve",
+                  "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6", "IPAddressDeny=" + " ".join(DEPLOY_DENY)]
+    else:
+        props += ["PrivateNetwork=yes", "RestrictAddressFamilies=AF_UNIX", "IPAddressDeny=any"]
+    out = ["systemd-run", "--pty", "--wait", "--collect", "--quiet", f"--slice={SLICE}",
+           f"--unit=mes-{p}.run-as-{os.getpid()}"]
+    for prop in props:
+        out += ["-p", prop]
+    return [*out, "--", program, *argv[1:]]
 
 
 # --------------------------------------------------------------------------- the dashboard server
@@ -1009,8 +1221,7 @@ def render_web(project: Project, *, layout, params: dict[str, Any]) -> dict[str,
         "RestartSec=2",
         f"MemoryMax={params['memory_max']}",
         "MemoryDenyWriteExecute=yes",
-        *[line for line in SANDBOX_LINES if not line.startswith("TasksMax=")],
-        "TasksMax=64",
+        *hardening(tasks=64),
         "LimitNOFILE=1024",
         *_view(layout, ro=[layout.ui], rw=[layout.auth]),
         _hidden(project, layout),
@@ -1028,7 +1239,7 @@ def render_project(project: Project, *, layout, mes: str, mes_python: str = DEFA
     check_tool_path(mes_python, "the Python of mes")
     files: dict[str, str] = {}
     files.update(render_gate(project, layout=layout, mes=mes))
-    files.update(render_selftest(project, layout=layout, mes=mes))
+    files.update(render_selftest(project, layout=layout, mes=mes, mes_python=mes_python))
     for job in project.jobs.values():
         files[job_unit(project.name, job.id)] = render_job_service(project, job, layout=layout, mes=mes,
                                                                    mes_python=mes_python)
@@ -1040,7 +1251,8 @@ def render_project(project: Project, *, layout, mes: str, mes_python: str = DEFA
             files[net_unit(project.name, job.id)] = render_net_service(project, job, mes_python=mes_python,
                                                                           layout=layout)
     if project.ui is not None and project.ui.refresh_after and easy_ui is not None:
-        files[ui_refresh_unit(project.name)] = render_ui_refresh(project, layout=layout, easy_ui=easy_ui)
+        files[ui_refresh_unit(project.name)] = render_ui_refresh(project, layout=layout, easy_ui=easy_ui,
+                                                                 mes_python=mes_python)
     if any(j.trigger == "webhook" for j in project.jobs.values()):
         files.update(render_webhook(project, layout=layout, mes=mes))
     for name in files:

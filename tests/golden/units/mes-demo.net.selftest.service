@@ -1,0 +1,41 @@
+# Made by my-easy-software (mes). Do not edit: run 'mes server plan' again and the script it writes instead.
+# mes-project: demo
+# mes-unit: net
+# Runs as root just before each start of the job, with an empty environment: it looks up the
+# job's hosts, writes the job's own hosts file and lets the job reach only those addresses.
+# Addresses on this computer or the local network are dropped, except for hosts listed in
+# local_network. It reads nothing from the project.
+
+[Unit]
+Description=Allow the one test address of the self-test probe of demo
+Before=mes-demo.selftest-net.service
+
+[Service]
+Type=oneshot
+ExecStart="/usr/bin/env" "-i" "PATH=/usr/bin:/bin" "LANG=C.UTF-8" "/opt/mes/my-easy-software/.venv/bin/python" "-I" "-m" "mes" "jobs" "allow-network" "--selftest" "--unit" "mes-demo.selftest-net.service" "--hosts-file" "/run/mes-demo-net/selftest/hosts" "--" "selftest.invalid"
+WorkingDirectory=/
+RuntimeDirectory=mes-demo-net/selftest
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+TimeoutStartSec=60
+UMask=0022
+NoNewPrivileges=yes
+# Only the right to change unit settings (systemd asks for CAP_SYS_ADMIN for that).
+CapabilityBoundingSet=CAP_SYS_ADMIN
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+# It needs nothing of the projects' folders.
+InaccessiblePaths=-/var/lib/mes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+SystemCallArchitectures=native
+SystemCallFilter=@system-service

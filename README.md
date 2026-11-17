@@ -16,9 +16,9 @@ other way round:
 - **AI-native.** Every app has a command-line tool an AI agent can use. Your own coding agent
   can query your data and reshape your dashboards on the fly, with the permissions you give it.
 
-my-easy-software is a framework for building small personal apps this way, as easily as
+**my-easy-software** is a framework for building small personal apps this way, as easily as
 starting a web project: create an app, preview it, deploy it to your own machine or server.
-Its command is called `mes` (short for my-easy-software): everything you do with the framework
+Its command is called `mes` (short for **my-easy-software**): everything you do with the framework
 is a `mes` command, such as `mes new` or `mes deploy`.
 
 You do not need to be a developer. Setup is guided by an AI agent that explains each step in
@@ -51,13 +51,10 @@ my-notes/
 
 The exact rules are in the [contract](docs/apps-contract.md).
 
-## Status
-
-Version 1 round (in progress). A **project** (`project.toml`) holds one or more apps, their
-jobs and their dashboards. What works:
+## What it does
 
 - `mes new` creates a project whose app stores data in SQLite and whose dashboard works at once;
-  `mes dev` shows it on this computer with one link (needs [my-easy-ui](https://github.com/josep-reyero/my-easy-ui)).
+  `mes dev` shows it on this computer with one link (needs **[my-easy-ui](https://github.com/josep-reyero/my-easy-ui)**).
 - `mes server plan` writes one readable root script that sets a project up on a Linux server with
   its own two accounts, folders and sandboxed system units; you run it once with sudo, and
   `mes server check` verifies it. `mes` itself never uses sudo.
@@ -69,8 +66,8 @@ jobs and their dashboards. What works:
   anyone with the link (encrypted), or everyone, always after your explicit yes.
 - Signed webhooks as job triggers, `mes backup` / `mes restore`, agent skills in `skills/`.
 
-The server parts are tested on this computer with fakes; see `docs/design.md` for what still
-needs a real Linux server to be confirmed.
+The server parts are tested with fakes on a development computer; `docs/design.md` says which
+of them are confirmed only by running them on a real Linux server (`mes server selftest`).
 
 ## Quick start
 

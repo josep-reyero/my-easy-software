@@ -25,13 +25,16 @@ Slice=mes.slice
 MemoryMax=2G
 MemorySwapMax=0
 RuntimeMaxSec=1800
-# The deploy tools' own folders are in code/, which jobs and the write gate see read-only.
+# Installs a new release and nothing else: uv puts the locked third-party packages into the new
+# release's fresh environment, and mes unpacks the release's own wheels itself. No project code
+# runs here (uv never starts the new environment's Python), and it sees no data, state, ui,
+# store, gate or sign-in folder. uv's cache and Python are in code/, which only this step writes.
 Environment="UV_CACHE_DIR=/var/lib/mes/demo/code/uv-cache"
 Environment="UV_PYTHON_INSTALL_DIR=/var/lib/mes/demo/code/uv-python"
 Environment="UV_NO_CONFIG=1"
 Environment="UV_LINK_MODE=copy"
 Environment="PYTHONNOUSERSITE=1"
-Environment="MES_ROOT=/var/lib/mes"
+UMask=0077
 NoNewPrivileges=yes
 CapabilityBoundingSet=
 AmbientCapabilities=
@@ -40,6 +43,7 @@ ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
 DevicePolicy=closed
+PrivateIPC=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes
@@ -55,21 +59,25 @@ RestrictRealtime=yes
 RestrictNamespaces=yes
 RemoveIPC=yes
 SystemCallArchitectures=native
-SystemCallErrorNumber=EPERM
-LimitCORE=0
-TasksMax=256
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged
 SystemCallFilter=@chown
-# The dashboard server's account reads ui/ through its group, so new files are group-readable.
-UMask=0027
+SystemCallErrorNumber=EPERM
+LimitCORE=0
+TasksMax=256
+TemporaryFileSystem=/var:ro /run:ro /opt:ro /usr/local:ro
+BindReadOnlyPaths=-/opt/mes -/usr/local/bin -/usr/local/lib -/usr/local/lib64
+InaccessiblePaths=-/srv -/mnt -/media -/boot -/efi
+InaccessiblePaths=-/etc/shadow -/etc/shadow- -/etc/gshadow -/etc/gshadow- -/etc/sudoers -/etc/sudoers.d -/etc/ssh -/etc/ssl/private -/etc/pki/tls/private -/etc/letsencrypt -/etc/credstore -/etc/credstore.encrypted -/etc/NetworkManager -/etc/wireguard -/etc/systemd/network -/etc/netctl -/etc/wpa_supplicant -/etc/iwd -/etc/openvpn -/etc/ppp -/etc/ipsec.d -/etc/ipsec.secrets -/etc/krb5.keytab -/etc/docker -/etc/containers -/etc/tailscale -/etc/libvirt -/etc/samba -/etc/cups -/etc/polkit-1 -/etc/security -/etc/crypttab
 # Of all the projects' folders, only these of this project are there (read-only unless listed
 # as writable); other projects, the sign-in folder and the gate's own folder are not.
-TemporaryFileSystem=/var/lib/mes:ro
-BindReadOnlyPaths=/var/lib/mes/demo/etc /var/lib/mes/demo/data
-BindPaths=/var/lib/mes/demo/code /var/lib/mes/demo/ui
-ReadWritePaths=/var/lib/mes/demo/code /var/lib/mes/demo/ui
-InaccessiblePaths=-/run/mes-demo-gate -/var/lib/mes/demo/etc/webhook.key -/var/lib/mes/demo/code/incoming
+BindReadOnlyPaths=/var/lib/mes/demo/etc /var/lib/mes/demo/code
+# Writable: uv's cache and Python, and the new release only: code/installing is a link the gate
+# points at releases/<n> just before this step; every other release stays read-only.
+BindPaths=-/var/lib/mes/demo/code/uv-cache -/var/lib/mes/demo/code/uv-python -/var/lib/mes/demo/code/installing
+InaccessiblePaths=-/var/lib/mes/demo/etc/webhook.key -/var/lib/mes/demo/code/incoming
+# Names are looked up through systemd-resolved's socket (its address 127.0.0.53 is blocked).
+BindReadOnlyPaths=-/run/systemd/resolve/io.systemd.Resolve
 # uv needs the package index, but nothing on this computer or the local network.
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 IPAddressDeny=0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.168.0.0/16 224.0.0.0/4 240.0.0.0/4 ::/128 ::1/128 fc00::/7 fe80::/10 ff00::/8

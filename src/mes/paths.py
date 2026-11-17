@@ -212,6 +212,9 @@ class ServerLayout:
     releases = property(lambda self: self.code / "releases")
     current = property(lambda self: self.code / "current")
     incoming = property(lambda self: self.code / "incoming")
+    # A link the gate points at the release being installed, just before the install step: the
+    # only release that step may change.
+    installing = property(lambda self: self.code / "installing")
     uv_cache = property(lambda self: self.code / "uv-cache")
     uv_python = property(lambda self: self.code / "uv-python")
     data = property(lambda self: self.base / "data")
@@ -235,6 +238,9 @@ class ServerLayout:
     run_log = property(lambda self: self.log / "runs.jsonl")
     triggers = property(lambda self: self.webhook / "triggers")
     release_records = property(lambda self: self.gate / "releases")
+    # The newest accepted release time and the hashes of accepted archives (replay protection
+    # that does not depend on release folders still being there).
+    accepted = property(lambda self: self.gate / "accepted.json")
 
     @property
     def current_project(self) -> Path:

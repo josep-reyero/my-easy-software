@@ -18,7 +18,8 @@ Public API
 ``ensure_schema(conn, project) -> dict``  bring the file in line with the schema: create what is
     missing, add missing columns, recreate views whose SQL differs; refuse anything else
     (``SchemaError``, hint ``mes db sync --reset <name>``). Runs inside the caller's transaction.
-``check_views(conn, project) -> list[str]``  problems with ``[views]`` (read-only authorizer).
+``check_views(conn, project) -> list[str]``  problems with ``[views]`` (read-only authorizer; only the
+    SQL functions in ``VIEW_FUNCTIONS``).
 ``db_path(project) -> Path``       ``<data folder>/<project>.sqlite`` on this computer / in this session.
 ``connect(path, *, write=True) -> sqlite3.Connection``
 ``sync(project, *, reset=(), path=None) -> dict``  ``ensure_schema`` in one transaction.
@@ -296,7 +297,39 @@ def ensure_schema(conn: sqlite3.Connection, project: Project) -> dict[str, Any]:
 # --------------------------------------------------------------------------- views
 
 
-_ALLOWED_ACTIONS = {sqlite3.SQLITE_SELECT, sqlite3.SQLITE_READ, sqlite3.SQLITE_FUNCTION, sqlite3.SQLITE_RECURSIVE}
+_ALLOWED_ACTIONS = {sqlite3.SQLITE_SELECT, sqlite3.SQLITE_READ, sqlite3.SQLITE_RECURSIVE}
+# The SQL functions a [views] SELECT may call: SQLite's own built-ins that only compute a value from
+# their arguments. Left out on purpose: anything that reaches outside the query (load_extension,
+# readfile, writefile, edit, fts3_tokenizer), reports how SQLite was built (sqlite_compileoption_*,
+# sqlite_source_id, sqlite_version), depends on the connection (changes, total_changes,
+# last_insert_rowid, sqlite_offset) or is random (random, randomblob): a view is a fixed table every
+# reader must see the same way. Any other function, also one an app or a library registers on its
+# own connection, is refused.
+VIEW_FUNCTIONS = frozenset({
+    # core scalar
+    "abs", "char", "coalesce", "concat", "concat_ws", "format", "glob", "hex", "ifnull", "iif", "instr",
+    "length", "like", "likelihood", "likely", "lower", "ltrim", "max", "min", "nullif", "octet_length",
+    "printf", "quote", "replace", "round", "rtrim", "sign", "soundex", "substr", "substring", "trim",
+    "typeof", "unhex", "unicode", "unlikely", "upper", "zeroblob",
+    # aggregate
+    "avg", "count", "group_concat", "string_agg", "sum", "total", "median", "percentile",
+    "percentile_cont", "percentile_disc",
+    # date and time
+    "date", "time", "datetime", "julianday", "unixepoch", "strftime", "timediff",
+    # math
+    "acos", "acosh", "asin", "asinh", "atan", "atan2", "atanh", "ceil", "ceiling", "cos", "cosh",
+    "degrees", "exp", "floor", "ln", "log", "log10", "log2", "mod", "pi", "pow", "power", "radians", "sin",
+    "sinh", "sqrt", "tan", "tanh", "trunc",
+    # JSON
+    "json", "jsonb", "json_array", "jsonb_array", "json_array_length", "json_error_position", "json_extract",
+    "jsonb_extract", "json_insert", "jsonb_insert", "json_object", "jsonb_object", "json_patch", "jsonb_patch",
+    "json_pretty", "json_remove", "jsonb_remove", "json_replace", "jsonb_replace", "json_set", "jsonb_set",
+    "json_type", "json_valid", "json_quote", "json_group_array", "jsonb_group_array", "json_group_object",
+    "jsonb_group_object", "json_each", "json_tree",
+    # window
+    "row_number", "rank", "dense_rank", "percent_rank", "cume_dist", "ntile", "lag", "lead", "first_value",
+    "last_value", "nth_value",
+})
 
 
 def check_views(conn: sqlite3.Connection, project: Project) -> list[str]:
@@ -305,10 +338,15 @@ def check_views(conn: sqlite3.Connection, project: Project) -> list[str]:
     problems: list[str] = []
     for v in project.views.values():
         refused: list[int] = []
+        functions: list[str] = []
 
-        def auth(action: int, *_: Any) -> int:
+        def auth(action: int, _arg1: Any = None, arg2: Any = None, *_: Any) -> int:
             if action in _ALLOWED_ACTIONS:
                 return sqlite3.SQLITE_OK
+            if action == sqlite3.SQLITE_FUNCTION:
+                if isinstance(arg2, str) and arg2.lower() in VIEW_FUNCTIONS:
+                    return sqlite3.SQLITE_OK
+                functions.append(str(arg2)[:60])
             refused.append(action)
             return sqlite3.SQLITE_DENY
 
@@ -317,7 +355,11 @@ def check_views(conn: sqlite3.Connection, project: Project) -> list[str]:
             conn.execute(f"EXPLAIN {v.sql}").fetchall()
         except sqlite3.DatabaseError as e:
             text = str(e)
-            if refused or "not authorized" in text:
+            if functions:
+                problems.append(f'The view "{v.name}" in project.toml calls the SQL function {functions[0]}(), which '
+                                "views may not use, so the view is not used. A view may only use SQLite's own "
+                                "functions that compute a value (no random values, files or extensions).")
+            elif refused or "not authorized" in text:
                 problems.append(f'The view "{v.name}" in project.toml does more than read data, so it is not used. '
                                 "A view may only be one SELECT.")
             elif "no such table" in text or "no such column" in text:

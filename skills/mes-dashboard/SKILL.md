@@ -1,6 +1,6 @@
 ---
 name: mes-dashboard
-description: Add, change or restyle a dashboard of a my-easy-software project (ui/dashboards/*.yaml for easy-ui, the [ui] sections of project.toml and app.toml, sample data in ui/fixtures, the look in ui/theme.yaml and ui/styles/*.css) and preview it with "mes dev". Use when the user wants to see their data as charts, tables or numbers, wants the dashboards to look different (colours, fonts, a theme, "make it look like ..."), or a dashboard shows nothing or an error.
+description: Add, change or restyle a dashboard of a **my-easy-software** project (ui/dashboards/*.yaml for easy-ui, the [ui] sections of project.toml and app.toml, sample data in ui/fixtures, the look in ui/theme.yaml and ui/styles/*.css) and preview it with "mes dev". Use when the user wants to see their data as charts, tables or numbers, wants the dashboards to look different (colours, fonts, a theme, "make it look like ..."), or a dashboard shows nothing or an error.
 ---
 
 # Add or change a dashboard

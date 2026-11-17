@@ -35,6 +35,7 @@ ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
 DevicePolicy=closed
+PrivateIPC=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes
@@ -55,14 +56,17 @@ SystemCallFilter=~@privileged @resources
 SystemCallErrorNumber=EPERM
 LimitCORE=0
 TasksMax=256
+TemporaryFileSystem=/var:ro /run:ro /opt:ro /usr/local:ro
+BindReadOnlyPaths=-/opt/mes -/usr/local/bin -/usr/local/lib -/usr/local/lib64
+InaccessiblePaths=-/srv -/mnt -/media -/boot -/efi
+InaccessiblePaths=-/etc/shadow -/etc/shadow- -/etc/gshadow -/etc/gshadow- -/etc/sudoers -/etc/sudoers.d -/etc/ssh -/etc/ssl/private -/etc/pki/tls/private -/etc/letsencrypt -/etc/credstore -/etc/credstore.encrypted -/etc/NetworkManager -/etc/wireguard -/etc/systemd/network -/etc/netctl -/etc/wpa_supplicant -/etc/iwd -/etc/openvpn -/etc/ppp -/etc/ipsec.d -/etc/ipsec.secrets -/etc/krb5.keytab -/etc/docker -/etc/containers -/etc/tailscale -/etc/libvirt -/etc/samba -/etc/cups -/etc/polkit-1 -/etc/security -/etc/crypttab
 # Of all the projects' folders, only these of this project are there (read-only unless listed
 # as writable); other projects, the sign-in folder and the gate's own folder are not.
-TemporaryFileSystem=/var/lib/mes:ro
 BindReadOnlyPaths=/var/lib/mes/demo/code
 BindPaths=/var/lib/mes/demo/data /var/lib/mes/demo/store /var/lib/mes/demo/state
 ReadWritePaths=/var/lib/mes/demo/data /var/lib/mes/demo/store /var/lib/mes/demo/state
 BindPaths=-/var/lib/mes/demo/gate/selftest
-InaccessiblePaths=-/run/mes-demo-gate -/var/lib/mes/demo/etc/webhook.key
+InaccessiblePaths=-/var/lib/mes/demo/etc/webhook.key -/var/lib/mes/demo/code/incoming -/var/lib/mes/demo/code/uv-cache
 PrivateNetwork=yes
 RestrictAddressFamilies=AF_UNIX
 IPAddressDeny=any

@@ -34,27 +34,40 @@ On the server (inside the gate, as the project's account)
    (root on a real server) and nobody else may change it; it may only hold Ed25519 keys.
 3. Unpacks the same open file with the hardened extractor of ``mes.archive`` into a new
    ``code/releases/<n>/``.
-4. Refuses an archive for another project, one older than the newest complete release, or one
-   already installed completely. A release that was interrupted (never completed) is removed and
-   never blocks sending the same archive again.
-5. In the deploy sandbox: refuses a stray ``pyproject.toml``/``uv.toml``/``.python-version`` in
-   ``code/`` or ``code/releases/``, then runs ``uv sync --frozen --no-build`` for the third-party
-   packages and installs the archive's own wheels with ``uv pip install --no-index --no-build``
-   (building on the server only if the administrator allowed it with ``mes server plan
-   --allow-server-builds``). In a read sandbox (which cannot change any release): finds every
-   app of the release (as ``mes apps sync`` does) and asks each app's program to describe
-   itself. The gate itself (no project code) then checks what the sandbox found, writes the
-   release's own ``apps.lock.json`` and checks the jobs' commands.
-6. Records the release as complete in ``gate/releases/<n>.json`` (a folder only the gate
-   writes), switches ``code/current`` to it atomically, publishes the dashboards
-   (``easy-ui publish``), and switches back if publishing fails.
-7. Keeps the newest ``KEEP_RELEASES`` releases (never the current or the previous one).
-8. Says when the jobs or units changed, so the person runs ``mes server plan`` again.
+4. Refuses an archive for another project, one made before the newest accepted one, or one
+   accepted before, checked against ``gate/accepted.json`` (the newest accepted creation time
+   and the hashes of accepted archives), which does not depend on release folders still being
+   there. A release that was interrupted (never completed) is removed and never blocks sending
+   the same archive again.
+5. Install step, in the deploy sandbox (``gate-deploy@``: the package index but nothing on this
+   computer or the local network; writable: only the new release, through the link
+   ``code/installing`` the gate points at it, and uv's cache and Python; no data, state, ui,
+   store or gate): refuses a stray ``pyproject.toml``/``uv.toml``/``.python-version`` in
+   ``code/`` or ``code/releases/`` and an environment that already exists, then runs
+   ``uv sync --frozen --no-build --no-dev --no-install-project`` (never for the project's own
+   packages), which makes a fresh ``.venv`` without ever starting its Python, and unpacks the
+   archive's own wheels with ``mes.wheels`` (standard library only; no Python is started). With
+   ``mes server plan --allow-server-builds`` packages may be built (their build code then runs
+   here) with a cache and a Python of the release's own, so nothing they write is used by
+   another deploy.
+6. Describe step, in a read sandbox (no network; cannot change any release): finds every app of
+   the release (as ``mes apps sync`` does) and asks each app's program to describe itself. The
+   gate itself (no project code) then checks what the sandbox found, writes the release's own
+   ``apps.lock.json`` and checks the jobs' commands.
+7. The gate records the release as complete in ``gate/releases/<n>.json`` (a folder only the
+   gate writes) with a fingerprint of every file of the release, adds it to
+   ``gate/accepted.json``, switches ``code/current`` to it atomically, publishes the dashboards
+   in the publish sandbox (``gate-publish@``: no network, the code read-only, ui/ writable; no
+   data or state), and switches back if publishing fails. No data yet is not a failure: the
+   answer says ``waiting for first data`` and the dashboard refresh publishes them later.
+8. Keeps the newest ``KEEP_RELEASES`` releases (never the current or the previous one).
+9. Says when the jobs or units changed, so the person runs ``mes server plan`` again.
 
 Rollback: ``["mes", "rollback", "--to", N, "--time", T, "--nonce", X, "--signature", S]``. The
 signature must be over ``rollback_message(project, N, T, X)`` in the namespace ``mes-rollback``
 by an allowed signer, ``T`` within ``ROLLBACK_WINDOW`` seconds of the server's clock, and ``X``
-never seen before (kept in ``gate/rollback-seen.json``). Only complete releases are targets.
+never seen before (kept in ``gate/rollback-seen.json``). Only complete releases are targets, and
+only when every file is still exactly as it was installed (the fingerprint in its record).
 
 Public API
 ----------
@@ -68,7 +81,8 @@ Client: ``export_release(root, export) -> dict``, ``collect(exported, project, w
 Server: ``operation(where, command, args, *, stdin, timeout, run_child) -> dict``,
 ``receive(...)``, ``rollback(...)``, ``list_releases(layout) -> dict``, ``child_step(where, req, *, timeout) -> dict``,
 ``check_signers(path, project, base) -> list[str]``, ``read_server_config(layout) -> dict``,
-``units_fingerprint(project, layout, mes, easy_ui) -> str``.
+``units_fingerprint(project, layout, mes, easy_ui) -> str``, ``tree_digest(folder) -> str``,
+``read_accepted(layout) -> dict``.
 """
 
 from __future__ import annotations
@@ -565,11 +579,13 @@ def run_deploy(host: str, *, project_dir: str | None, key: str | None, dry_run: 
             {"step": "on the server", "what": [
                 "verify the signature against the project's allowed signers, before unpacking anything",
                 "unpack the same open file with the hardened extractor into a new release folder",
-                "uv sync --frozen --no-build in the deploy sandbox, and install the wheels built here",
-                "find every app and ask each to describe itself in a read sandbox; then write the release's own "
-                "apps.lock.json and check the jobs' commands",
-                "switch 'current' to the new release in one step",
-                "publish the dashboards (switch back if that fails)",
+                "install step (the package index, nothing local; writes only the new release and uv's cache): uv sync "
+                "--frozen --no-build --no-dev for the locked packages, without starting the new release's Python, "
+                "then mes unpacks the wheels built here itself",
+                "describe step (no network, cannot change any release): find every app and ask each to describe "
+                "itself; then write the release's own apps.lock.json and check the jobs' commands",
+                "record a fingerprint of every file of the release, then switch 'current' to it in one step",
+                "publish the dashboards with no network (switch back if that fails; no data yet only waits)",
                 f"keep the newest {KEEP_RELEASES} releases",
             ]},
         ]
@@ -965,6 +981,7 @@ def _check_release(layout: paths.ServerLayout, folder: Path, sha: str) -> dict[s
     if not (folder / paths.RELEASE_PROJECT_DIR / "uv.lock").is_file():
         raise Refused("The archive has no uv.lock, so the server cannot install exactly the same packages.",
                       hint="Run 'uv lock' and commit uv.lock.", code="bad_release")
+    accepted = read_accepted(layout)
     for n, other in _complete(layout).items():
         if other.get("archive_sha256") == sha:
             raise Refused(f"This exact archive is already installed as release {n}, so nothing changed.",
@@ -974,7 +991,109 @@ def _check_release(layout: paths.ServerLayout, folder: Path, sha: str) -> dict[s
                 f"This archive was made before release {n}, which is already installed, so it was refused (an old "
                 "signed archive must not quietly replace a newer version).",
                 hint="To go back to an older version on purpose, use: mes deploy <host> --rollback", code="older_release")
+    # The same, against the gate's own record of what it accepted, which stays when releases are
+    # removed (pruned, or deleted by someone).
+    if sha in accepted["archives"]:
+        raise Refused("This exact archive was installed on this server before, so it was refused (an old signed "
+                      "archive must not be installed again).",
+                      hint="Deploy a new commit, or switch to an installed release with: mes deploy <host> --rollback",
+                      code="already_installed")
+    newest = accepted["newest_created_ns"]
+    if newest is not None and created <= newest:
+        raise Refused("This archive was made before the newest release this server accepted, so it was refused (an "
+                      "old signed archive must not quietly replace a newer version).",
+                      hint="Make a new deploy from the version you want (it gets a new time), or use: mes deploy <host> "
+                      "--rollback", code="older_release")
     return {**info, "archive_sha256": sha}
+
+
+MAX_ACCEPTED = 1000
+
+
+def read_accepted(layout: paths.ServerLayout) -> dict[str, Any]:
+    """``gate/accepted.json``: ``{"newest_created_ns": int | None, "archives": [sha256, ...]}``.
+    Missing means nothing was accepted yet (or a server set up before this record existed); a
+    damaged one stops every deploy, because replays could then not be told apart."""
+    empty = {"newest_created_ns": None, "archives": []}
+    try:
+        fd = os.open(layout.accepted, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except FileNotFoundError:
+        return empty
+    except OSError:
+        fd = -1
+    damaged = Refused("The server's record of accepted releases (gate/accepted.json) is damaged, so nothing was "
+                      "installed: without it an old signed archive could be sent again.",
+                      hint=f"Ask the owner to look at {layout.accepted} on the server.", code="damaged_record")
+    if fd < 0:
+        raise damaged
+    with os.fdopen(fd, "rb") as f:
+        raw = f.read(1024 * 1024 + 1)
+    try:
+        data = json.loads(raw.decode("ascii"))
+    except (UnicodeDecodeError, ValueError):
+        raise damaged from None
+    newest, archives = (data.get("newest_created_ns"), data.get("archives")) if isinstance(data, dict) else (0, 0)
+    if not (newest is None or (isinstance(newest, int) and not isinstance(newest, bool))) or \
+            not isinstance(archives, list) or not all(isinstance(a, str) and re.fullmatch(r"[0-9a-f]{64}", a)
+                                                     for a in archives):
+        raise damaged
+    return {"newest_created_ns": newest, "archives": archives}
+
+
+def _remember_accepted(layout: paths.ServerLayout, created_ns: int, sha: str) -> None:
+    seen = read_accepted(layout)
+    newest = created_ns if seen["newest_created_ns"] is None else max(seen["newest_created_ns"], created_ns)
+    archives = [a for a in seen["archives"] if a != sha] + [sha]
+    layout.gate.mkdir(mode=0o700, parents=True, exist_ok=True)
+    tmp = layout.gate / f".accepted.{secrets.token_hex(4)}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    with os.fdopen(fd, "w", encoding="ascii") as f:
+        json.dump({"newest_created_ns": newest, "archives": archives[-MAX_ACCEPTED:]}, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, layout.accepted)
+
+
+def tree_digest(folder: Path) -> str:
+    """A fingerprint of every file, folder and link of a release (names, modes, sizes, contents
+    and link targets), read without following any link."""
+    h = hashlib.sha256()
+    base = Path(folder)
+    for dirpath, dirnames, filenames in os.walk(base, followlinks=False):
+        dirnames.sort()
+        rel_dir = os.path.relpath(dirpath, base)
+        for name in sorted(dirnames + filenames):
+            full = os.path.join(dirpath, name)
+            rel = os.path.normpath(os.path.join(rel_dir, name))
+            st = os.lstat(full)
+            mode = stat.S_IMODE(st.st_mode)
+            if stat.S_ISLNK(st.st_mode):
+                h.update(f"L\0{rel}\0{os.readlink(full)}\0".encode("utf-8", "surrogateescape"))
+            elif stat.S_ISDIR(st.st_mode):
+                h.update(f"D\0{rel}\0{mode:o}\0".encode("utf-8", "surrogateescape"))
+            elif stat.S_ISREG(st.st_mode):
+                fh = hashlib.sha256()
+                fd = os.open(full, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+                with os.fdopen(fd, "rb") as f:
+                    for block in iter(lambda: f.read(1024 * 1024), b""):
+                        fh.update(block)
+                h.update(f"F\0{rel}\0{mode:o}\0{st.st_size}\0{fh.hexdigest()}\0".encode("utf-8", "surrogateescape"))
+            else:
+                h.update(f"X\0{rel}\0{stat.S_IFMT(st.st_mode):o}\0".encode("utf-8", "surrogateescape"))
+    return h.hexdigest()
+
+
+def _check_tree(layout: paths.ServerLayout, number: int, record: dict[str, Any]) -> None:
+    want = record.get("tree_sha256")
+    if not isinstance(want, str):
+        raise Refused(f"Release {number} has no fingerprint of its files in the gate's record, so the server cannot "
+                      "check that nothing changed it, and does not switch to it.",
+                      hint="Deploy that version again instead (a new deploy of the commit you want).",
+                      code="unverified_release")
+    if tree_digest(layout.releases / str(number)) != want:
+        raise Refused(f"The files of release {number} are no longer exactly as they were installed, so the server "
+                      "does not switch to it (something changed them).",
+                      hint="Deploy again, and ask the owner to look at the server.", code="release_changed")
 
 
 def _units_note(layout: paths.ServerLayout, project: manifest_mod.Project, config: dict[str, Any]) -> str | None:
@@ -1020,9 +1139,10 @@ def receive(where: Any, signature: str, stdin: BinaryIO | None, *,
     layout: paths.ServerLayout = where.layout
     signers = check_signers(layout.allowed_signers, layout.project, layout.base)
     config = read_server_config(layout)
-    for folder in (layout.incoming, layout.releases):
+    for folder in (layout.incoming, layout.releases, layout.uv_cache, layout.uv_python):
         folder.mkdir(mode=0o700, parents=True, exist_ok=True)
     refuse_stray_config(layout)
+    _clear_installing(layout)
     _drop_incomplete(layout)
     name = f"{int(time.time())}-{secrets.token_hex(6)}.tar.gz"
     incoming = layout.incoming / name
@@ -1053,19 +1173,26 @@ def receive(where: Any, signature: str, stdin: BinaryIO | None, *,
                 shutil.rmtree(partial, ignore_errors=True)
             raise
     try:
-        synced = run_child({"kind": "sync", "release": number})
+        # The install step may change only this release: the gate points code/installing at it.
+        _point_installing(layout, number)
+        try:
+            synced = run_child({"kind": "sync", "release": number})
+        finally:
+            _clear_installing(layout)
         described = run_child({"kind": "describe", "release": number})
         from mes import apps
 
         commands = described.get("commands") if isinstance(described.get("commands"), dict) else {}
         new_project = write_release_lock(final / paths.RELEASE_PROJECT_DIR, described)
         problems = apps._command_problems(new_project, commands)
+        tree = tree_digest(final)
     except BaseException:
         shutil.rmtree(final, ignore_errors=True)
         raise
-    _write_record(layout, number, {k: info.get(k) for k in (
+    _write_record(layout, number, {**{k: info.get(k) for k in (
         "project", "version", "created", "created_ns", "commit", "dirty", "archive_sha256", "signer", "received",
-        "deps", "wheels")})
+        "deps", "wheels")}, "tree_sha256": tree})
+    _remember_accepted(layout, int(info["created_ns"]), sha)
     previous = _current_number(layout)
     _switch(layout, number)
     project = manifest_mod.load(layout.current_project)
@@ -1101,8 +1228,34 @@ def receive(where: Any, signature: str, stdin: BinaryIO | None, *,
         "needs_plan": any("mes server plan" in n for n in notes),
         "notes": notes,
         "message": f'Release {number} of "{layout.project}" is installed and running.'
-        + (f" Release {previous} is kept, so you can switch back with: mes deploy <host> --rollback" if previous else ""),
+        + (f" Release {previous} is kept, so you can switch back with: mes deploy <host> --rollback" if previous else "")
+        + _dashboards_words(published),
     }
+
+
+WAITING_FOR_DATA = "waiting for first data"
+
+
+def _dashboards_words(published: dict[str, Any]) -> str:
+    if published.get("waiting"):
+        return (f" Dashboards: {WAITING_FOR_DATA} (they are published by the dashboard refresh after the first job "
+                "that brings data).")
+    return ""
+
+
+def _point_installing(layout: paths.ServerLayout, number: int) -> None:
+    tmp = layout.code / f".installing-{secrets.token_hex(4)}"
+    os.symlink(f"releases/{int(number)}", tmp)
+    os.replace(tmp, layout.installing)
+
+
+def _clear_installing(layout: paths.ServerLayout) -> None:
+    with contextlib.suppress(FileNotFoundError):
+        if os.path.islink(layout.installing):
+            os.unlink(layout.installing)
+        elif os.path.lexists(layout.installing):
+            raise Refused("code/installing on the server is not the link mes makes, so nothing was installed.",
+                          hint=f"Ask the owner to look at it and remove it: {layout.installing}", code="stray_config")
 
 
 def write_release_lock(folder: Path, described: dict[str, Any]) -> manifest_mod.Project:
@@ -1151,6 +1304,8 @@ def _publish(layout: paths.ServerLayout, project: manifest_mod.Project, run_chil
     try:
         return run_child({"kind": "publish"})
     except MesError as e:
+        if e.code == "no_data":  # (the publish sandbox reports it as an answer; this is a safety net)
+            return {"published": False, "waiting": True, "status": WAITING_FOR_DATA}
         return {"failed": True, "detail": e.detail or e.message}
 
 
@@ -1230,6 +1385,7 @@ def rollback(where: Any, args: list[str], *, run_child) -> dict[str, Any]:
                        code="no_release")
     if to == current:
         return {"rolled_back": False, "release": to, "message": f"Release {to} is already the one running."}
+    _check_tree(layout, to, complete[to])
     _switch(layout, to)
     project = manifest_mod.load(layout.current_project)
     published = _publish(layout, project, run_child)
@@ -1241,7 +1397,8 @@ def rollback(where: Any, args: list[str], *, run_child) -> dict[str, Any]:
     config = read_server_config(layout)
     notes = [n for n in (_units_note(layout, project, config),) if n]
     return {"rolled_back": True, "release": to, "from": current, "signer": fingerprint, "dashboards": published,
-            "notes": notes, "message": f'"{layout.project}" now runs release {to} again (it ran release {current}).'}
+            "notes": notes, "message": f'"{layout.project}" now runs release {to} again (it ran release {current}).'
+            + _dashboards_words(published)}
 
 
 def list_releases(layout: paths.ServerLayout) -> dict[str, Any]:
@@ -1257,7 +1414,7 @@ def list_releases(layout: paths.ServerLayout) -> dict[str, Any]:
 def _status(where: Any) -> dict[str, Any]:
     layout: paths.ServerLayout = where.layout
     sockets = {level: os.path.exists(units.gate_socket_path(layout.project, level))
-               for level in units.GATE_LEVELS}
+               for level in units.SANDBOX_LEVELS}
     return {"project": layout.project, "current": _current_number(layout),
             "request_sandbox": sockets,
             "message": "Every request runs in its own system sandbox." if all(sockets.values()) else
@@ -1301,8 +1458,8 @@ def _tool_env(where: Any) -> dict[str, str]:
 
     env = clean_env("write", where)
     env.update({
-        # The tools' own folders are in code/, which jobs and the write gate see read-only, and uv
-        # reads no settings file: nothing a job can write changes what the next deploy runs.
+        # The tools' own folders are in code/, which only the install step writes, and uv reads no
+        # settings file: nothing a job can write changes what the next deploy runs.
         "UV_CACHE_DIR": str(layout.uv_cache),
         "UV_PYTHON_INSTALL_DIR": str(layout.uv_python),
         "UV_NO_CONFIG": "1",
@@ -1342,9 +1499,27 @@ def _uv_failed(done, *, built: bool) -> MesError:
         detail=done.stderr.decode("utf-8", "replace")[-2000:] or None, detail_label="What uv said:")
 
 
+def install_argv(uv: str, folder: Path, *, wheels: bool, allow_builds: bool) -> list[str]:
+    """The one uv command of the install step. It runs in a release folder that has no
+    environment yet, so uv makes a fresh one from the base Python and never starts the new
+    environment's own Python (which would run every .pth startup file of the packages it holds).
+    The project's own packages are never installed by uv: mes unpacks their wheels itself."""
+    argv = [uv, "sync", "--frozen", "--no-progress"]
+    if not allow_builds:
+        argv.append("--no-build")
+    argv.append("--no-dev")
+    if wheels:
+        argv.append("--no-install-project")
+        for pkg in _path_packages(folder):
+            argv += ["--no-install-package", pkg]
+    return argv
+
+
 def child_step(where: Any, req: dict[str, Any], *, timeout: float) -> dict[str, Any]:
-    """A deploy step that downloads packages or publishes: called inside the deploy sandbox
-    (``mes gate child --level deploy``), or by the gate itself where there is none (tests)."""
+    """A deploy step in its own sandbox (``mes gate child --level deploy|publish``), or run by the
+    gate itself where there is none (tests): ``sync`` installs a release (the install step),
+    ``publish`` publishes the dashboards of the running release."""
+    from mes import wheels as wheels_mod
     from mes.gate import run_limited
 
     layout: paths.ServerLayout = where.layout
@@ -1358,46 +1533,47 @@ def child_step(where: Any, req: dict[str, Any], *, timeout: float) -> dict[str, 
         folder = release / paths.RELEASE_PROJECT_DIR
         if folder.is_symlink() or not folder.is_dir():
             raise NotFound(f"Release {number} is not on the server.", hint="Deploy again.", code="no_release")
+        try:
+            pointed = os.readlink(layout.installing)
+        except OSError:
+            pointed = None
+        if pointed != f"releases/{number}":
+            raise Refused(f"Release {number} is not the one the gate is installing, so nothing was installed.",
+                          hint="Deploy again with 'mes deploy'.", code="not_installing")
         refuse_stray_config(layout)
+        if os.path.lexists(folder / ".venv"):
+            raise Refused(f"Release {number} already has an environment (.venv) before installing. uv would start its "
+                          "Python, which runs code from the packages in it, so nothing was installed.",
+                          hint="Deploy again with 'mes deploy' (an archive never holds a .venv).", code="stray_environment")
         uv = config.get("uv")
         if not uv:
             raise NotFound("The server settings do not say where uv is, so the project cannot be installed.",
                            hint="Run 'mes server plan' with --uv <path> and its script again.", code="uv_missing")
         allow_builds = config.get("allow_builds") is True
         wheels = sorted(str(p) for p in (release / WHEELS_DIR).glob("*.whl")) if (release / WHEELS_DIR).is_dir() else []
-        env = _tool_env(where)
-        limit = min(timeout, SYNC_TIMEOUT)
-        notes: list[str] = []
-        built = False
-        if wheels:
-            skip = ["--no-install-project"]
-            for pkg in _path_packages(folder):
-                skip += ["--no-install-package", pkg]
-            done = run_limited([uv, "sync", "--frozen", "--no-progress", "--no-build", *skip], env=env, timeout=limit,
-                               max_output=1024 * 1024, cwd=str(folder))
-            if (done.timed_out or done.returncode != 0) and allow_builds:
-                done = run_limited([uv, "sync", "--frozen", "--no-progress", *skip], env=env, timeout=limit,
-                                   max_output=1024 * 1024, cwd=str(folder))
-                built = True
-                notes.append("Some packages had to be built on the server (allowed by its plan).")
-            if done.timed_out or done.returncode != 0:
-                raise _uv_failed(done, built=allow_builds)
-            done = run_limited([uv, "pip", "install", "--no-progress", "--python", str(folder / ".venv" / "bin" / "python"),
-                                "--no-deps", "--no-index", "--no-build", "--offline", *wheels], env=env, timeout=limit,
-                               max_output=1024 * 1024, cwd=str(folder))
-            if done.timed_out or done.returncode != 0:
-                raise _uv_failed(done, built=True)
-        elif allow_builds:
-            done = run_limited([uv, "sync", "--frozen", "--no-progress"], env=env, timeout=limit,
-                               max_output=1024 * 1024, cwd=str(folder))
-            built = True
-            if done.timed_out or done.returncode != 0:
-                raise _uv_failed(done, built=True)
-        else:
+        if not wheels and not allow_builds:
             raise Refused("The release has no wheels, and this server does not build packages, so it was not installed.",
                           hint="Deploy with a current 'mes deploy', which builds the wheels on your computer.",
                           code="no_wheels")
-        return {"synced": True, "release": number, "built_on_server": built, "notes": notes}
+        env = _tool_env(where)
+        env.pop("MES_ROOT", None)
+        notes: list[str] = []
+        private = release / ".uv"
+        if allow_builds:
+            # Build code of packages runs here: it gets a cache and a Python of this release's own,
+            # so nothing it writes is used by another deploy.
+            env.update(UV_CACHE_DIR=str(private / "cache"), UV_PYTHON_INSTALL_DIR=str(private / "python"))
+            notes.append("Packages may be built on the server (allowed by its plan): their build code ran in the "
+                         "install step, with a cache and a Python of this release's own.")
+        done = run_limited(install_argv(uv, folder, wheels=bool(wheels), allow_builds=allow_builds), env=env,
+                           timeout=min(timeout, SYNC_TIMEOUT), max_output=1024 * 1024, cwd=str(folder))
+        if allow_builds:
+            shutil.rmtree(private / "cache", ignore_errors=True)
+        if done.timed_out or done.returncode != 0:
+            raise _uv_failed(done, built=allow_builds)
+        installed = [wheels_mod.install(w, folder / ".venv") for w in wheels]
+        return {"synced": True, "release": number, "built_on_server": allow_builds, "notes": notes,
+                "installed": [f"{i['name']} {i['version']}" for i in installed]}
     if kind == "publish":
         easy_ui = config.get("easy_ui")
         if not easy_ui:
@@ -1405,13 +1581,17 @@ def child_step(where: Any, req: dict[str, Any], *, timeout: float) -> dict[str, 
         done = run_limited([easy_ui, "--json", "--project-dir", str(layout.current_project), "publish"],
                            env=_tool_env(where), timeout=min(timeout, 300.0), max_output=1024 * 1024,
                            cwd=str(layout.current_project))
-        if done.timed_out or done.returncode != 0:
-            raise MesError("The dashboards could not be published.", hint="Check them with: easy-ui validate",
-                           code="publish_failed",
-                           detail=(done.stdout or done.stderr).decode("utf-8", "replace")[-2000:] or None)
         try:
             said = json.loads(done.stdout.decode("utf-8"))
         except (UnicodeDecodeError, ValueError):
             said = None
+        if done.timed_out or done.returncode != 0:
+            error = said.get("error") if isinstance(said, dict) else None
+            if not done.timed_out and isinstance(error, dict) and error.get("code") == "no_data":
+                # Nothing to show yet (a first deploy before any job ran): not a failure.
+                return {"published": False, "waiting": True, "status": WAITING_FOR_DATA}
+            raise MesError("The dashboards could not be published.", hint="Check them with: easy-ui validate",
+                           code="publish_failed",
+                           detail=(done.stdout or done.stderr).decode("utf-8", "replace")[-2000:] or None)
         return {"published": True, "easy_ui": said if isinstance(said, dict) else None}
     raise UsageError("Unknown deploy step.", hint="Use: mes deploy <host>", code="bad_request")

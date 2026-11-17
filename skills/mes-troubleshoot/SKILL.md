@@ -1,6 +1,6 @@
 ---
 name: mes-troubleshoot
-description: Find out why something in a my-easy-software project does not work - a mes command error or exit code, a failing job, a refused deploy, a gate refusal, a dashboard that does not show. Use when the user reports a mes error, a job that did not run, or a server that does not answer.
+description: Find out why something in a **my-easy-software** project does not work - a mes command error or exit code, a failing job, a refused deploy, a gate refusal, a dashboard that does not show. Use when the user reports a mes error, a job that did not run, or a server that does not answer.
 ---
 
 # Troubleshoot

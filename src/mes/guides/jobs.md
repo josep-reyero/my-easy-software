@@ -54,6 +54,14 @@ Rules:
   serves other sites; addresses that change during a run are not followed. On this computer
   (`mes jobs run`) mes cannot limit the network (`mes jobs list` says so), but the job gets only
   a small environment (no SSH agent, no hosting tokens).
+- Exit code 75 means "a temporary problem, try again later" (for example the service was down):
+  the run is recorded as `skipped`, not failed, and the jobs that wait for it (and the dashboard
+  refresh) do not run. On a server the units count it as a success (`SuccessExitStatus=75`), so
+  `systemctl --failed` only lists real failures; the next scheduled run tries again.
+- A job that lists hosts cannot open unix sockets (it shares the server's network, where other
+  programs' sockets live); socket pairs inside the job still work. A job without network has a
+  private network. Neither sees the server's service sockets or anything outside the project's
+  own folders (`mes guide server`).
 - Unknown settings are errors, so a typo cannot switch off a limit.
 
 Commands:
@@ -63,7 +71,8 @@ Commands:
 - `mes --json jobs run <app>.<job>`: run a job now, on this computer, then the jobs that wait for it
   (`--no-chain` runs only that one). A bare job name works when only one app has a job of that name.
   A job that may write data first brings the shared database in line with `project.toml`.
-- `mes --json jobs log` and `mes --json jobs status`. `--verify` checks the chain of records; on
+- `mes --json jobs log` and `mes --json jobs status` (results: `success`, `skipped`, `exit-code`,
+  `timeout`, ...). `--verify` checks the chain of records; on
   a personal computer that shows mistakes, not a determined edit. On a server root also keeps an
   anchor (record count and newest hash) after every run, so `--verify --server-root /var/lib/mes`
   also catches a log that was cut, emptied or replaced.

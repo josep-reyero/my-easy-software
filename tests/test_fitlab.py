@@ -1,4 +1,4 @@
-"""The proof of the app model on examples/fitlab (docs/apps-contract.md, 9.7 and 11).
+"""The proof of the app model on examples/fitlab (docs/apps-contract.md, 9.7).
 
 A copy of the example is installed with ``uv sync --offline`` (skipped when uv or its cache cannot
 do that), then driven as real programs with throwaway per-machine folders: steps 1 to 4, 8 and 9

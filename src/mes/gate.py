@@ -43,7 +43,7 @@ SSH puts that text in ``SSH_ORIGINAL_COMMAND``. The gate:
    jobs' and requests' ``mes.slice``. A server whose sockets are missing or do not answer
    refuses every request (exit 75); nothing is ever run with less protection.
 5. On a personal computer (no sockets) the gate asks the app for its kinds and runs it itself,
-   with the limits of v0.1 only: time, output, CPU time, file size, no core files, address
+   with process limits only: time, output, CPU time, file size, no core files, address
    space (Linux), and says so in its log.
 6. Every request runs with a small fixed environment (fixed ``PATH``, ``MES_ALLOW``, the
    project's folders, no SSH agent, no tokens, no ``PYTHON*`` from outside), no input (except
@@ -855,8 +855,8 @@ def child_main(project: str, server_root: str, level: str, stdin: BinaryIO, stdo
     try:
         if peer is not None:
             peer()
-        if level not in GATE_LEVELS:
-            raise UsageError("Unknown level.", hint="Use read, write or deploy.")
+        if level not in units.SANDBOX_LEVELS:
+            raise UsageError("Unknown level.", hint="Use read, write, deploy or publish.")
         line = stdin.readline(MAX_REQUEST_BYTES + 1)
         try:
             req = json.loads(line.decode("utf-8"))
@@ -881,7 +881,7 @@ def child_main(project: str, server_root: str, level: str, stdin: BinaryIO, stdo
 
             body = json.dumps(selftest.probe(where.layout, level), ensure_ascii=False).encode("utf-8")
             return answer(Finished(0, body, b""))
-        if kind in ("sync", "publish") and level == "deploy":
+        if (kind == "sync" and level == "deploy") or (kind == "publish" and level == "publish"):
             from mes import deploy
 
             result = deploy.child_step(where, req, timeout=timeout)
@@ -1147,13 +1147,15 @@ def _child_json(where: GateProject, level: str, req: dict[str, Any], timeout: fl
 
 
 def _deploy_child(where: GateProject, req: dict[str, Any], timeout: float) -> dict[str, Any]:
-    """Run a deploy step in its own sandbox: installing packages and publishing in the deploy
-    sandbox; asking the new release's apps what they are (project code) in a read sandbox, which
-    cannot change any release; the self-test probes in every sandbox."""
+    """Run a deploy step in its own sandbox: installing a release in the deploy sandbox (uv and
+    mes only, never project code); asking the new release's apps what they are (project code) in
+    a read sandbox, which cannot change any release and has no network; publishing the dashboards
+    in the publish sandbox (no network, no data); the self-test probes in every sandbox. Switching
+    ``current`` and removing old releases happen here, in the gate, which runs no project code."""
     kind = req.get("kind")
     if kind == "selftest":
         level = req.get("level")
-        if level not in GATE_LEVELS:
+        if level not in units.SANDBOX_LEVELS:
             raise _bad_request("Unknown level.")
         data = _child_json(where, level, {"kind": "selftest"}, timeout)
         if data is None:
@@ -1161,7 +1163,9 @@ def _deploy_child(where: GateProject, req: dict[str, Any], timeout: float) -> di
 
             return selftest.probe(where.layout, level)
         return data
-    level = "read" if kind == "describe" else "deploy"
+    level = {"describe": "read", "publish": "publish", "sync": "deploy"}.get(str(kind))
+    if level is None:
+        raise _bad_request("Unknown deploy step.")
     data = _child_json(where, level, req, timeout)
     if data is not None:
         return data
@@ -1273,7 +1277,7 @@ def register(subparsers: Any) -> None:
     c = sub.add_parser("child", help="(Used by the server's sandboxed request instances.) Run one request.")
     c.add_argument("--project", required=True, dest="child_project")
     c.add_argument("--server-root", required=True, dest="child_server_root")
-    c.add_argument("--level", required=True, choices=GATE_LEVELS)
+    c.add_argument("--level", required=True, choices=units.SANDBOX_LEVELS)
     c.set_defaults(func=lambda a: _handle_child(argparse.Namespace(project=a.child_project,
                                                                    server_root=a.child_server_root,
                                                                    level=a.level)))

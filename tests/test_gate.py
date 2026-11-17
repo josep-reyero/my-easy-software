@@ -727,6 +727,19 @@ def test_a_server_without_sandbox_sockets_runs_nothing(server, monkeypatch):
     assert not (layout.data / "added.txt").exists()
 
 
+def test_the_installed_default_requires_the_sandbox(server, tmp_path):
+    """Finding G: every gate test lifted the switch, so nothing checked that the installed module
+    keeps it on. A fresh Python, with nothing patched, must refuse without the sockets."""
+    code = ("import json, sys, mes.gate as g\n"
+            "assert g.REQUIRE_SANDBOX_ON_SERVER is True\n"
+            "from mes.cli import run\n"
+            "sys.exit(run(['--json', 'gate', '--project', 'fakeproj', '--allow', 'read', '--server-root', sys.argv[1]]))\n")
+    env = {"PATH": os.environ["PATH"], "HOME": str(tmp_path), "SSH_ORIGINAL_COMMAND": json.dumps(["fakeapp", "summary", "--json"])}
+    res = subprocess.run([sys.executable, "-c", code, str(server)], capture_output=True, text=True, env=env, timeout=60)
+    assert res.returncode == 75, (res.stdout, res.stderr)
+    assert json.loads(res.stdout)["error"]["code"] == "sandbox_unavailable"
+
+
 def test_server_environment_has_only_the_project_folders(server, monkeypatch):
     monkeypatch.setenv("HOME", "/home/owner")
     layout = paths.server_layout("fakeproj", server)

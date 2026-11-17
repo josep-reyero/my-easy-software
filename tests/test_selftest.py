@@ -59,10 +59,64 @@ def test_probe_reports_what_is_reachable_as_failed(layout):
         selftest.probe(layout, "admin")
 
 
-def test_deploy_probe_expects_code_to_be_writable(layout):
+def test_install_probe_expects_only_the_new_release_to_be_writable(layout):
+    """Finding A: the install step may write the release code/installing points at and uv's
+    cache, never code/ itself or the other releases."""
     items = _by_id(selftest.probe(layout, "deploy"))
-    assert items["deploy-code"]["status"] == "done"
+    assert items["deploy-code"]["status"] == "todo"  # outside a sandbox code/ is writable: not a pass
+    assert items["deploy-other-releases"]["status"] == "skipped"  # no releases/ yet: not a pass
+    assert items["deploy-new-release"]["status"] == "todo"  # no code/installing here
+    target = layout.releases / ".selftest-install"
+    target.mkdir(parents=True)
+    os.symlink("releases/.selftest-install", layout.installing)
+    layout.uv_cache.mkdir()
+    items = _by_id(selftest.probe(layout, "deploy"))
+    assert items["deploy-new-release"]["status"] == "done" and items["deploy-uv-cache"]["status"] == "done"
+    assert items["deploy-other-releases"]["status"] == "todo"  # writable outside a sandbox
+    assert items["deploy-no-data"]["status"] == "todo"  # data/ is visible here
     assert "deploy-syscalls" in items and "deploy-loopback" in items and "deploy-network" not in items
+
+
+def test_net_probe_never_passes_the_filter_when_it_cannot_tell(layout, monkeypatch):
+    """Finding G: on a computer without the filter, unlisted addresses either connect (fail) or
+    fail for another reason (todo with a reason), never pass."""
+    def refuse(host, port):
+        raise OSError(101, "Network is unreachable")  # ENETUNREACH for everything: cannot tell
+
+    monkeypatch.setattr(selftest, "_connect", refuse)
+    items = _by_id(selftest.probe(layout, "net"))
+    assert items["net-filter"]["status"] == "todo" and "cannot tell" in items["net-filter"]["why"]
+    assert items["net-names"]["status"] == "todo"  # this computer's /etc/hosts is not the probe's own
+
+    def filtered(host, port):
+        raise OSError(1 if host != units.SELFTEST_ADDRESS else 110, "x")  # EPERM unless listed
+
+    monkeypatch.setattr(selftest, "_connect", filtered)
+    items = _by_id(selftest.probe(layout, "net"))
+    assert items["net-filter"]["status"] == "done" and items["net-public"]["status"] == "done"
+    assert items["net-local"]["status"] == "done"
+    monkeypatch.setattr(selftest, "_connect", lambda host, port: None)  # everything connects
+    items = _by_id(selftest.probe(layout, "net"))
+    assert items["net-filter"]["status"] == "todo" and items["net-public"]["status"] == "todo"
+
+
+def test_host_sockets_seen_are_reported(layout, monkeypatch):
+    monkeypatch.setattr(selftest, "HOST_SOCKETS", (str(layout.code),))
+    assert _by_id(selftest.probe(layout, "job"))["job-host-sockets"]["status"] == "todo"
+    monkeypatch.setattr(selftest, "HOST_SOCKETS", (str(layout.code / "nothing-here"),))
+    assert _by_id(selftest.probe(layout, "job"))["job-host-sockets"]["status"] == "done"
+
+
+def test_filter_settings_and_sandbox_switch_are_checked(layout, monkeypatch):
+    good = {"IPAddressAllow": f"{units.SELFTEST_ADDRESS}/32", "IPAddressDeny": "0.0.0.0/0 ::/0"}
+    assert selftest._filter_settings(layout, show=lambda *a: good)["status"] == "done"
+    assert selftest._filter_settings(layout, show=lambda *a: {**good, "IPAddressDeny": ""})["status"] == "todo"
+    assert selftest._filter_settings(layout, show=lambda *a: {})["status"] == "skipped"
+    from mes import gate
+
+    assert selftest._sandbox_required()["status"] == "done"  # the default, as installed
+    monkeypatch.setattr(gate, "REQUIRE_SANDBOX_ON_SERVER", False)
+    assert selftest._sandbox_required()["status"] == "todo"
 
 
 def test_job_result_is_left_where_no_job_can_write(layout):

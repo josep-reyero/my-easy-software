@@ -28,26 +28,39 @@ On this computer mes:
    random nonce) signed in the namespace `mes-rollback`; the server accepts it within 5 minutes,
    once.
 
-On the server the gate:
+On the server the gate (which itself runs no project code):
 1. checks the signature against the project's allowed signers **before unpacking anything**,
    reading one open file that has already left the folder;
 2. unpacks with a hardened extractor (plain files and folders only, size and count limits);
-3. refuses an archive already installed or older than an installed one; a release that was
-   interrupted is removed and never blocks sending it again;
-4. in the deploy sandbox (no access to this computer's own services or the local network, uv's
-   cache and Python under `code/`, no user settings): `uv sync --frozen --no-build` for the
-   third-party packages, then installs the archive's own wheels offline; then, in a read sandbox
-   (which cannot change any release), finds every app (as `mes apps sync` does) and asks each
-   app's program to describe itself. The gate itself then checks that answer, writes the
-   release's own `apps.lock.json` and checks the jobs' commands (problems become notes);
-5. records the release as complete, switches `current` in one step, publishes the dashboards
-   (switching back if that fails), and keeps the newest 5 releases.
+3. refuses an archive accepted before or made before the newest accepted one (kept in
+   `gate/accepted.json`, which no sandbox can change, so it holds even when old releases were
+   removed); a release that was interrupted is removed and never blocks sending it again;
+4. **install step**, in the deploy sandbox: the package index but nothing on this computer or the
+   local network; writable: only the new release (the link `code/installing` the gate points at
+   it) and uv's cache and Python under `code/`; no data, state, ui, store or gate folder; no user
+   settings. `uv sync --frozen --no-build --no-dev --no-install-project` puts the locked
+   third-party packages into the release's fresh `.venv` without ever starting its Python (which
+   would run every `.pth` startup file of those packages), then mes unpacks the archive's own
+   wheels itself, with no Python started;
+5. **describe step**, in a read sandbox (no network; cannot change any release): finds every app
+   (as `mes apps sync` does) and asks each app's program to describe itself. The gate checks that
+   answer, writes the release's own `apps.lock.json` and checks the jobs' commands (problems
+   become notes);
+6. records the release as complete with a fingerprint of every file in it, switches `current`
+   in one step, and in the **publish step** (no network, the code read-only, `ui/` writable, no
+   data or state) publishes the dashboards (switching back if that fails). Before the first data
+   there is nothing to publish: the answer says `dashboards: waiting for first data` (exit 0),
+   and the dashboard refresh publishes them after the first job that brings data;
+7. keeps the newest 5 releases. A rollback switches only to a complete release whose files are
+   still exactly as they were installed (it checks the fingerprint).
 
-What remains: third-party packages still come from the package index during `uv sync` (checked
+What remains: third-party packages come from the package index during `uv sync` (checked
 against the hashes in `uv.lock`); a package that has only source code fails unless the plan was
-made with `--allow-server-builds`, and then its build code runs in the deploy sandbox. The deploy
-sandbox finds names through systemd-resolved (the default on Arch); a name server on this
-computer or the local network is blocked, so such a server cannot reach the index.
+made with `--allow-server-builds`, and then its build code runs in the install step (with the
+internet and the new release writable; it gets a cache and a Python of the release's own, so
+nothing it writes is used by another deploy). The install step finds names through
+systemd-resolved's socket (the default on Arch); a name server on this computer or the local
+network is blocked, so such a server cannot reach the index.
 
 Errors: exit 5 `bad_signature` (wrong signing key: add it with `mes server plan --signer`),
 `stale_request`/`replay` (send the rollback again), exit 4 (not a deploy key), exit 6 (unlock

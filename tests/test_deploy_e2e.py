@@ -4,11 +4,12 @@
 - ``ssh`` is a fake on PATH: it does what sshd does with a forced command, setting
   SSH_ORIGINAL_COMMAND to the request and running ``mes gate --project demo --allow <level>
   --server-root <tmp>`` with the archive on stdin.
-- ``uv`` is a fake. On this computer ``uv build --wheel`` writes an empty wheel named after the
-  folder's pyproject.toml (and records which folder it built). On "the server" ``uv sync
-  --frozen --no-build ...`` "installs" the project by writing ``.venv/bin/demo``, a small
-  program that runs the project's own cli.py, and ``uv pip install --no-index ...`` checks that
-  only the archive's wheels are installed.
+- ``uv`` is a fake. On this computer ``uv build --wheel`` writes a small real wheel named after
+  the folder's pyproject.toml (its metadata and console scripts, no code). On "the server" ``uv
+  sync --frozen --no-build --no-dev --no-install-project ...`` checks that the release has no
+  environment yet and makes a fresh one (a link to the base Python and a .pth that stands in for
+  the third-party packages); mes then unpacks the archive's own wheels itself (``mes.wheels``),
+  which writes ``.venv/bin/demo`` and ``.venv/bin/demo-app``. ``uv pip`` must never be called.
 - The test user plays both root (it owns the project's top folder and the signers file) and
   mes-demo (it owns code/), which is the only difference from a real server.
 
@@ -25,12 +26,13 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import types
 from pathlib import Path
 
 import pytest
 
 import mes
-from mes import deploy
+from mes import deploy, paths
 from mes.errors import MesError, NotFound, Refused
 
 pytestmark = pytest.mark.skipif(shutil.which("ssh-keygen") is None or shutil.which("git") is None,
@@ -79,7 +81,7 @@ manual = true
 '''
 
 FAKE_UV = '''#!{python}
-import json, os, sys, tomllib
+import base64, hashlib, json, os, sys, tomllib, zipfile
 args = sys.argv[1:]
 log = {log!r}
 if log:
@@ -90,26 +92,43 @@ if args[:2] == ["build", "--wheel"]:
     out, folder = args[args.index("--out-dir") + 1], args[-1]
     meta = tomllib.load(open(os.path.join(folder, "pyproject.toml"), "rb"))["project"]
     assert not os.path.exists(os.path.join(folder, "UNTRACKED")), "built from the working folder"
-    open(os.path.join(out, "%s-%s-py3-none-any.whl" % (meta["name"], meta["version"])), "wb").close()
+    name, version = meta["name"].replace("-", "_"), meta["version"]
+    dist = "%s-%s.dist-info" % (name, version)
+    files = {{dist + "/METADATA": ("Metadata-Version: 2.1\\nName: %s\\nVersion: %s\\n" % (meta["name"], version)).encode(),
+             dist + "/WHEEL": b"Wheel-Version: 1.0\\nGenerator: fake\\nRoot-Is-Purelib: true\\nTag: py3-none-any\\n"}}
+    scripts = meta.get("scripts") or {{}}
+    if scripts:
+        files[dist + "/entry_points.txt"] = ("[console_scripts]\\n" + "".join(
+            "%s = %s\\n" % kv for kv in scripts.items())).encode()
+    def h(b):
+        return "sha256=" + base64.urlsafe_b64encode(hashlib.sha256(b).digest()).rstrip(b"=").decode()
+    files[dist + "/RECORD"] = ("".join("%s,%s,%d\\n" % (k, h(v), len(v)) for k, v in files.items())
+                               + dist + "/RECORD,,\\n").encode()
+    with zipfile.ZipFile(os.path.join(out, "%s-%s-py3-none-any.whl" % (name, version)), "w") as z:
+        for k, v in files.items():
+            z.writestr(k, v)
     sys.exit(0)
-if args[:2] == ["pip", "install"]:
-    for flag in ("--no-deps", "--no-index", "--no-build", "--offline"):
-        assert flag in args, args
-    wheels = [a for a in args if a.endswith(".whl")]
-    assert wheels and all("/wheels/" in w for w in wheels), args
-    sys.exit(0)
-assert args[:5] == ["sync", "--frozen", "--no-progress", "--no-build", "--no-install-project"], args
-if os.path.exists(os.path.join(os.getcwd(), "FAIL_SYNC")):
+assert args[0] != "pip", "the server must never ask uv to install into the release's environment"
+assert args[:6] == ["sync", "--frozen", "--no-progress", "--no-build", "--no-dev", "--no-install-project"], args
+assert not any("/.venv/" in a or a.endswith("/.venv") for a in args), args
+here = os.getcwd()
+assert not os.path.lexists(os.path.join(here, ".venv")), "uv sync must start from a fresh environment"
+if os.path.exists(os.path.join(here, "FAIL_SYNC")):
     sys.stderr.write("could not resolve packages\\n")
     sys.exit(1)
-here = os.getcwd()
-os.makedirs(os.path.join(here, ".venv", "bin"), exist_ok=True)
-for name, entry in (("demo-app", "from demo_app.cli import main"), ("demo", "from mes.project import main")):
-    prog = os.path.join(here, ".venv", "bin", name)
-    with open(prog, "w") as f:
-        f.write("#!{python}\\nimport sys\\nsys.path[:0] = [%r, %r]\\n%s\\nmain()\\n"
-                % (os.path.join(here, "apps"), {mes_src!r}, entry))
-    os.chmod(prog, 0o700)
+# A fresh environment, as uv makes it: its Python is a link to the base one, and (standing in for
+# the locked third-party packages) a .pth that puts the project's apps and mes on the path.
+venv = os.path.join(here, ".venv")
+site = os.path.join(venv, "lib", "python%d.%d" % sys.version_info[:2], "site-packages")
+os.makedirs(site)
+os.makedirs(os.path.join(venv, "bin"))
+base = os.path.realpath(getattr(sys, "_base_executable", sys.executable))
+os.symlink(base, os.path.join(venv, "bin", "python"))
+with open(os.path.join(venv, "pyvenv.cfg"), "w") as f:
+    f.write("home = %s\\ninclude-system-site-packages = false\\nversion_info = %d.%d\\n"
+            % ((os.path.dirname(base),) + tuple(sys.version_info[:2])))
+with open(os.path.join(site, "_e2e_paths.pth"), "w") as f:
+    f.write(os.path.join(here, "apps") + "\\n" + {mes_src!r} + "\\n")
 '''
 
 FAKE_SSH = '''#!{python}
@@ -256,8 +275,13 @@ def test_deploy_runs_the_new_release_through_the_gate(world):
     calls = [json.loads(ln) for ln in (w.tmp / "uv-log.jsonl").read_text().splitlines()]
     server_calls = [c for c in calls if c["args"][0] in ("sync", "pip")]
     assert server_calls and all(c["home"] == "/nonexistent" and c["no_config"] == "1" for c in server_calls)
-    assert all("--no-build" in c["args"] for c in server_calls)
-    assert [c["args"][-1] for c in calls if c["args"][0] == "pip"][0].endswith("demo-0.1.0-py3-none-any.whl")
+    assert all("--no-build" in c["args"] and "--no-dev" in c["args"] for c in server_calls)
+    # uv is never asked to install into (and so never starts) the release's own Python: mes
+    # unpacked the project's wheel itself.
+    assert not [c for c in calls if c["args"][0] == "pip"]
+    site = next((w.base / "code" / "releases" / "1" / "project" / ".venv" / "lib").glob("python*/site-packages"))
+    assert (site / "demo-0.1.0.dist-info" / "INSTALLER").read_text() == "mes\n"
+    assert not os.path.lexists(w.base / "code" / "installing")
 
 
 def test_rollback_is_signed_and_cannot_be_replayed(world):
@@ -555,3 +579,94 @@ def test_an_installed_app_inside_the_project_gets_its_own_wheel():
     fitlab = Path(__file__).resolve().parents[1] / "examples" / "fitlab"
     assert deploy._inside_path_dependencies(fitlab) == ["vendor/fitlab-rides"]
     assert "fitlab-rides" in deploy._path_packages(fitlab)
+
+
+# --------------------------------------------------------------------------- replay record, fingerprints, first data
+
+def test_replay_is_refused_even_after_the_releases_are_gone(world):
+    """Finding A4: replay protection rested on the release folders and their records; once those
+    were pruned (or removed by hand), an old signed archive installed again. The gate now keeps
+    the newest accepted time and the accepted archives in gate/accepted.json."""
+    w = world
+    old, old_sig = _signed(w, name="old.tgz")
+    w.write_project("0.2.0")
+    new, new_sig = _signed(w, name="new.tgz")
+    assert deploy._send("mes-demo@my-server", ["mes", "deploy", "--signature", new_sig], new, 60)["release"] == 1
+    shutil.rmtree(w.base / "code" / "releases")
+    os.unlink(w.base / "code" / "current")
+    shutil.rmtree(w.base / "gate" / "releases", ignore_errors=True)
+    for archive, sig, code in ((new, new_sig, "already_installed"), (old, old_sig, "older_release")):
+        with pytest.raises(Refused) as e:
+            deploy._send("mes-demo@my-server", ["mes", "deploy", "--signature", sig], archive, 60)
+        assert e.value.code == code
+    accepted = json.loads((w.base / "gate" / "accepted.json").read_text())
+    assert len(accepted["archives"]) == 1 and accepted["newest_created_ns"] > 0
+
+
+def test_rollback_refuses_a_release_whose_files_changed(world):
+    """Finding A4: a rollback switched to whatever was in releases/<n>; now the gate checks the
+    fingerprint of its files recorded when it was installed."""
+    w = world
+    _deploy(w)
+    w.write_project("0.2.0")
+    _deploy(w)
+    record = json.loads((w.base / "gate" / "releases" / "1.json").read_text())
+    assert len(record["tree_sha256"]) == 64
+    cli = w.base / "code" / "releases" / "1" / "project" / "apps" / "demo_app" / "cli.py"
+    cli.write_text(cli.read_text() + "\n# changed after installing\n")
+    with pytest.raises(Refused) as e:
+        _deploy(w, rollback=True, to=1)
+    assert e.value.code == "release_changed"
+    assert os.readlink(w.base / "code" / "current") == "releases/2"
+
+
+def test_a_first_deploy_before_any_data_is_waiting_not_failed(world):
+    """Finding E: easy-ui cannot publish before the first data; the deploy says so and succeeds."""
+    w = world
+    fake = _script(w.tmp / "tools" / "easy-ui", f"#!{sys.executable}\n"
+                   "import json, sys\n"
+                   "if sys.argv[-1] == 'publish':\n"
+                   "    print(json.dumps({'error': {'code': 'no_data', 'message': 'There is no data yet.'}}))\n"
+                   "    sys.exit(3)\n"
+                   "print(json.dumps({}))\n")
+    with open(w.base / "etc" / "server.toml", "a") as f:
+        f.write(f'easy_ui = "{fake}"\n')
+    (w.project / "ui" / "dashboards").mkdir(parents=True)
+    (w.project / "ui" / "dashboards" / "main.yaml").write_text("title: Main\n")
+    _git(w.project, "add", "-A")
+    _git(w.project, "commit", "-q", "-m", "dashboards")
+    out = _deploy(w)
+    assert out["deployed"] and out["release"] == 1
+    assert out["dashboards"]["waiting"] is True
+    assert "waiting for first data" in out["message"]
+    assert os.readlink(w.base / "code" / "current") == "releases/1"
+
+
+def test_the_install_step_never_names_the_new_environment(tmp_path):
+    """Finding A1: 'uv pip install --python <release>/.venv/bin/python' started the release's
+    Python. The one uv command now is a fresh 'uv sync' that names no interpreter."""
+    folder = tmp_path / "project"
+    folder.mkdir()
+    (folder / "pyproject.toml").write_text('[project]\nname = "demo"\nversion = "0.1.0"\n')
+    argv = deploy.install_argv("/usr/bin/uv", folder, wheels=True, allow_builds=False)
+    assert argv[:2] == ["/usr/bin/uv", "sync"] and "--no-dev" in argv and "--no-build" in argv
+    assert "--no-install-project" in argv and "pip" not in argv
+    assert not any(a == "--python" or ".venv" in a for a in argv)
+    assert "--no-build" not in deploy.install_argv("/usr/bin/uv", folder, wheels=True, allow_builds=True)
+
+
+def test_the_install_step_refuses_a_release_it_is_not_pointed_at_or_with_an_environment(world):
+    w = world
+    _deploy(w)
+    layout = paths.server_layout("demo", w.root)
+    where = types.SimpleNamespace(layout=layout)
+    with pytest.raises(Refused) as e:  # code/installing does not point at release 1
+        deploy.child_step(where, {"kind": "sync", "release": 1}, timeout=60)
+    assert e.value.code == "not_installing"
+    os.symlink("releases/1", layout.installing)
+    try:
+        with pytest.raises(Refused) as e:  # release 1 has its .venv: uv would start its Python
+            deploy.child_step(where, {"kind": "sync", "release": 1}, timeout=60)
+        assert e.value.code == "stray_environment"
+    finally:
+        os.unlink(layout.installing)

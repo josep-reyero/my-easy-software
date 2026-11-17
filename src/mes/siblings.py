@@ -17,8 +17,8 @@ What mes assumes about their command lines (kept here, in one place):
   "enable": ["mes-<p>-web.socket"], "written", "units": {"mes-<p>-web.socket": ..., "mes-<p>-web.service": ...}}``.
   The service runs as ``mes-<p>-web``; the socket defaults to ``/run/mes/<p>-web.sock``. easy-ui
   lists ``<root>/<p>`` as ``mes-<p>:mes-<p>-web 0710``; mes keeps it ``root:root 0711`` on purpose
-  and makes ``ui``, ``ui/data``, ``ui/specs`` (``mes-<p>:mes-<p>-web 2750``) and ``ui/auth``
-  (``mes-<p>-web 0700``) as listed.
+  and makes ``ui``, ``ui/data``, ``ui/specs`` (``mes-<p>:mes-<p>-web 2750``) and ``auth``
+  (beside ``ui``, ``mes-<p>-web 0700``) itself.
 - ``easy-ui ... preview [--port N]`` prints a ``http://127.0.0.1:<port>/?token=...`` link and runs
   until stopped.
 - ``easy-ui ... export --out DIR [--dashboard NAME ...] [--encrypt] [--working]`` creates DIR and

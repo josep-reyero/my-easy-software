@@ -13,7 +13,7 @@ Before=mes-demo.job.demo-app.sync.service
 
 [Service]
 Type=oneshot
-ExecStart="/usr/bin/env" "-i" "PATH=/usr/bin:/bin" "LANG=C.UTF-8" "/opt/mes/tools/my-easy-software/bin/python" "-I" "-m" "mes" "jobs" "allow-network" "--unit" "mes-demo.job.demo-app.sync.service" "--hosts-file" "/run/mes-demo-net/demo-app.sync/hosts" "--" "api.example.com" "auth.example.com"
+ExecStart="/usr/bin/env" "-i" "PATH=/usr/bin:/bin" "LANG=C.UTF-8" "/opt/mes/my-easy-software/.venv/bin/python" "-I" "-m" "mes" "jobs" "allow-network" "--unit" "mes-demo.job.demo-app.sync.service" "--hosts-file" "/run/mes-demo-net/demo-app.sync/hosts" "--" "api.example.com" "auth.example.com"
 WorkingDirectory=/
 RuntimeDirectory=mes-demo-net/demo-app.sync
 RuntimeDirectoryMode=0755

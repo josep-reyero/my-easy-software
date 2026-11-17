@@ -2,7 +2,7 @@
 
 How to show a project's data in a dashboard, preview it, and keep it working on a server.
 
-Dashboards are YAML files in `ui/dashboards/` read by the dashboard server easy-ui (my-easy-ui):
+Dashboards are YAML files in `ui/dashboards/` read by the dashboard server easy-ui (**my-easy-ui**):
 named, read-only queries plus fixed components. Dashboard files hold no code; the look lives in
 `ui/theme.yaml` and `ui/styles/` (see "Change the look" below). See every component with
 `easy-ui components`; check files with `easy-ui validate`.

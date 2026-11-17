@@ -5,7 +5,7 @@ How to share chosen dashboards as a static copy on a hosting provider, safely an
 `mes expose` makes a **static copy** of the chosen dashboards with `easy-ui export` (the page, the
 dashboards and only the data they use) and publishes it with the person's own hosting account.
 No code of ours runs on the internet and nothing listens on this computer, so there is nothing to
-break into and no way back to the person's devices. It needs my-easy-ui (`easy-ui`) installed.
+break into and no way back to the person's devices. It needs **my-easy-ui** (`easy-ui`) installed.
 
 ```
 mes --json expose <project> --to cloudflare-pages --mode link

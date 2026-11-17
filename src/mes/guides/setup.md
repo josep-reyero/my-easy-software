@@ -3,7 +3,7 @@
 How to get a computer ready for mes projects, driven by you (the agent) without blocking on prompts.
 
 0. Get `mes` itself (it is not published on a package index; never install a package called
-   my-easy-software from one, since anyone could publish that name there): with the user's yes,
+   **my-easy-software** from one, since anyone could publish that name there): with the user's yes,
    clone the repository the user names (`git clone <my-easy-software repository address>`), check
    that it is the one they mean (the address they gave, and `git log -1` shows the commit they
    expect), and run `uv tool install <the my-easy-software folder>`. `mes` is then available
@@ -51,17 +51,20 @@ Serving a project's dashboard on the private network (on the server): run
 `mes --json setup` does the same). The checklist then ends with the item `tailscale-serve`,
 "Serve the dashboard on your private network". It is always `needs_human`: mes never runs its
 commands. Its `why` (and, line by line, its `detail`) gives:
+- first look at what the server already serves, with `tailscale serve status`: serving on a port
+  replaces whatever is served there now, so if 443 is taken use another port (`--port N`, then the
+  plan takes `--origin https://<server>.<tailnet>.ts.net:N`);
 - the command to run once on the server, with the user's yes:
   `sudo tailscale serve --bg --https=443 unix:/run/mes/<name>-web.sock`
   (`--socket PATH` changes the dashboard server's socket, `--port N` the HTTPS port; use another
   port for each project served from the same server);
 - the private name the dashboard server must accept, given when its units are made:
-  `mes server plan <name> --allow-host <server>.<tailnet>.ts.net` (the same as
+  `/usr/local/bin/mes server plan <name> --allow-host <server>.<tailnet>.ts.net` (the same as
   `--origin https://<server>.<tailnet>.ts.net`; mes passes it to `easy-ui units --origin` and
   renders the units `mes-<name>-web.socket` and `mes-<name>-web.service` itself), then the
   script it prints is run as before;
-- the dashboard password, set once on the server:
-  `sudo -u mes-<name>-web easy-ui set-password --ui-dir /var/lib/mes/<name>/ui --auth-dir /var/lib/mes/<name>/auth`. The name comes from `tailscale status` when this
+- the dashboard password, set once on the server (`cd /` first, full paths after `sudo -u`):
+  `cd / && sudo -u mes-<name>-web /usr/local/bin/easy-ui set-password --ui-dir /var/lib/mes/<name>/ui --auth-dir /var/lib/mes/<name>/auth`. The name comes from `tailscale status` when this
   computer is the server, otherwise it is a placeholder to replace;
 - how to check (`tailscale serve status`) and how to stop (`sudo tailscale serve --https=443 off`).
 Tell the user it makes the dashboard open on their own devices only. Never use `tailscale funnel`:

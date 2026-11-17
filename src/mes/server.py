@@ -63,6 +63,7 @@ import base64
 import datetime as _dt
 import grp
 import hashlib
+import json
 import os
 import pwd
 import re
@@ -78,11 +79,13 @@ from pathlib import Path
 from typing import Any
 
 from mes import __version__, paths, protocol, siblings, units
+from mes.buildinfo import build_id
 from mes import manifest as manifest_mod
 from mes.app import check_allowed
 from mes.errors import MesError, NotFound, Refused, UsageError
 
 MAX_SERVER_NAME = 24
+MIN_SYSTEMD = 249  # PrivateIPC=, ProtectProc=, ProcSubset=, ExecCondition=
 UNITS_DIR = "/etc/systemd/system"
 DEFAULT_TOOLS = {"mes": "/usr/local/bin/mes", "mes_python": None, "uv": "/usr/local/bin/uv",
                  "easy_ui": "/usr/local/bin/easy-ui"}
@@ -176,6 +179,8 @@ class PlanInput:
     units_dir: str = UNITS_DIR
     fingerprint: str = ""
     allow_builds: bool = False
+    start: bool = True          # False (--no-start): switch on nothing that runs jobs
+    build: str = ""             # the build of mes that made the plan (mes.buildinfo)
 
 
 def gate_command(plan: PlanInput, level: str) -> str:
@@ -275,7 +280,8 @@ def _web_units(project: manifest_mod.Project, project_dir: Path, layout: paths.S
 def build_plan(project_dir: str | os.PathLike[str] | None, name: str, *, server_root: str = str(paths.SERVER_ROOT),
                tools: dict[str, str | None] | None = None, key_files: list[str] = (),
                signer_files: list[str] = (), units_dir: str = UNITS_DIR, allow_hosts: list[str] = (),
-               origins: list[str] = (), allow_builds: bool = False, refuse_tools_in_project: bool = True) -> PlanInput:
+               origins: list[str] = (), allow_builds: bool = False, refuse_tools_in_project: bool = True,
+               start: bool = True) -> PlanInput:
     from mes.jobs import load_project
 
     _, project = load_project(project_dir)
@@ -306,10 +312,17 @@ def build_plan(project_dir: str | os.PathLike[str] | None, name: str, *, server_
             continue
         checked[key] = units.check_tool_path(value, f"the path of {key.replace('_', '-')}") if value else None
     checked["mes_python"] = mes_python_for(checked["mes"], chosen.get("mes_python"))
+    for key, value in checked.items():
+        if value and not any(value.startswith(r + "/") for r in units.TOOL_ROOTS):
+            raise Refused(
+                f"The path of {key.replace('_', '-')} ({value}) is outside the folders the project's services can see "
+                f"({', '.join(units.TOOL_ROOTS)}): everything else is hidden from them, so they could not run it.",
+                hint="Install the tools as described in 'mes guide server' (/opt/mes and /usr/local/bin), then make "
+                "the plan again.", code="tool_hidden")
     if refuse_tools_in_project:
         refuse_project_tools(root_dir, siblings.tool_path("easy-ui"))
     plan = PlanInput(project=project, layout=layout, tools=checked, units_dir=units.sandbox_path(units_dir),
-                     allow_builds=bool(allow_builds))
+                     allow_builds=bool(allow_builds), start=bool(start), build=build_id())
     for spec in key_files:
         level, sep, path = spec.partition("=")
         if not sep or level not in KEY_LEVELS or not path:
@@ -350,9 +363,14 @@ def build_plan(project_dir: str | os.PathLike[str] | None, name: str, *, server_
     if not any(level == "deploy" for level, _, _ in plan.keys):
         plan.notes.append("No key may deploy (--key deploy=...), so 'mes deploy' cannot reach this project yet.")
     if plan.allow_builds:
-        plan.notes.append("--allow-server-builds: packages that exist only as source code are built on the server, "
-                          "in the deploy sandbox with the internet. Without it, the server installs only ready-made "
-                          "wheels.")
+        plan.notes.append("--allow-server-builds: packages that exist only as source code are built on the server. "
+                          "Their build code then runs in the install step, which has the internet and can write the "
+                          "new release (it gets a cache and a Python of its own, so nothing it writes is used by "
+                          "another deploy; it still sees no data, state or ui). Without it, the server installs only "
+                          "ready-made wheels and runs no package code while installing.")
+    if not plan.start:
+        plan.notes.append("--no-start: the script switches on nothing that runs jobs (their timers, webhook triggers "
+                          "and the webhook receiver); it prints the exact command to switch them on later.")
     return plan
 
 
@@ -433,7 +451,7 @@ def _server_toml(plan: PlanInput) -> str:
     if t.get("easy_ui"):
         lines.append(f'easy_ui = "{t["easy_ui"]}"')
     lines += [f"allow_builds = {'true' if plan.allow_builds else 'false'}",
-              f'units_sha256 = "{plan.fingerprint}"', f'planned_with = "mes {__version__}"', ""]
+              f'units_sha256 = "{plan.fingerprint}"', f'planned_with = "mes {__version__} build {plan.build or build_id()}"', ""]
     return "\n".join(lines)
 
 
@@ -532,6 +550,16 @@ not_in_unsafe() {
   return 0
 }
 
+# in_tool_roots <name> <real path>: the services see programs only in these folders (the rest of
+# /opt, /usr/local/etc and friends, /srv, /home, ... are hidden from them).
+in_tool_roots() {
+  local name="$1" real="$2" r
+  for r in /usr /bin /sbin /lib /lib64 /opt/mes; do
+    case "$real" in "$r"/*) return 0 ;; esac
+  done
+  die "$name is really in $real. The project's services only see programs in /usr, /bin, /lib and /opt/mes (everything else is hidden from them), so install it there as described in: mes guide server"
+}
+
 # check_tool <name> <path>: the program, every folder and link on the way, and the program that
 # runs it (a script's first line, also through uv's long-path trampoline) belong to root, cannot
 # be changed by others, are outside home and temporary folders, and the project's accounts can
@@ -542,6 +570,7 @@ check_tool() {
   follow "$name" "$path"
   real="$REAL"
   not_in_unsafe "$name" "$real"
+  in_tool_roots "$name" "$real"
   [ -f "$real" ] && [ -x "$real" ] || die "$name ($real) is not a program."
   perm="$(stat -c %a -- "$real")"
   (( 8#$perm & 8#001 )) || die "$name ($real) cannot be run by the project's accounts."
@@ -564,11 +593,13 @@ check_tool() {
   return 0
 }
 
-# check_mes <mes> <python> <version>: mes is the script of that Python, which is an isolated
-# virtual environment (no system packages), and mes's own code belongs to root as well. Root
-# runs mes for the project's units only as: env -i PATH=/usr/bin:/bin <python> -I -m mes ...
+# check_mes <mes> <python> <version> <build>: mes is the script of that Python, which is an
+# isolated virtual environment (no system packages), mes's own code is inside it (not an editable
+# install) and belongs to root as well, and it is exactly the build that made this plan. Works for
+# the locked install (/opt/mes/my-easy-software/.venv) and for a 'uv tool' one. Root runs mes for
+# the project's units only as: env -i PATH=/usr/bin:/bin <python> -I -m mes ...
 check_mes() {
-  local mes="$1" py="$2" version="$3" script_py venv got where
+  local mes="$1" py="$2" version="$3" build="$4" script_py venv got got_build where
   check_tool mes "$mes"
   [ -n "$TOOL_INTERP" ] || die "$mes is not the mes program (it should be a Python script)."
   script_py="$TOOL_INTERP"
@@ -580,9 +611,13 @@ check_mes() {
     || die "mes's Python ($py) is not an isolated virtual environment (include-system-site-packages must be false). Install mes as described in: mes guide server"
   got="$(cd / && /usr/bin/env -i PATH=/usr/bin:/bin "$py" -I -m mes --version 2>/dev/null || true)"
   [ "$got" = "mes $version" ] || die "the plan was made by mes $version, but $py runs ${got:-no mes at all}. Make the plan with the mes installed on this server."
+  got_build="$(cd / && /usr/bin/env -i PATH=/usr/bin:/bin "$py" -I -c 'import mes.buildinfo as b; print(b.build_id())' 2>/dev/null || true)"
+  [ "$got_build" = "$build" ] || die "the plan was made by mes $version build $build, but $py runs build ${got_build:-unknown} (another commit). Make the plan with the mes installed on this server: /usr/local/bin/mes server plan ..."
   where="$(cd / && /usr/bin/env -i PATH=/usr/bin:/bin "$py" -I -c 'import mes, os; print(os.path.dirname(os.path.realpath(mes.__file__)))')"
   follow "mes's own code" "$where/__init__.py"
   not_in_unsafe "mes's own code" "$REAL"
+  in_tool_roots "mes's own code" "$REAL"
+  case "$REAL" in "$venv"/lib/*) ;; *) die "mes's own code ($REAL) is not inside its environment $venv: it was installed as editable. Install it as described in: mes guide server" ;; esac
 }
 
 # ensure_dir <path> <owner> <group> <mode>: a real folder (never a link) with exactly these settings.
@@ -660,6 +695,7 @@ def render_script(plan: PlanInput) -> str:
     root = units.sandbox_path(lay.root)
     base = units.sandbox_path(lay.base)
     t = plan.tools
+    mes_path = shlex.quote(str(t['mes']))
     acct, web = lay.account, lay.web_account
     has_webhook = any(j.trigger == "webhook" for j in plan.project.jobs.values())
     group_files = f"root:{acct}"
@@ -674,6 +710,9 @@ def render_script(plan: PlanInput) -> str:
     texts = [f[3] for f in files] + [gate_shell[3]] + list(all_units.values())
     delim = _delimiter(texts)
     enable = [n for n in all_units if n.endswith((".timer", ".path", ".socket"))]
+    # What starts jobs: their timers and webhook triggers, and the webhook receiver.
+    starts_jobs = [n for n in enable if ".job." in n or ".webhook." in n]
+    enable = [n for n in enable if n not in starts_jobs]
     keep = " ".join(sorted(plan.units))
     when = _dt.datetime.now(_dt.UTC).strftime("%Y-%m-%d %H:%M UTC")
 
@@ -694,10 +733,14 @@ def render_script(plan: PlanInput) -> str:
         '[ "$(id -u)" -eq 0 ] || die "this script must be run by the administrator: sudo bash $0"',
         '[ "$(uname -s)" = Linux ] || die "this script is for a Linux server."',
         'command -v systemctl >/dev/null || die "this server has no systemd, which runs the jobs."',
+        "SYSTEMD_VERSION=\"$(systemctl --version | awk 'NR == 1 { print $2 }')\"",
+        'case "$SYSTEMD_VERSION" in ""|*[!0-9]*) die "the version of systemd could not be read." ;; esac',
+        f'[ "$SYSTEMD_VERSION" -ge {MIN_SYSTEMD} ] || die "this server runs systemd $SYSTEMD_VERSION; the sandboxes need '
+        f'{MIN_SYSTEMD} or newer (Debian 12, Ubuntu 22.04, Fedora 35, current Arch)."',
         "for tool in useradd usermod groupadd getent install stat readlink mktemp head sed cut grep awk dirname basename; do",
         '  command -v "$tool" >/dev/null || die "the program $tool is missing."',
         "done",
-        f"check_mes {_q(t['mes'])} {_q(t['mes_python'])} {_q(__version__)}",
+        f"check_mes {_q(t['mes'])} {_q(t['mes_python'])} {_q(__version__)} {_q(plan.build or build_id())}",
         f"check_tool uv {_q(t['uv'])}",
     ]
     if t.get("easy_ui"):
@@ -772,9 +815,7 @@ def render_script(plan: PlanInput) -> str:
     for name, text in all_units.items():
         body += _put(f"{plan.units_dir}/{name}", "0644", "root:root", text, delim)
     body += [
-        "# Units of this project that are no longer in the plan are switched off and removed; this includes",
-        "# units in the old form (mes-<project>.job.<job>.*, mes-<project>.net.<job>.service) from before jobs",
-        "# were named <app>.<job>.",
+        "# Units that carry this project's mark but are not in this plan are switched off and removed.",
         f"KEEP={_q(keep)}",
         f"for f in {_q(plan.units_dir)}/mes-{p}.*; do",
         '  [ -e "$f" ] || continue',
@@ -783,15 +824,32 @@ def render_script(plan: PlanInput) -> str:
         f"  grep -qxF -e {_q(units.MARKER_PROJECT + p)} -- \"$f\" || continue",
         '  systemctl disable --now -- "$name" >/dev/null 2>&1 || true',
         '  rm -f -- "$f"',
-        '  say "Removed $name (no longer in the plan)."',
+        '  say "Removed $name (not in this plan)."',
         "done",
         "systemctl daemon-reload",
     ]
     if enable:
         body.append("systemctl enable --now -- " + " ".join(_q(n) for n in enable))
+    later = "sudo systemctl enable --now -- " + " ".join(starts_jobs)
+    if starts_jobs and plan.start:
+        body.append("systemctl enable --now -- " + " ".join(_q(n) for n in starts_jobs))
+    elif starts_jobs:
+        body += [
+            "say 'Nothing that runs jobs was switched on (made with --no-start). When the data is in place, run:'",
+            f"say {_q('  ' + later)}",
+        ]
+    if starts_jobs:
+        body += [
+            "say 'What starts jobs now:'",
+            f"for u in {' '.join(_q(n) for n in starts_jobs)}; do",
+            '  if systemctl is-active --quiet -- "$u"; then say "  running:     $u"; else say "  not running: $u"; fi',
+            "done",
+        ]
+    else:
+        body.append("say 'The project has no schedules or webhook jobs, so nothing starts jobs on its own.'")
     body += [
         "",
-        f"say {_q(f'Done. The project {p} is set up. Check it (no sudo needed) with: mes server check {p}')}",
+        f"say {_q(f'Done. The project {p} is set up. Check it (as your own account, no sudo) with: cd / && {mes_path} server check {p}')}",
         f"say {_q(f'Then prove the sandboxes from your computer: mes server selftest {p} --host <server>')}",
         "",
     ]
@@ -799,7 +857,8 @@ def render_script(plan: PlanInput) -> str:
     fingerprint = hashlib.sha256(body_text.encode("utf-8")).hexdigest()
     header = [
         "#!/usr/bin/env bash",
-        f'# Root script for the mes project "{p}", made by \'mes server plan\' (mes {__version__}) on {when}.',
+        f'# Root script for the mes project "{p}", made by \'mes server plan\' (mes {__version__}, build '
+        f'{plan.build or build_id()}) on {when}.',
         f"# Plan fingerprint (SHA-256): {fingerprint}",
         "#",
         "# What it does, in plain words:",
@@ -813,7 +872,9 @@ def render_script(plan: PlanInput) -> str:
         f"#  4. Writes the keys that may connect over SSH ({len(plan.keys)}; each one can only run the mes gate),",
         f"#     and the keys that may sign deploys and rollbacks ({len(plan.signers)}).",
         f"#  5. Writes the project's {len(all_units)} system units into {plan.units_dir} and switches on its",
-        "#     schedules and sockets.",
+        "#     sockets" + (" and the schedules and webhook triggers of its jobs." if plan.start else
+                          "; NOT the schedules and webhook triggers of its jobs (--no-start): it prints the"),
+        *([] if plan.start else ["#     command to switch them on later."]),
         "#",
         "# What each app of the project may do in its jobs (network, memory, time):",
         *[f"#   {line}" for line in _per_app_lines(plan.project)],
@@ -822,7 +883,7 @@ def render_script(plan: PlanInput) -> str:
         "# to this plan. Undo it with the script from: mes server remove " + p,
         "#",
         "# Read it, then run:   sudo bash <this file>",
-        "# Afterwards check:    mes server check " + p,
+        f"# Afterwards check:    cd / && {mes_path} server check {p}   (as your own account, no sudo)",
         PLAN_MARKER,
     ]
     return "\n".join(header) + "\n" + body_text
@@ -1049,14 +1110,6 @@ def run_check(name: str, *, server_root: str = str(paths.SERVER_ROOT), units_dir
                        + (f" ({len(hidden)} inside folders that only the project can open were not checked.)"
                           if hidden else ""),
                        "Some folders are missing or have the wrong owner or permissions: " + "; ".join(bad[:6]), fix))
-    st, _ = stat_of(f"{base}/ui/auth")
-    if st is not None:
-        if True:
-            items.append(_item("old-auth", "No sign-in folder is left inside ui/", False, "",
-                               f"{base}/ui/auth is from an older plan. The sign-in now lives in {base}/auth; the old "
-                               "folder is not moved over (sign in again and set a new password).",
-                               f"sudo rm -rf {base}/ui/auth"))
-
     for rel, title, mode in (("etc/allowed_signers", "Deploy signing keys", 0o640),
                              ("etc/gate-shell", "The gate's login shell", 0o750),
                              ("etc/server.toml", "The server settings", 0o640),
@@ -1169,7 +1222,7 @@ def _run_log_item(lay: paths.ServerLayout, p: str, server_root: str) -> dict[str
     from mes import jobs
 
     title = "The run log is complete and unchanged"
-    how = f"sudo -u {lay.account} {DEFAULT_TOOLS['mes']} jobs log --verify --project {p} --server-root {server_root}"
+    how = f"cd / && sudo -u {lay.account} {DEFAULT_TOOLS['mes']} jobs log --verify --project {p} --server-root {server_root}"
     try:
         result = jobs.check_head(lay.run_log, jobs.verify_log(lay.run_log))
     except PermissionError:
@@ -1255,7 +1308,8 @@ def _plan_text(plan: PlanInput, script: str, out: str | None) -> dict[str, Any]:
             {"step": "Read the script", "why": "It says at the top, in plain words, everything it will do."},
             {"step": "Run it once on the server, as the administrator", "command": runs,
              "why": "Only this step needs the administrator. mes itself never uses sudo."},
-            {"step": "Check the result (no sudo needed)", "command": f"mes server check {p}"},
+            {"step": "Check the result on the server, as your own account (no sudo needed)",
+             "command": f"cd / && {plan.tools.get('mes') or DEFAULT_TOOLS['mes']} server check {p}"},
             {"step": "Deploy from your computer", "command": "mes deploy <server>"},
             {"step": "Prove the sandboxes", "command": f"mes server selftest {p} --host <server>"},
         ],
@@ -1277,7 +1331,8 @@ def _build_from_args(args: argparse.Namespace) -> PlanInput:
     return build_plan(args.project_dir, args.project, server_root=args.server_root,
                       tools={"mes": args.mes, "mes_python": args.mes_python, "uv": args.uv, "easy_ui": args.easy_ui},
                       key_files=args.key, signer_files=args.signer, units_dir=args.units_dir,
-                      allow_hosts=args.allow_host, origins=args.origin, allow_builds=args.allow_server_builds)
+                      allow_hosts=args.allow_host, origins=args.origin, allow_builds=args.allow_server_builds,
+                      start=not getattr(args, "no_start", False))
 
 
 def _cmd_plan(args: argparse.Namespace) -> Any:
@@ -1292,7 +1347,8 @@ def _cmd_plan(args: argparse.Namespace) -> Any:
     if not args.out:
         return script
     lines = [f'The root script for "{plan.project.name}" is in {args.out}. Nothing was changed on any computer.',
-             f"It was made by mes {__version__}; its fingerprint is {result['fingerprint']} (the script checks it).",
+             f"It was made by mes {__version__} (build {plan.build}); its fingerprint is {result['fingerprint']} "
+             "(the script checks both).",
              "What each app may do in its jobs:", *[f"  {line}" for line in _per_app_lines(plan.project)]]
     lines += [f"{i}. {s['step']}" + (f": {s['command']}" if s.get("command") else "") for i, s in
               enumerate(result["next_steps"], 1)]
@@ -1340,10 +1396,93 @@ def _cmd_selftest(args: argparse.Namespace) -> Any:
 def _cmd_selftest_probe(args: argparse.Namespace) -> Any:
     from mes import selftest
 
-    if args.context != "job":
-        raise UsageError("Only the job probe runs this way.", hint="Use: mes server selftest <project>")
+    if args.context not in ("job", "net"):
+        raise UsageError("Only the job probes run this way.", hint="Use: mes server selftest <project>")
     layout = paths.server_layout(check_server_name(args.project), args.server_root)
-    return selftest.write_job_result(layout)
+    return selftest.write_job_result(layout, args.context)
+
+
+def first_publish(project: str, *, server_root: str, easy_ui: str,
+                  run: Callable[[list[str]], Any] | None = None) -> dict[str, Any]:
+    """Run by the dashboard refresh (as the project's account, in its sandbox) after the data was
+    built: publish the dashboards when nothing is published yet (a deploy before the first data
+    could not). It asks easy-ui (``versions``) and keys on its JSON, never on its words."""
+    from mes.gate import SAFE_PATH, run_limited
+
+    layout = paths.server_layout(check_server_name(project), server_root)
+    easy_ui = units.check_tool_path(easy_ui, "the path of easy-ui")
+    env = {"PATH": SAFE_PATH, "LANG": "C.UTF-8", "HOME": "/nonexistent", "MES_CONFIG": "/nonexistent",
+           "PYTHONNOUSERSITE": "1", "PYTHONDONTWRITEBYTECODE": "1", "MES_ROOT": str(layout.root),
+           "MES_PROJECT": layout.project, "MES_DATA_DIR": str(layout.data), "MES_STATE_DIR": str(layout.state),
+           "MES_STORE_DIR": str(layout.store), "MES_ALLOW": "write"}
+    base = [easy_ui, "--json", "--project-dir", str(layout.current_project)]
+
+    def ask(*words: str) -> tuple[int, Any]:
+        if run is not None:
+            return run([*base, *words])
+        done = run_limited([*base, *words], env=env, timeout=300.0, max_output=1024 * 1024,
+                           cwd=str(layout.current_project))
+        try:
+            said = json.loads(done.stdout.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            said = None
+        return (124 if done.timed_out else done.returncode), said
+
+    code, versions = ask("versions")
+    if code != 0 or not isinstance(versions, dict) or "current" not in versions:
+        raise MesError("easy-ui could not say which dashboards are published, so none were published now.",
+                       hint="Check the dashboards on the server with: easy-ui versions", code="publish_failed")
+    if versions.get("current") is not None:
+        return {"published": False, "why": "the dashboards are already published"}
+    code, said = ask("publish")
+    if code == 0:
+        return {"published": True, "first": True}
+    error = said.get("error") if isinstance(said, dict) else None
+    if isinstance(error, dict) and error.get("code") == "no_data":
+        return {"published": False, "waiting": True, "status": "waiting for first data"}
+    raise MesError("The first data is there, but the dashboards could not be published.",
+                   hint="Check them with: easy-ui validate, then deploy again.", code="publish_failed",
+                   detail=str((error or {}).get("message") or "")[:2000] or None)
+
+
+def run_as(project_dir: str | None, name: str, argv: list[str], *, server_root: str = str(paths.SERVER_ROOT),
+           network: bool = True) -> dict[str, Any]:
+    """The command an owner runs (with sudo, in a terminal) for an app command that needs a
+    terminal, as the project's account in a sandbox. mes only prints it."""
+    from mes.jobs import load_project
+
+    _, project = load_project(project_dir)
+    if project.name != name:
+        raise UsageError(f'The project in this folder is "{project.name}", not "{name}".',
+                         hint=f"Run: mes server run-as {project.name} -- <app program> <command>")
+    check_server_name(name)
+    programs = {a.program: a.name for a in project.apps.values()}
+    if not argv or argv[0] not in programs:
+        raise UsageError("Name one of the project's app programs after --, then its command.",
+                         hint="For example: mes server run-as " + name + " -- " + (next(iter(programs), "<app>"))
+                         + " login. The programs are: " + ", ".join(programs) + ".")
+    layout = paths.server_layout(name, units.sandbox_path(server_root))
+    cmd = units.interactive_command(project, layout, argv, network=network)
+    text = "sudo " + " ".join(shlex.quote(w) for w in cmd)
+    return {"project": name, "app": programs[argv[0]], "network": "internet, not this computer or the local network"
+            if network else "none", "command": text,
+            "message": "Run this on the server, in a terminal, with sudo (mes never runs sudo itself). It runs the "
+            f"command as {layout.account} with the same sandbox as a job: the project's data, state and store, its "
+            "code read-only, nothing else of the server" + (", and the internet but nothing on this computer or the "
+            "local network." if network else ", and no network.")}
+
+
+def _cmd_run_as(args: argparse.Namespace) -> Any:
+    check_allowed("read")
+    words = list(args.words)
+    if words and words[0] == "--":
+        words = words[1:]
+    result = run_as(args.project_dir, args.project, words, server_root=args.server_root, network=not args.no_network)
+    return result if args.json else f"{result['message']}\n\n{result['command']}"
+
+
+def _cmd_first_publish(args: argparse.Namespace) -> Any:
+    return first_publish(args.project, server_root=args.server_root, easy_ui=args.easy_ui)
 
 
 def register(subparsers: Any) -> None:
@@ -1376,6 +1515,9 @@ def register(subparsers: Any) -> None:
                        "for --origin https://NAME (repeatable)")
         p.add_argument("--origin", action="append", default=[], metavar="URL",
                        help="the exact web address the dashboards are opened with, https://NAME[:PORT] (repeatable)")
+        p.add_argument("--no-start", action="store_true",
+                       help="switch on nothing that runs jobs (timers, webhook triggers); print the command to do it "
+                       "later. Use it for a first install on a server that gets an existing archive")
         p.add_argument("--allow-server-builds", action="store_true",
                        help="let deploys build packages that exist only as source code on the server (off: only "
                        "ready-made wheels are installed)")
@@ -1415,9 +1557,24 @@ def register(subparsers: Any) -> None:
 
     pr = sub.add_parser("selftest-probe", help="(Run by the server's self-test unit.) Probe a job's sandbox.")
     pr.add_argument("project")
-    pr.add_argument("--context", required=True, choices=("job",))
+    pr.add_argument("--context", required=True, choices=("job", "net"))
     pr.add_argument("--server-root", required=True, metavar="DIR")
     pr.set_defaults(func=_cmd_selftest_probe)
+
+    ra = sub.add_parser("run-as", help="Print the sudo command that runs an app command needing a terminal (such as "
+                        "a login) as the project's account, in a sandbox.")
+    common(ra)
+    ra.add_argument("--project-dir", default=None, metavar="DIR", help="the project's folder (default: here)")
+    ra.add_argument("--no-network", action="store_true", help="no network at all (default: the internet, nothing local)")
+    ra.add_argument("words", nargs="*", help="-- <app program> <command> [options]")
+    ra.set_defaults(func=_cmd_run_as)
+
+    fp = sub.add_parser("first-publish", help="(Run by the server's dashboard refresh.) Publish the dashboards when "
+                        "nothing is published yet.")
+    fp.add_argument("project")
+    fp.add_argument("--server-root", required=True, metavar="DIR")
+    fp.add_argument("--easy-ui", required=True, metavar="PATH")
+    fp.set_defaults(func=_cmd_first_publish)
 
     r = sub.add_parser("remove", help="Write the script that removes the project from a server.")
     common(r)

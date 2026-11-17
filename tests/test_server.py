@@ -23,10 +23,11 @@ from pathlib import Path
 
 import pytest
 
+from mes.buildinfo import build_id
 from mes import cli, server, units
 
 import projects as helpers
-from mes.errors import Refused, UsageError
+from mes.errors import MesError, Refused, UsageError
 
 PROJECT_TOML = """
 [project]
@@ -114,7 +115,7 @@ def test_script_text_golden(proj, keys, tmp_path):
         "usermod -p '*' -- mes-demo",
         "usermod -p '!' -- mes-demo-web",
         f"ensure_account mes-demo {q(base + '/home')} {q(base + '/etc/gate-shell')} 'mes project demo'",
-        f"check_mes /bin/sh {q(units.DEFAULT_MES_PYTHON)} {q(server.__version__)}",
+        f"check_mes /bin/sh {q(units.DEFAULT_MES_PYTHON)} {q(server.__version__)} {q(build_id())}",
         "check_tool uv /bin/sh",
     ]:
         assert line in script, line
@@ -141,7 +142,7 @@ def test_script_header_names_the_version_and_a_fingerprint(proj, keys, tmp_path)
     """Finding 1: nothing in the script showed which mes made it or whether it was changed."""
     script = server.render_script(_plan(proj, keys, tmp_path))
     head = script.split(server.PLAN_MARKER)[0]
-    assert f"(mes {server.__version__})" in head
+    assert f"(mes {server.__version__}, build {build_id()})" in head  # item I: the version alone is not enough
     m = re.search(r"^# Plan fingerprint \(SHA-256\): ([0-9a-f]{64})$", head, re.M)
     assert m and m.group(1) == server.plan_fingerprint(script)
 
@@ -214,7 +215,10 @@ FAKES = r'''
 LOG="$FAKE/log"
 id() { if [ "${1:-}" = -u ]; then echo 0; else command id "$@"; fi; }
 uname() { echo Linux; }
-systemctl() { echo "systemctl $*" >> "$LOG"; }
+systemctl() {
+  if [ "${1:-}" = --version ]; then echo "systemd ${FAKE_SYSTEMD:-256} (${FAKE_SYSTEMD:-256}.1-1-arch)"; return 0; fi
+  echo "systemctl $*" >> "$LOG"
+}
 chown() {
   echo "chown $*" >> "$LOG"
   local a=("$@"); [ "${a[0]}" = -- ] && a=("${a[@]:1}")
@@ -503,7 +507,7 @@ def test_dashboard_units_are_rendered_by_mes_from_checked_parameters(proj, keys,
         "/bin/sh", "serve", "--ui-dir", f"{tmp_path}/srv/demo/ui", "--auth-dir", f"{tmp_path}/srv/demo/auth",
         "--origin", ORIGIN]
     assert f"BindPaths={tmp_path}/srv/demo/auth" in lines and f"BindReadOnlyPaths={tmp_path}/srv/demo/ui" in lines
-    assert f"TemporaryFileSystem={tmp_path}/srv:ro" in lines
+    assert "TemporaryFileSystem=/var:ro /run:ro /opt:ro /usr/local:ro" in lines
     env = " ".join(ln for ln in lines if ln.startswith("Environment="))
     assert "HOME=/nonexistent" in env and "MES_CONFIG=/nonexistent" in env
     sock = plan.web_units["mes-demo-web.socket"]
@@ -722,8 +726,8 @@ def test_check_passes_on_a_server_that_matches_the_plan(proj, keys, tmp_path):
         f"{base}/etc/server.toml": _st(f | 0o640, 0, 1001),
         f"{base}/home/.ssh/authorized_keys": _st(f | 0o640, 0, 1001),
         "/bin/sh": _st(f | 0o755), "/opt": _st(d | 0o755), "/opt/mes": _st(d | 0o755),
-        "/opt/mes/tools": _st(d | 0o755), "/opt/mes/tools/my-easy-software": _st(d | 0o755),
-        "/opt/mes/tools/my-easy-software/bin": _st(d | 0o755), units.DEFAULT_MES_PYTHON: _st(f | 0o755),
+        "/opt/mes/my-easy-software": _st(d | 0o755), "/opt/mes/my-easy-software/.venv": _st(d | 0o755),
+        "/opt/mes/my-easy-software/.venv/bin": _st(d | 0o755), units.DEFAULT_MES_PYTHON: _st(f | 0o755),
     }
     active = {n for n in plan.units if n.endswith((".timer", ".socket", ".path"))}
     probe, texts = _probe(tmp_path, accounts, files, active)
@@ -755,7 +759,7 @@ def test_check_passes_on_a_server_that_matches_the_plan(proj, keys, tmp_path):
     result = server.run_check("demo", project_dir=str(proj), probe=probe)
     assert next(i for i in result["items"] if i["id"] == "keys-forced")["status"] == "todo"
     # A tool in a folder others can change is reported (every folder on the way is checked).
-    files["/opt/mes/tools"] = _st(d | 0o777)
+    files["/opt/mes/my-easy-software"] = _st(d | 0o777)
     result = server.run_check("demo", project_dir=str(proj), probe=probe)
     assert next(i for i in result["items"] if i["id"] == "tool-mes_python")["status"] == "todo"
 
@@ -795,3 +799,93 @@ def test_plan_shows_network_and_limits_per_app(proj, keys, tmp_path):
     script = server.render_script(plan)
     assert "demo-app (in-project): api.example.com" in script
     assert "demo-app.build: memory" in script and "internet: none" in script
+
+
+# --------------------------------------------------------------------------- --no-start, systemd, first publish, run-as
+
+def test_no_start_switches_on_nothing_that_runs_jobs(proj, keys, tmp_path):
+    """Item D: a first install next to an existing archive must not start a second schedule."""
+    plan = _plan(proj, keys, tmp_path, start=False)
+    script = server.render_script(plan)
+    enable = [ln for ln in script.splitlines() if "systemctl enable --now -- " in ln and not ln.lstrip().startswith(
+        ("#", "say", "echo"))]
+    assert enable and not any(".job." in ln or ".webhook." in ln for ln in enable), enable
+    assert "made with --no-start" in script
+    (tmp_path / "units").mkdir()
+    res = _run_script(script, tmp_path / "fake")
+    assert res.returncode == 0, res.stderr
+    log = (tmp_path / "fake" / "log").read_text()
+    started = [ln for ln in log.splitlines() if ln.startswith("systemctl enable --now")]
+    assert started and not any(".job." in ln for ln in started), started
+    assert "sudo systemctl enable --now -- mes-demo.job.demo-app.sync.timer" in res.stdout
+    assert "Nothing that runs jobs was switched on" in res.stdout
+    # Without --no-start the timers are switched on, and the last lines say which run.
+    again = server.build_plan(proj, "demo", server_root=str(tmp_path / "srv2"), tools=dict(TOOLS),
+                              key_files=[f"deploy={keys['deploy']}"], signer_files=[str(keys["signer"])],
+                              units_dir=str(tmp_path / "units"))
+    res = _run_script(server.render_script(again), tmp_path / "fake2")
+    assert res.returncode == 0, res.stderr
+    assert any(".job.demo-app.sync.timer" in ln for ln in (tmp_path / "fake2" / "log").read_text().splitlines()
+               if ln.startswith("systemctl enable --now"))
+
+
+def test_an_old_systemd_is_refused(proj, keys, tmp_path, monkeypatch):
+    script = server.render_script(_plan(proj, keys, tmp_path))
+    (tmp_path / "units").mkdir()
+    fake = tmp_path / "fake"
+    fake.mkdir()
+    (fake / "fakes.sh").write_text(FAKES)
+    (fake / "plan.sh").write_text(_harness(script))
+    res = subprocess.run(["bash", "-c", f'FAKE="{fake}"; FAKE_SYSTEMD=245; source "{fake}/fakes.sh"; '
+                          f'source "{fake}/plan.sh"'], capture_output=True, text=True,
+                         env={"PATH": os.environ["PATH"], "HOME": str(fake)})
+    assert res.returncode == 1 and "need 249 or newer" in res.stderr
+
+
+def test_a_tool_the_sandboxes_cannot_see_is_refused(proj, keys, tmp_path):
+    """Finding C: units hide /home, /srv, the rest of /opt and /usr/local, so a tool there would
+    fail on the server; the plan says so first."""
+    tools = dict(TOOLS, uv="/srv/tools/uv")
+    with pytest.raises(Refused) as e:
+        server.build_plan(proj, "demo", server_root=str(tmp_path / "srv"), tools=tools,
+                          key_files=[f"deploy={keys['deploy']}"], signer_files=[str(keys["signer"])],
+                          units_dir=str(tmp_path / "units"))
+    assert e.value.code == "tool_hidden"
+
+
+def test_first_publish_publishes_only_when_nothing_is_published(tmp_path):
+    """Item E: the refresh after the first data publishes; later refreshes never do."""
+    calls = []
+
+    def run_with(current, publish):
+        def run(argv):
+            calls.append(argv[4:])
+            if argv[4:] == ["versions"]:
+                return 0, {"app": "demo", "current": current, "versions": []}
+            return publish
+        return run
+
+    out = server.first_publish("demo", server_root=str(tmp_path), easy_ui="/bin/sh", run=run_with(None, (0, {})))
+    assert out == {"published": True, "first": True} and calls == [["versions"], ["publish"]]
+    calls.clear()
+    out = server.first_publish("demo", server_root=str(tmp_path), easy_ui="/bin/sh", run=run_with(3, (0, {})))
+    assert out["published"] is False and calls == [["versions"]]
+    out = server.first_publish("demo", server_root=str(tmp_path), easy_ui="/bin/sh",
+                               run=run_with(None, (3, {"error": {"code": "no_data", "message": "x"}})))
+    assert out["waiting"] is True and out["status"] == "waiting for first data"
+    with pytest.raises(MesError) as e:
+        server.first_publish("demo", server_root=str(tmp_path), easy_ui="/bin/sh",
+                             run=run_with(None, (1, {"error": {"code": "invalid_spec", "message": "x"}})))
+    assert e.value.code == "publish_failed"
+
+
+def test_run_as_only_prints_the_command(proj, capsys):
+    from mes.cli import run as main
+
+    code = main(["--json", "server", "run-as", "demo", "--project-dir", str(proj), "--", "demo-app", "login"])
+    data = json.loads(capsys.readouterr().out)
+    assert code == 0, data
+    assert data["command"].startswith("sudo systemd-run --pty ") and "-p User=mes-demo" in data["command"]
+    assert data["command"].endswith("/var/lib/mes/demo/code/current/project/.venv/bin/demo-app login")
+    code = main(["--json", "server", "run-as", "demo", "--project-dir", str(proj), "--", "rm", "-rf"])
+    assert code != 0

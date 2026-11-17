@@ -30,7 +30,7 @@ uv run mes jobs run <name>-main.rebuild  # fills the shared table the dashboard 
 uv run mes dev                           # one link to the dashboard, on this computer only
 ```
 
-`mes dev` needs easy-ui (my-easy-ui). It runs `mes apps sync`, shows the sample data until the
+`mes dev` needs easy-ui (**my-easy-ui**). It runs `mes apps sync`, shows the sample data until the
 project has its own database, rebuilds the dashboard data when it changes, and reports mistakes in
 `project.toml` and `app.toml` as you save. Stop it with Ctrl-C.
 

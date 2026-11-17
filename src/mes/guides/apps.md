@@ -28,6 +28,7 @@ folder = "walks"               # its own folder inside the project's data folder
 writes = ["activities"]        # shared tables of project.toml it adds rows to (see: mes guide share-data)
 tables = ["walks_log"]         # its own tables; they start with its prefix "walks_"
 rebuild = "rebuild"            # the command that rebuilds what it wrote, from its own files
+no_backup = ["data/walks/.login.json"]  # files mes backup leaves out, such as a saved login (see: mes guide backup)
 
 [jobs.rebuild]                 # its jobs; their ids are "fitlab-walks.rebuild" (see: mes guide jobs)
 run = "rebuild"
@@ -80,9 +81,10 @@ own program. `<project> <short> <command>` runs a command of that app (`fitlab w
 `<project> describe`, `<project> guide` and `<project> apps` describe the whole project. With one
 app, `<project> <command>` works too (with a note). See `mes guide add-app` to add one.
 
-## From the old one-file form
+## What installing an app means
 
-`project.toml` with `[apps.<name>]`, `[jobs.<name>]` or `[ui] data = "..."` is refused with a plain
-message. Move each app into `apps/<package>/` with an `app.toml`, move its jobs into that file
-(drop the app's name from `run`), list the packages under `[project] apps`, and declare shared
-tables under `[tables]`. Then run `uv sync` and `mes apps sync`.
+An app's code runs as the project's own account, inside the project's sandboxes: its jobs, the
+gate's requests, `describe`, the dashboard data refresh. There it can read and write the project's
+data and state within its jobs' limits (network hosts, memory, time, `writes`); it cannot change
+the deployed code, reach other projects, the gate's records or the dashboard sign-in, or gain
+root. Install only apps you would run yourself, and tell the user so in plain words.

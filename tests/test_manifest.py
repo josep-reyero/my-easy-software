@@ -1,4 +1,4 @@
-"""project.toml and app.toml: parsing, the plain migration errors, composition, and the lock."""
+"""project.toml and app.toml: parsing, plain errors, composition, and the lock."""
 
 import hashlib
 import json
@@ -144,32 +144,21 @@ def test_defaults_title_and_version():
     assert pf.title == "ab" and pf.version == "0.0.0" and pf.tables == {} and pf.ui is None
 
 
-# The plain-language migration errors (contract section 1.6).
+# Keys that belong elsewhere get the plain unknown-key message, with advice on where they go.
 
 
-def test_old_apps_section_is_refused_with_a_migration_message():
-    err = _err('[project]\nname = "fitdata"\n[apps.fitdata]\ncli = "fitdata"\n')
-    assert err.message == ("project.toml still has the old [apps.fitdata] section. Apps are now Python packages, each "
-                           "with its own app.toml, and the project lists them under [project] apps. The project cannot "
-                           "be used until this is changed.")
-    assert err.hint == ('Move the app into apps/fitdata/ with an app.toml (see: mes guide apps), write apps = '
-                        '["fitdata"] under [project], and remove [apps.fitdata].')
+@pytest.mark.parametrize("text, key, advice", [
+    ('[project]\nname = "fitdata"\napps = ["fitdata_garmin"]\n[apps.fitdata]\ncli = "fitdata"\n', "apps",
+     "listed by package name under [project] apps"),
+    ('[project]\nname = "x1"\napps = ["x1_a"]\n[jobs.sync]\nrun = "sync"\nmanual = true\n', "jobs",
+     "Jobs belong in an app's app.toml"),
+    ('[project]\nname = "fit"\napps = ["fit_a"]\n[ui]\ndata = "fit.sqlite"\n', "data",
+     "one shared database"),
+])
+def test_keys_that_belong_elsewhere_are_unknown_with_advice(text, key, advice):
+    err = _err(text)
+    assert f'does not know: "{key}"' in err.message and advice in (err.hint or "")
     assert err.exit_code == 1
-
-
-def test_old_jobs_section_is_refused_with_a_migration_message():
-    err = _err('[project]\nname = "x1"\napps = ["x1_a"]\n[jobs.sync]\nrun = "x1 sync"\nmanual = true\n')
-    assert err.message == ("project.toml still has [jobs.sync]. Jobs now belong to the app that runs them, in its "
-                           "app.toml, so they are no longer read here.")
-    assert err.hint == ("Move the job to [jobs.sync] in the app's app.toml and drop the app's name from its run line. "
-                        "To change a schedule from the project, use [settings.<app>].")
-
-
-def test_old_ui_data_is_refused():
-    err = _err('[project]\nname = "fit"\napps = ["fit_a"]\n[ui]\ndata = "fit.sqlite"\n')
-    assert err.message == ("[ui] data is no longer used: every project has one shared database, fit.sqlite, in its "
-                           "data folder.")
-    assert err.hint == "Remove the data line from [ui]."
 
 
 def test_missing_apps_list():
@@ -840,3 +829,37 @@ def test_a_job_can_be_named_with_the_apps_short_name(tmp_path):
                        'manual = true\n'})
     assert p.job("rides.rebuild").id == "trail-rides.rebuild"
     assert p.job("trail-rides.rebuild").id == "trail-rides.rebuild"
+
+
+# --------------------------------------------------------------------------- what backups leave out
+
+_BK_PROJECT = '[project]\nname = "bk"\napps = ["bk_main"]\n'
+
+
+def _bk_app(no_backup: str) -> str:
+    return f'[app]\nname = "bk-main"\ncommand = "bk-main"\n[data]\nno_backup = {no_backup}\n'
+
+
+def test_no_backup_and_backup_exclude_are_read(tmp_path):
+    p = helpers.load(tmp_path / "bk", _BK_PROJECT + '[backup]\nexclude = ["state/cache/*.tmp"]\n',
+                     {"bk_main": _bk_app('["data/.state/tokens.json", "data/main/*.lock"]')})
+    assert p.backup_exclude == ("state/cache/*.tmp",)
+    assert p.apps["bk-main"].data.no_backup == ("data/.state/tokens.json", "data/main/*.lock")
+    assert p.apps["bk-main"].data.to_dict()["no_backup"] == ["data/.state/tokens.json", "data/main/*.lock"]
+
+
+@pytest.mark.parametrize("entry", ["/data/x", "data/../x", "data//x", "x/y", "data", "data/**/x", "data/a?b",
+                                   "data/.", "store/x", "data/x/"])
+def test_paths_backups_leave_out_are_checked(tmp_path, entry):
+    with pytest.raises(ManifestError, match="no_backup"):
+        helpers.load(tmp_path / "bk", _BK_PROJECT, {"bk_main": _bk_app(json.dumps([entry]))})
+    with pytest.raises(ManifestError, match="exclude"):
+        manifest.loads(_BK_PROJECT + f"[backup]\nexclude = {json.dumps([entry])}\n")
+
+
+def test_backup_section_takes_only_exclude():
+    with pytest.raises(ManifestError, match='does not know: "exclud"') as e:
+        manifest.loads(_BK_PROJECT + '[backup]\nexclud = ["data/x"]\n')
+    assert "Did you mean" in (e.value.hint or "")
+    with pytest.raises(ManifestError, match="more than once"):
+        manifest.loads(_BK_PROJECT + "[backup]\nexclude = " + json.dumps([f"data/x{i}" for i in range(33)]) + "\n")

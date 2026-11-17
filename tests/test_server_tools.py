@@ -53,14 +53,20 @@ def _program(path: Path, text: str, mode: int = 0o755) -> Path:
     return path
 
 
-def _mes_tree(root: Path, *, version: str = server.__version__, isolated: bool = True) -> tuple[Path, Path]:
+BUILD = "0123456789abcdef"
+
+
+def _mes_tree(root: Path, *, version: str = server.__version__, isolated: bool = True, build: str = BUILD,
+              editable: bool = False) -> tuple[Path, Path]:
     venv = root / "opt" / "mes" / "venv"
-    lib = venv / "lib" / "mes"
+    lib = (root / "opt" / "mes" / "src" / "mes") if editable else venv / "lib" / "mes"
     lib.mkdir(parents=True)
+    (venv / "bin").mkdir(parents=True, exist_ok=True)
     (lib / "__init__.py").write_text("")
     (venv / "pyvenv.cfg").write_text(f"home = /usr/bin\ninclude-system-site-packages = {'false' if isolated else 'true'}\n")
     py = _program(venv / "bin" / "python", "#!/bin/sh\n"
                   f'if [ "$*" = "-I -m mes --version" ]; then echo "mes {version}"; exit 0; fi\n'
+                  f'case "$3" in *buildinfo*) echo "{build}"; exit 0 ;; esac\n'
                   f'if [ "$1" = -I ] && [ "$2" = -c ]; then echo "{lib}"; exit 0; fi\n'
                   "exit 1\n")
     mes = _program(venv / "bin" / "mes", f"#!{py}\nimport mes\n")
@@ -68,7 +74,11 @@ def _mes_tree(root: Path, *, version: str = server.__version__, isolated: bool =
 
 
 def _check(root: Path, call: str) -> subprocess.CompletedProcess[str]:
-    script = (FAKE_STAT + server._PRELUDE.replace("PATH=/usr/sbin:/usr/bin:/sbin:/bin", "")
+    prelude = server._PRELUDE.replace("PATH=/usr/sbin:/usr/bin:/sbin:/bin", "")
+    # The tools of these tests live in <test folder>/opt, which stands in for /opt/mes.
+    prelude = prelude.replace("for r in /usr /bin /sbin /lib /lib64 /opt/mes; do",
+                              f"for r in /usr /bin /sbin /lib /lib64 /opt/mes {root / 'opt'}; do")
+    script = (FAKE_STAT + prelude
               + f"\nMES_ROOT={root / 'srv'}\n{call}\necho CHECKED\n")
     return subprocess.run(["bash", "-c", script], capture_output=True, text=True,
                           env={"PATH": os.environ["PATH"], "TESTROOT": str(root)})
@@ -76,25 +86,25 @@ def _check(root: Path, call: str) -> subprocess.CompletedProcess[str]:
 
 def test_a_well_installed_mes_passes(root):
     mes, py = _mes_tree(root)
-    res = _check(root, f"check_mes {mes} {py} {server.__version__}")
+    res = _check(root, f"check_mes {mes} {py} {server.__version__} {BUILD}")
     assert res.returncode == 0 and "CHECKED" in res.stdout, res.stderr
 
 
 def test_uv_long_path_trampoline_is_followed_to_the_real_python(root):
     mes, py = _mes_tree(root)
     _program(mes, f"#!/bin/sh\n'''exec' '{py}' \"$0\" \"$@\"\n' '''\nimport mes\n")
-    res = _check(root, f"check_mes {mes} {py} {server.__version__}")
+    res = _check(root, f"check_mes {mes} {py} {server.__version__} {BUILD}")
     assert res.returncode == 0, res.stderr
     other = _program(root / "opt" / "other" / "python", "#!/bin/sh\nexit 0\n")
     _program(mes, f"#!/bin/sh\n'''exec' '{other}' \"$0\" \"$@\"\n' '''\n")
-    res = _check(root, f"check_mes {mes} {py} {server.__version__}")
+    res = _check(root, f"check_mes {mes} {py} {server.__version__} {BUILD}")
     assert res.returncode == 1 and "the plan expects" in res.stderr
 
 
 def test_a_folder_others_can_change_on_the_way_is_refused(root):
     mes, py = _mes_tree(root)
     (root / "opt" / "mes").chmod(0o777)
-    res = _check(root, f"check_mes {mes} {py} {server.__version__}")
+    res = _check(root, f"check_mes {mes} {py} {server.__version__} {BUILD}")
     assert res.returncode == 1 and "can be changed by other accounts" in res.stderr
 
 
@@ -125,13 +135,13 @@ def test_a_tool_the_project_cannot_run_or_read_is_refused(root):
 
 def test_a_python_with_system_packages_is_refused(root):
     mes, py = _mes_tree(root, isolated=False)
-    res = _check(root, f"check_mes {mes} {py} {server.__version__}")
+    res = _check(root, f"check_mes {mes} {py} {server.__version__} {BUILD}")
     assert res.returncode == 1 and "not an isolated virtual environment" in res.stderr
 
 
 def test_a_different_mes_version_is_refused(root):
     mes, py = _mes_tree(root, version="0.0.1")
-    res = _check(root, f"check_mes {mes} {py} {server.__version__}")
+    res = _check(root, f"check_mes {mes} {py} {server.__version__} {BUILD}")
     assert res.returncode == 1 and "runs mes 0.0.1" in res.stderr
 
 
@@ -140,3 +150,43 @@ def test_the_interpreter_of_a_script_is_checked_too(root):
     py.parent.chmod(0o777)
     res = _check(root, f"check_tool mes {mes}")
     assert res.returncode == 1 and "can be changed by other accounts" in res.stderr
+
+
+def test_another_build_of_the_same_version_is_refused(root):
+    """Item I: __version__ is the same for every commit, so the plan also names the build."""
+    mes, py = _mes_tree(root, build="fedcba9876543210")
+    res = _check(root, f"check_mes {mes} {py} {server.__version__} {BUILD}")
+    assert res.returncode == 1 and "runs build fedcba9876543210" in res.stderr
+
+
+def test_an_editable_mes_is_refused(root):
+    mes, py = _mes_tree(root, editable=True)
+    res = _check(root, f"check_mes {mes} {py} {server.__version__} {BUILD}")
+    assert res.returncode == 1 and "installed as editable" in res.stderr
+
+
+def test_a_tool_the_services_cannot_see_is_refused(root):
+    """Finding C: the units hide everything but /usr, /bin, /lib and /opt/mes."""
+    tool = _program(root / "elsewhere" / "uv", "#!/bin/sh\nexit 0\n")
+    res = _check(root, f"check_tool uv {tool}")
+    assert res.returncode == 1 and "only see programs in /usr" in res.stderr
+
+
+def test_the_locked_install_layout_passes(root):
+    """Item I: a clone at /opt/mes/my-easy-software with 'uv sync --locked --no-editable' and a link
+    in /usr/local/bin (here under the test folder): mes's code sits in the environment's lib/."""
+    venv = root / "opt" / "my-easy-software" / ".venv"
+    lib = venv / "lib" / "python3.13" / "site-packages" / "mes"
+    lib.mkdir(parents=True)
+    (lib / "__init__.py").write_text("")
+    (venv / "pyvenv.cfg").write_text("home = /usr/bin\ninclude-system-site-packages = false\n")
+    py = _program(venv / "bin" / "python", "#!/bin/sh\n"
+                  f'if [ "$*" = "-I -m mes --version" ]; then echo "mes {server.__version__}"; exit 0; fi\n'
+                  f'case "$3" in *buildinfo*) echo "{BUILD}"; exit 0 ;; esac\n'
+                  f'if [ "$1" = -I ] && [ "$2" = -c ]; then echo "{lib}"; exit 0; fi\nexit 1\n')
+    real = _program(venv / "bin" / "mes", f"#!{py}\nimport mes\n")
+    link = root / "opt" / "bin" / "mes"
+    link.parent.mkdir(parents=True)
+    link.symlink_to(real)
+    res = _check(root, f"check_mes {link} {py} {server.__version__} {BUILD}")
+    assert res.returncode == 0 and "CHECKED" in res.stdout, res.stderr

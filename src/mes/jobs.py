@@ -13,7 +13,6 @@ Commands (``--project-dir DIR``; default: the project in the current folder)
                                     when exactly one app has a job of that name.
 ``mes jobs log [--job J] [--limit N] [--verify]``  recent runs; ``--verify`` checks the hash chain.
 ``mes jobs status``                 last run of each job on this computer (read).
-``mes jobs install``                only says where scheduling moved: ``mes server plan``.
 
 Used by the system units on a server (admin; they run as root, take only names as arguments
 and read nothing from the project's files):
@@ -28,7 +27,13 @@ and read nothing from the project's files):
     addresses (local-network ones only for ``--local`` hosts; never this computer, link-local or
     multicast), writes the job's own hosts file and sets the job unit's ``IPAddressAllow=`` to
     exactly those addresses (the job unit itself has ``IPAddressDeny=any``). No name server is
-    opened to the job.
+    opened to the job. ``--selftest`` is the helper of the host-list self-test probe: its one host
+    (``units.SELFTEST_HOST``) gets the documentation address ``units.SELFTEST_ADDRESS`` without a
+    lookup.
+``mes jobs should-run --project P --server-root R -- <job id>...``
+    before a job that waits for another (``ExecCondition=+``): asks systemd how the job that
+    finished last of those ended; exit 0 lets this run start, exit 1 skips it (that job failed,
+    was itself skipped, or stopped with exit code 75, "a temporary problem").
 
 Run log
 -------
@@ -39,7 +44,10 @@ One JSON object per line, per run::
 ``app`` is the app's name and ``job`` the job id.
 
 ``result`` uses systemd's words: ``success``, ``exit-code``, ``timeout``, ``signal``,
-``start-failed`` (and whatever else systemd reports). ``prev`` is the SHA-256 (hex) of the
+``start-failed`` (and whatever else systemd reports), plus ``skipped``: the job stopped with exit
+code 75 (``TEMPORARY_EXIT``, "a temporary problem, try again later"; the units count it as a
+success with ``SuccessExitStatus=75``, so ``systemctl --failed`` stays meaningful) or was not
+started because the job before it was skipped. Jobs that wait for a skipped run do not start. ``prev`` is the SHA-256 (hex) of the
 previous line's exact bytes, without its newline; the first record uses ``GENESIS`` (64 zeros).
 Changing or removing any line other than the last breaks the chain, and ``mes jobs log
 --verify`` says where. The chain alone has no key, so on a personal computer it shows mistakes,
@@ -468,6 +476,8 @@ def _run_one(root: Path, project: Project, job: Job, exe: list[str], via: str = 
                     exit_code = proc.returncode
                     if exit_code == 0:
                         result = "success"
+                    elif exit_code == TEMPORARY_EXIT:
+                        result = "skipped"
                     elif exit_code < 0:
                         result, exit_code = "signal", None
                     else:
@@ -641,6 +651,8 @@ def run_job(root: Path, project: Project, job_name: str, *, chain: bool = True) 
 
 
 _INVOCATION_RE = re.compile(r"^[0-9a-f]{32}\Z")
+# The framework's own "a temporary problem, try again later" exit code.
+TEMPORARY_EXIT = 75
 
 
 def _is_linux() -> bool:
@@ -702,6 +714,8 @@ def record_systemd_run(project_name: str, job_name: str, server_root: str | Path
         result = "unknown"
     code, status = props.get("ExecMainCode"), props.get("ExecMainStatus", "")
     exit_code = int(status) if code == "1" and status.isdigit() else None  # 1 = CLD_EXITED
+    if (result == "success" and exit_code == TEMPORARY_EXIT) or result == "exec-condition":
+        result = "skipped"  # a temporary problem (SuccessExitStatus=75), or the job before it was skipped
     duration = None
     try:
         start = int(props.get("ExecMainStartTimestampMonotonic", ""))
@@ -743,6 +757,43 @@ def record_systemd_run(project_name: str, job_name: str, server_root: str | Path
     })
     write_head(log)
     return {k: rec[k] for k in ("time", "job", "result", "exit_code", "duration_s")}
+
+
+def should_run(project_name: str, upstream: Sequence[str], *, server_root: str | Path,
+               show: Callable[..., dict[str, str]] | None = None) -> dict[str, Any]:
+    """Called as root by systemd (``ExecCondition=+``) before a job that waits for another, or
+    before the dashboard refresh. Of the listed jobs, the one that finished last started this
+    run; it may go ahead only if that one really succeeded (not exit code 75, not skipped)."""
+    paths.server_layout(project_name, server_root)  # checks the project name
+    if not upstream:
+        raise UsageError("No job was named.", hint="Name the jobs after --.")
+    for job in upstream:
+        if not manifest_mod.JOB_ID_RE.fullmatch(job or ""):
+            raise UsageError(f"{str(job)[:70]!r} is not a job id.", hint="Use the job's id: <app>.<job>.")
+    if show is None and not _is_linux():
+        raise _not_from_systemd()
+    look = show or _show
+    latest: tuple[int, str, dict[str, str]] | None = None
+    for job in upstream:
+        props = look(units.job_unit(project_name, job), "Result", "ExecMainCode", "ExecMainStatus",
+                     "InactiveEnterTimestampMonotonic")
+        try:
+            when = int(props.get("InactiveEnterTimestampMonotonic", "0") or 0)
+        except ValueError:
+            when = 0
+        if latest is None or when > latest[0]:
+            latest = (when, job, props)
+    assert latest is not None
+    _, job, props = latest
+    temporary = props.get("ExecMainCode") == "1" and props.get("ExecMainStatus") == str(TEMPORARY_EXIT)
+    if props.get("Result") != "success" or temporary:
+        raise MesError(
+            f'The job "{job}" that started this one did not finish its work'
+            + (" (it stopped for a temporary problem and counts as skipped)" if temporary else
+               f" (systemd says: {str(props.get('Result') or 'unknown')[:40]})")
+            + ", so this run is skipped too.",
+            hint="It runs again after the next successful run of that job.", code="upstream_skipped")
+    return {"run": True, "after": job}
 
 
 HEAD_SUFFIX = ".head"
@@ -834,10 +885,13 @@ def resolve_hosts(hosts: Sequence[str], *, resolver: Callable[..., Any] | None =
     return found
 
 
-def _write_hosts_file(path: str, unit: str, found: dict[str, list[str]]) -> None:
+def _write_hosts_file(path: str, unit: str, found: dict[str, list[str]], *, selftest: bool = False) -> None:
     m = _HOSTS_FILE_RE.fullmatch(path or "")
     u = units.JOB_UNIT_RE.fullmatch(unit)
-    if not m or not u or m.group("project", "app", "job") != u.group("project", "app", "job"):
+    s = _SELFTEST_UNIT_RE.fullmatch(unit) if selftest else None
+    if s is not None and path == units.selftest_hosts_file(s.group("project")):
+        pass
+    elif not m or not u or m.group("project", "app", "job") != u.group("project", "app", "job"):
         raise UsageError(f"{str(path)[:80]!r} is not the hosts file of {unit}.",
                          hint="Use /run/mes-<project>-net/<app>.<job>/hosts")
     lines = ["# Written by mes jobs allow-network before each run: the only names this job can look up.",
@@ -854,16 +908,27 @@ def _write_hosts_file(path: str, unit: str, found: dict[str, list[str]]) -> None
     os.replace(tmp, target)
 
 
+_SELFTEST_UNIT_RE = re.compile(r"^mes-(?P<project>[a-z][a-z0-9-]{1,30})\.selftest-net\.service\Z")
+
+
 def allow_network(unit: str, hosts: Sequence[str], *, resolver: Callable[..., Any] | None = None,
                   local: Sequence[str] = (), hosts_file: str | None = None,
-                  run: Callable[..., Any] | None = None) -> dict[str, Any]:
-    if not isinstance(unit, str) or not units.JOB_UNIT_RE.fullmatch(unit):
+                  run: Callable[..., Any] | None = None, selftest: bool = False) -> dict[str, Any]:
+    if selftest:
+        m = _SELFTEST_UNIT_RE.fullmatch(unit) if isinstance(unit, str) else None
+        if not m or list(hosts) != [units.SELFTEST_HOST] or local or \
+                hosts_file not in (None, units.selftest_hosts_file(m.group("project"))):
+            raise UsageError("The self-test helper only allows its one test address to the self-test probe.",
+                             hint=f"Use: --selftest --unit mes-<project>.selftest-net.service -- {units.SELFTEST_HOST}")
+        found = {units.SELFTEST_HOST: [units.SELFTEST_ADDRESS]}
+    elif not isinstance(unit, str) or not units.JOB_UNIT_RE.fullmatch(unit):
         raise UsageError(f"{str(unit)[:80]!r} is not the unit of a mes job.", hint="Use mes-<project>.job.<app>.<job>.service")
     if not hosts:
         raise UsageError("No hosts were given, so nothing would be allowed.", hint="List the job's hosts after --.")
     if any(h not in hosts for h in local):
         raise UsageError("A --local host is not in the list of hosts.", hint="List it after -- as well.")
-    found = resolve_hosts(hosts, resolver=resolver, local=local)
+    if not selftest:
+        found = resolve_hosts(hosts, resolver=resolver, local=local)
     addresses = list(dict.fromkeys(a for addrs in found.values() for a in addrs))
     if not addresses:
         raise TemporaryFailure(
@@ -874,7 +939,7 @@ def allow_network(unit: str, hosts: Sequence[str], *, resolver: Callable[..., An
             code="dns_failed",
         )
     if hosts_file is not None:
-        _write_hosts_file(hosts_file, unit, found)
+        _write_hosts_file(hosts_file, unit, found, selftest=selftest)
     # No name servers are opened: the job's own hosts file is its only name lookup.
     argv = ["systemctl", "set-property", "--runtime", unit, "IPAddressAllow=", "IPAddressAllow=" + " ".join(addresses)]
     runner = run or (lambda a: subprocess.run(a, capture_output=True, text=True, timeout=60, check=False,
@@ -1003,6 +1068,7 @@ def _cmd_log(args: argparse.Namespace) -> Any:
 
 _RESULT_WORDS = {
     "success": "worked",
+    "skipped": "skipped: a temporary problem (it runs again next time)",
     "exit-code": "failed",
     "timeout": "stopped: took too long",
     "signal": "stopped by the system",
@@ -1039,16 +1105,6 @@ def _cmd_status(args: argparse.Namespace) -> Any:
     return text + "\n\nThese are the runs on this computer. Scheduled runs happen on a server set up with: mes server plan"
 
 
-def _cmd_install(args: argparse.Namespace) -> Any:
-    raise MesError(
-        "Scheduled jobs now run as system services under the project's own accounts on a Linux server, so "
-        "'mes jobs install' no longer installs anything for your own account.",
-        hint="Run 'mes server plan <project>' on the server: it writes one readable script that you run once "
-        "with sudo, and 'mes server check <project>' confirms the result. See: mes guide server",
-        code="moved",
-    )
-
-
 def _cmd_record(args: argparse.Namespace) -> Any:
     check_allowed("write")
     return record_systemd_run(args.project, args.job, args.server_root)
@@ -1056,7 +1112,12 @@ def _cmd_record(args: argparse.Namespace) -> Any:
 
 def _cmd_allow_network(args: argparse.Namespace) -> Any:
     check_allowed("admin")
-    return allow_network(args.unit, args.hosts, local=args.local, hosts_file=args.hosts_file)
+    return allow_network(args.unit, args.hosts, local=args.local, hosts_file=args.hosts_file, selftest=args.selftest)
+
+
+def _cmd_should_run(args: argparse.Namespace) -> Any:
+    check_allowed("read")
+    return should_run(args.project, args.jobs, server_root=args.server_root)
 
 
 def _project_dir_arg(p: argparse.ArgumentParser) -> None:
@@ -1102,9 +1163,6 @@ def register(subparsers: Any) -> None:
     _project_dir_arg(p)
     p.set_defaults(func=_cmd_status)
 
-    p = sub.add_parser("install", help="(Moved) Scheduling now happens on a server: see 'mes server plan'.")
-    p.set_defaults(func=_cmd_install, _accept_extra=True)
-
     p = sub.add_parser("record", help="(Used by the server's system units after each run.) Add the run to the log.")
     p.add_argument("--project", required=True, help="the project's name")
     p.add_argument("--server-root", required=True, metavar="DIR", help="the server folder, /var/lib/mes")
@@ -1118,5 +1176,14 @@ def register(subparsers: Any) -> None:
                    help="the job's own hosts file, /run/mes-<project>-net/<app>.<job>/hosts")
     p.add_argument("--local", action="append", default=[], metavar="HOST",
                    help="a host that may be on the local network (local_network in the app's app.toml)")
+    p.add_argument("--selftest", action="store_true",
+                   help="the self-test probe's helper: allow only its one documentation address")
     p.add_argument("hosts", nargs="+", help="the host names the job may reach")
     p.set_defaults(func=_cmd_allow_network)
+
+    p = sub.add_parser("should-run", help="(Used by the server's system units before a job that waits for another.) "
+                       "Skip this run when that job did not really succeed.")
+    p.add_argument("--project", required=True, help="the project's name")
+    p.add_argument("--server-root", required=True, metavar="DIR", help="the server folder, /var/lib/mes")
+    p.add_argument("jobs", nargs="+", help="the ids of the jobs this one waits for")
+    p.set_defaults(func=_cmd_should_run)

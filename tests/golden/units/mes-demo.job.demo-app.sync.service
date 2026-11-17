@@ -14,13 +14,16 @@ OnSuccess=mes-demo.job.demo-app.build.service
 Type=oneshot
 User=mes-demo
 Group=mes-demo
+# Exit code 75 means "a temporary problem, try again later": the run counts as skipped, not
+# failed, and the jobs that wait for this one do not start.
+SuccessExitStatus=75
 # First the shared database is brought in line with project.toml, by mes itself, as this
 # account, with an empty environment and Python's isolated mode.
-ExecStartPre="/usr/bin/env" "-i" "PATH=/usr/bin:/bin" "LANG=C.UTF-8" "HOME=/nonexistent" "MES_CONFIG=/nonexistent" "PYTHONDONTWRITEBYTECODE=1" "MES_PROJECT=demo" "MES_DATA_DIR=/var/lib/mes/demo/data" "MES_STATE_DIR=/var/lib/mes/demo/state" "MES_STORE_DIR=/var/lib/mes/demo/store" "MES_PROJECT_DIR=/var/lib/mes/demo/code/current/project" "MES_ALLOW=write" "/opt/mes/tools/my-easy-software/bin/python" "-I" "-m" "mes" "db" "sync" "--quiet" "--project-dir" "/var/lib/mes/demo/code/current/project"
+ExecStartPre="/usr/bin/env" "-i" "PATH=/usr/bin:/bin" "LANG=C.UTF-8" "HOME=/nonexistent" "MES_CONFIG=/nonexistent" "PYTHONDONTWRITEBYTECODE=1" "MES_PROJECT=demo" "MES_DATA_DIR=/var/lib/mes/demo/data" "MES_STATE_DIR=/var/lib/mes/demo/state" "MES_STORE_DIR=/var/lib/mes/demo/store" "MES_PROJECT_DIR=/var/lib/mes/demo/code/current/project" "MES_ALLOW=write" "/opt/mes/my-easy-software/.venv/bin/python" "-I" "-m" "mes" "db" "sync" "--quiet" "--project-dir" "/var/lib/mes/demo/code/current/project"
 ExecStart="/var/lib/mes/demo/code/current/project/.venv/bin/demo-app" "--json" "sync" "--days" "3"
 # Root records the run with an empty environment and Python's isolated mode: nothing the
 # job can write reaches it.
-ExecStopPost=+"/usr/bin/env" "-i" "PATH=/usr/bin:/bin" "LANG=C.UTF-8" "/opt/mes/tools/my-easy-software/bin/python" "-I" "-m" "mes" "jobs" "record" "--project" "demo" "--server-root" "/var/lib/mes" "demo-app.sync"
+ExecStopPost=+"/usr/bin/env" "-i" "PATH=/usr/bin:/bin" "LANG=C.UTF-8" "/opt/mes/my-easy-software/.venv/bin/python" "-I" "-m" "mes" "jobs" "record" "--project" "demo" "--server-root" "/var/lib/mes" "demo-app.sync"
 WorkingDirectory=/var/lib/mes/demo/code/current/project
 Environment="MES_PROJECT=demo"
 Environment="MES_DATA_DIR=/var/lib/mes/demo/data"
@@ -45,6 +48,7 @@ ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
 DevicePolicy=closed
+PrivateIPC=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes
@@ -65,15 +69,20 @@ SystemCallFilter=~@privileged @resources
 SystemCallErrorNumber=EPERM
 LimitCORE=0
 TasksMax=256
+TemporaryFileSystem=/var:ro /run:ro /opt:ro /usr/local:ro
+BindReadOnlyPaths=-/opt/mes -/usr/local/bin -/usr/local/lib -/usr/local/lib64
+InaccessiblePaths=-/srv -/mnt -/media -/boot -/efi
+InaccessiblePaths=-/etc/shadow -/etc/shadow- -/etc/gshadow -/etc/gshadow- -/etc/sudoers -/etc/sudoers.d -/etc/ssh -/etc/ssl/private -/etc/pki/tls/private -/etc/letsencrypt -/etc/credstore -/etc/credstore.encrypted -/etc/NetworkManager -/etc/wireguard -/etc/systemd/network -/etc/netctl -/etc/wpa_supplicant -/etc/iwd -/etc/openvpn -/etc/ppp -/etc/ipsec.d -/etc/ipsec.secrets -/etc/krb5.keytab -/etc/docker -/etc/containers -/etc/tailscale -/etc/libvirt -/etc/samba -/etc/cups -/etc/polkit-1 -/etc/security -/etc/crypttab
 # Of all the projects' folders, only these of this project are there (read-only unless listed
 # as writable); other projects, the sign-in folder and the gate's own folder are not.
-TemporaryFileSystem=/var/lib/mes:ro
 BindReadOnlyPaths=/var/lib/mes/demo/code
 BindPaths=/var/lib/mes/demo/data /var/lib/mes/demo/store /var/lib/mes/demo/state
 ReadWritePaths=/var/lib/mes/demo/data /var/lib/mes/demo/store /var/lib/mes/demo/state
+InaccessiblePaths=-/var/lib/mes/demo/etc/webhook.key -/var/lib/mes/demo/code/incoming -/var/lib/mes/demo/code/uv-cache
 # The job's own /etc/hosts, written just before the run: the only names it can look up. It has
 # no DNS server and no access to the system's name service.
 BindReadOnlyPaths=/run/mes-demo-net/demo-app.sync/hosts:/etc/hosts
-InaccessiblePaths=-/run/mes-demo-gate -/var/lib/mes/demo/etc/webhook.key -/run/systemd/resolve -/run/dbus
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# It shares the server's network (where other programs' abstract unix sockets live), so it
+# cannot open unix sockets at all; socket pairs inside the job still work.
+RestrictAddressFamilies=AF_INET AF_INET6
 IPAddressDeny=any

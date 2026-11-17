@@ -559,3 +559,123 @@ def test_rename_never_replaces(tmp_path):
     finally:
         os.close(fa)
         os.close(fb)
+
+
+# --------------------------------------------------------------------------- left out on purpose
+
+APP_TOML = ('[app]\nname = "keeper-app"\ncommand = "keeper-app"\n[data]\nfolder = "app"\n'
+            'no_backup = ["data/.state/login.json"]\n')
+
+
+@pytest.fixture
+def with_login(project):
+    """An in-project app that keeps a saved login (a harmless stand-in file) at the top of the
+    data folder and says so in [data] no_backup; the project also leaves a state cache out."""
+    (project / "apps" / "keeper_app").mkdir(parents=True)
+    (project / "apps" / "keeper_app" / "app.toml").write_text(APP_TOML)
+    (project / "project.toml").write_text(PROJECT_TOML + '\n[backup]\nexclude = ["state/cache/*.tmp"]\n')
+    data, state = paths.project_data_dir("keeper"), paths.project_state_dir("keeper")
+    (data / ".state").mkdir()
+    (data / ".state" / "login.json").write_text('{"stand-in": "login"}\n')
+    (data / ".state" / "sync.json").write_text('{"cursor": 1}\n')
+    (state / "cache").mkdir()
+    (state / "cache" / "a.tmp").write_text("scratch\n")
+    (state / "cache" / "keep.json").write_text("{}\n")
+    return project
+
+
+def test_backup_leaves_out_what_the_app_and_project_say(with_login, tmp_path):
+    code, out = run("backup", "--project-dir", str(with_login), "--to", str(tmp_path / "b"))
+    assert code == 0, out
+    names = {n for n, *_ in archive.read_members(out["archive"])}
+    assert "data/.state/login.json" not in names and "state/cache/a.tmp" not in names
+    assert {"data/.state/sync.json", "state/cache/keep.json"} <= names
+    left = {e["path"]: e for e in out["excluded"]}
+    assert left["data/.state/login.json"]["from"] == "the app keeper-app ([data] no_backup)"
+    assert left["state/cache/a.tmp"]["rule"] == "state/cache/*.tmp"
+    assert any("sign in to those apps again" in n for n in out["notes"])
+    rules = backup.verify_archive(out["archive"])["info"]["left_out_rules"]
+    assert {"rule": "data/.state/login.json", "from": "the app keeper-app ([data] no_backup)"} in rules
+
+
+def test_lock_files_and_sqlite_side_files_are_always_left_out(project, tmp_path):
+    import sqlite3
+
+    data = paths.project_data_dir("keeper")
+    (data / "raw" / "sync.lock").write_text("")
+    # An app's own database in WAL mode, with rows only in its -wal file while a reader is open.
+    db = data / "raw" / "index.sqlite"
+    conn = sqlite3.connect(db)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA wal_autocheckpoint=0")
+    conn.execute("CREATE TABLE t (x)")
+    conn.executemany("INSERT INTO t VALUES (?)", [(i,) for i in range(50)])
+    conn.commit()
+    assert (data / "raw" / "index.sqlite-wal").stat().st_size > 0
+    try:
+        code, out = run("backup", "--project-dir", str(project), "--to", str(tmp_path / "b"))
+    finally:
+        conn.close()
+    assert code == 0, out
+    names = {n for n, *_ in archive.read_members(out["archive"])}
+    assert not {"data/raw/sync.lock", "data/raw/index.sqlite-wal", "data/raw/index.sqlite-shm"} & names
+    assert "data/raw/index.sqlite" in names
+    # The copy holds every committed row although the -wal file was left out.
+    out_dir = tmp_path / "x"
+    out_dir.mkdir()
+    for name, kind, _mode, _size, chunks in archive.read_members(out["archive"]):
+        if name == "data/raw/index.sqlite":
+            (out_dir / "i.sqlite").write_bytes(b"".join(chunks))
+        else:
+            for _ in chunks:
+                pass
+    check = sqlite3.connect(out_dir / "i.sqlite")
+    assert check.execute("SELECT count(*) FROM t").fetchone() == (50,)
+    check.close()
+
+
+def test_restore_keeps_the_current_login_in_place(with_login, tmp_path):
+    code, out = run("backup", "--project-dir", str(with_login), "--to", str(tmp_path / "b"))
+    arc = out["archive"]
+    data = paths.project_data_dir("keeper")
+    (data / ".state" / "login.json").write_text('{"stand-in": "newer login"}\n')
+    (data / ".state" / "sync.json").write_text('{"cursor": 99}\n')
+    code, out = run("restore", arc, "--project-dir", str(with_login), "--yes", "--replace")
+    assert code == 0, out
+    assert (data / ".state" / "login.json").read_text() == '{"stand-in": "newer login"}\n'
+    assert (data / ".state" / "sync.json").read_text() == '{"cursor": 1}\n'  # from the backup
+    assert "data/.state/login.json" in out["kept"]
+    aside = Path(out["moved_aside"]["data"])
+    assert not (aside / ".state" / "login.json").exists() and (aside / ".state" / "sync.json").exists()
+
+
+def test_restore_after_a_total_loss_with_a_fresh_login_needs_no_replace(with_login, tmp_path):
+    import shutil
+
+    code, out = run("backup", "--project-dir", str(with_login), "--to", str(tmp_path / "b"))
+    data, state = paths.project_data_dir("keeper"), paths.project_state_dir("keeper")
+    shutil.rmtree(data)
+    shutil.rmtree(state)
+    (data / ".state").mkdir(parents=True)  # the person signed in to the app again
+    (data / ".state" / "login.json").write_text('{"stand-in": "fresh"}\n')
+    code, done = run("restore", out["archive"], "--project-dir", str(with_login), "--yes")
+    assert code == 0, done
+    assert (data / ".state" / "login.json").read_text() == '{"stand-in": "fresh"}\n'
+    assert (data / "raw" / "notes.jsonl").exists() and (data / ".state" / "sync.json").exists()
+    assert done["moved_aside"] == {} and not any(p.name.startswith(".before-restore-") for p in data.iterdir())
+
+
+def test_an_old_backup_holding_the_login_does_not_overwrite_it(project, tmp_path):
+    data = paths.project_data_dir("keeper")
+    (data / ".state").mkdir()
+    (data / ".state" / "login.json").write_text('{"stand-in": "old"}\n')
+    code, out = run("backup", "--project-dir", str(project), "--to", str(tmp_path / "b"))
+    assert "data/.state/login.json" in {n for n, *_ in archive.read_members(out["archive"])}
+    # Later the app starts leaving its login out of backups, and the person signs in again.
+    (project / "apps" / "keeper_app").mkdir(parents=True)
+    (project / "apps" / "keeper_app" / "app.toml").write_text(APP_TOML)
+    (data / ".state" / "login.json").write_text('{"stand-in": "new"}\n')
+    code, done = run("restore", out["archive"], "--project-dir", str(project), "--yes", "--replace")
+    assert code == 0, done
+    assert (data / ".state" / "login.json").read_text() == '{"stand-in": "new"}\n'
+    assert done["left_out_by_rule"] == ["data/.state/login.json"]

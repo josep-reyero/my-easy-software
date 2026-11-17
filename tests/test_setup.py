@@ -766,9 +766,10 @@ def test_serve_item_with_project_gives_exact_server_commands(mes_home):
     cmd = "sudo tailscale serve --bg --https=443 unix:/run/mes/notes-web.sock"
     assert f"`{cmd}`" in it["why"] and f"serve: {cmd}" in it["detail"]
     assert "--allow-host my-server.example-net.ts.net" in it["why"]
-    assert "`mes server plan notes --allow-host my-server.example-net.ts.net`" in it["why"]
+    assert "`/usr/local/bin/mes server plan notes --allow-host my-server.example-net.ts.net`" in it["why"]
+    assert "replaces whatever is served there now" in it["why"]
     assert "easy-ui units" in it["why"] and "mes-notes-web" in it["why"]
-    assert "dashboard units: mes server plan notes --allow-host my-server.example-net.ts.net" in it["detail"]
+    assert "dashboard units: /usr/local/bin/mes server plan notes --allow-host my-server.example-net.ts.net" in it["detail"]
     assert "`tailscale serve status`" in it["why"]
     assert "`sudo tailscale serve --https=443 off`" in it["why"]
     assert "opens at: https://my-server.example-net.ts.net/" in it["detail"]

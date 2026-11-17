@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from mes import cli, jobs, paths
+from mes import cli, jobs, paths, units
 from mes.errors import MesError, TemporaryFailure, UsageError
 
 import projects as helpers
@@ -270,10 +270,12 @@ def test_run_timeout_is_stopped(project_root, capsys, mes_home):
     assert rec["duration_s"] < 15
 
 
-def test_run_temporary_failure_exit_75(project_root, capsys):
+def test_run_temporary_failure_exit_75(project_root, capsys, mes_home):
     code, data = mes(capsys, "jobs", "run", "flaky", "--project-dir", str(project_root))
     assert code == 75
     assert data["error"]["code"] == "job_temporary"
+    # Finding H: recorded as skipped (a temporary problem), not as a failure.
+    assert jobs.read_log(log_file(mes_home))[-1]["result"] == "skipped"
 
 
 def test_run_unknown_job(project_root, capsys):
@@ -448,15 +450,6 @@ def test_status_shows_last_run(project_root, capsys):
     assert "mes server check" in data["note"]
 
 
-def test_install_has_moved_to_server_plan(project_root, capsys):
-    code, data = mes(capsys, "jobs", "install", "--project-dir", str(project_root))
-    assert code == 1
-    assert data["error"]["code"] == "moved"
-    assert "mes server plan" in data["error"]["hint"]
-    code, data = mes(capsys, "jobs", "install", "--render-only")
-    assert code == 1 and data["error"]["code"] == "moved"
-
-
 # =========================================================================== record (root, after each run)
 
 INVOCATION = "0123456789abcdef0123456789abcdef"
@@ -506,6 +499,60 @@ def test_record_from_systemd(server_root, capsys, monkeypatch):
     # The same run cannot be recorded twice.
     code, data = mes(capsys, "jobs", "record", "--project", "demo", "--server-root", str(server_root), "demo-app.sync")
     assert code == 5 and data["error"]["code"] == "already_recorded"
+
+
+def test_record_counts_exit_75_and_a_skipped_condition_as_skipped(server_root, capsys, monkeypatch):
+    """Finding H: with SuccessExitStatus=75 systemd says "success" for exit 75; the log says skipped."""
+    _systemd_env(monkeypatch, status="75", result="success", code="1")
+    code, data = mes(capsys, "jobs", "record", "--project", "demo", "--server-root", str(server_root), "demo-app.sync")
+    assert code == 0, data
+    log = paths.server_layout("demo", server_root).run_log
+    assert jobs.read_log(log)[-1]["result"] == "skipped"
+
+
+def test_should_run_follows_the_job_that_finished_last():
+    def show_with(states):
+        return lambda unit, *props: states[unit]
+
+    ok = {"Result": "success", "ExecMainCode": "1", "ExecMainStatus": "0"}
+    temp = {"Result": "success", "ExecMainCode": "1", "ExecMainStatus": "75"}
+    unit = units.job_unit
+    states = {unit("demo", "app-a.one"): {**ok, "InactiveEnterTimestampMonotonic": "100"},
+              unit("demo", "app-a.two"): {**temp, "InactiveEnterTimestampMonotonic": "200"}}
+    with pytest.raises(MesError) as e:  # a.two finished last, with exit code 75
+        jobs.should_run("demo", ["app-a.one", "app-a.two"], server_root="/var/lib/mes", show=show_with(states))
+    assert e.value.code == "upstream_skipped" and e.value.exit_code == 1  # 1: systemd skips, not fails
+    states[unit("demo", "app-a.one")]["InactiveEnterTimestampMonotonic"] = "300"
+    assert jobs.should_run("demo", ["app-a.one", "app-a.two"], server_root="/var/lib/mes",
+                           show=show_with(states)) == {"run": True, "after": "app-a.one"}
+    states[unit("demo", "app-a.one")]["Result"] = "exec-condition"  # it was skipped itself
+    with pytest.raises(MesError):
+        jobs.should_run("demo", ["app-a.one", "app-a.two"], server_root="/var/lib/mes", show=show_with(states))
+    with pytest.raises(UsageError):
+        jobs.should_run("demo", ["../x"], server_root="/var/lib/mes", show=show_with(states))
+
+
+def test_allow_network_for_the_selftest_allows_only_its_test_address(tmp_path):
+    """Finding G: the probe gets exactly one documentation address, with no DNS lookup."""
+    calls = []
+    written = {}
+    run = FakeRun()
+    real = jobs._write_hosts_file
+    jobs._write_hosts_file = lambda path, unit, found, **kw: written.update(path=path, found=found, **kw)
+    try:
+        res = jobs.allow_network("mes-demo.selftest-net.service", [units.SELFTEST_HOST], selftest=True,
+                                 hosts_file=units.selftest_hosts_file("demo"),
+                                 resolver=lambda *a: calls.append(a), run=run)
+    finally:
+        jobs._write_hosts_file = real
+    assert written["found"] == {units.SELFTEST_HOST: [units.SELFTEST_ADDRESS]}
+    assert calls == []  # the resolver was never asked
+    assert run.calls[0][-1] == f"IPAddressAllow={units.SELFTEST_ADDRESS}", run.calls
+    assert units.SELFTEST_ADDRESS in json.dumps(res)
+    for unit, hosts in (("mes-demo.job.demo-app.sync.service", [units.SELFTEST_HOST]),
+                        ("mes-demo.selftest-net.service", ["example.com"])):
+        with pytest.raises(UsageError):
+            jobs.allow_network(unit, hosts, selftest=True, run=lambda argv, **kw: None)
 
 
 def test_record_ignores_a_project_writable_environment(server_root, capsys, monkeypatch):
@@ -627,7 +674,7 @@ def test_allow_network_sets_only_the_hosts_and_no_nameservers(tmp_path):
     written = {}
     real_write = jobs._write_hosts_file
 
-    def capture(path, unit, found):
+    def capture(path, unit, found, **_):
         written.update(path=path, found=found)
 
     jobs._write_hosts_file = capture
