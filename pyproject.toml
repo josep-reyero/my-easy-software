@@ -7,6 +7,11 @@ license = "MIT"
 requires-python = ">=3.12"
 dependencies = []
 
+[project.urls]
+Homepage = "https://github.com/josep-reyero/my-easy-software"
+Repository = "https://github.com/josep-reyero/my-easy-software"
+Issues = "https://github.com/josep-reyero/my-easy-software/issues"
+
 [project.scripts]
 mes = "mes.cli:main"
 
