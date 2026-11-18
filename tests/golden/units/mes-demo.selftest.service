@@ -5,6 +5,11 @@
 
 [Unit]
 Description=mes self-test probe of project demo (a job's sandbox)
+# Once a run has ended, whatever its result, root records it in a unit of its own: a failing
+# record shows there and never changes this job's result. What waits for this job starts
+# after a success.
+OnSuccess=mes-demo.record.selftest.service mes-demo.selftest-after.service
+OnFailure=mes-demo.record.selftest.service
 
 [Service]
 Type=oneshot

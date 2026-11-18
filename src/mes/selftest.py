@@ -12,6 +12,13 @@ plain pass or fail per claim:
   (``mes-<p>.selftest-net.service``, rendered exactly like a real job with ``network = [...]``,
   whose one host is mapped to a documentation address that leads nowhere), each started by its
   ``.path`` unit when the gate touches ``gate/selftest-request`` or ``gate/selftest-net-request``.
+  When the first one has ended, systemd starts its record unit (``mes-<p>.record.selftest.service``,
+  root's ``mes jobs record``, exactly like a real job's) and a third probe with the sandbox of a job
+  that waits for another (``mes-<p>.selftest-after.service``, whose ``ExecCondition=+`` is root's
+  ``mes jobs should-run``). The gate then checks that the run is in the run log (by its invocation
+  id) and that the third probe really started; when either did not happen it reports ``todo`` with
+  the reason. The third probe also checks that it sees systemd's control socket (for root's check)
+  but cannot connect to it.
   A probe tries what must fail and what must work: other projects' folders, the sign-in folder,
   the gate's folder, the webhook secret, writing code/ (only the new release, from the deploy
   sandbox), writing data (not from a read request), the network (none, except the package index
@@ -32,7 +39,8 @@ reason, never as passed.
 Public API
 ----------
 ``probe(layout, context) -> dict``     one sandbox's checklist. ``context``: ``job`` (a job without
-    network), ``net`` (a job that lists hosts), ``read`` and ``write`` (the gate's request
+    network), ``net`` (a job that lists hosts), ``after`` (a job that waits for another), ``read``
+    and ``write`` (the gate's request
     sandboxes), ``deploy`` (the install step) and ``publish`` (the publish step).
 ``run_inside(where, run_child) -> dict``  the gate's side: every sandbox, plus the job probe.
 ``outside(layout) -> list[dict]``      the checks from the calling account.
@@ -54,6 +62,8 @@ from mes import paths, protocol, units
 
 JOB_RESULT = "job.json"
 NET_RESULT = "net.json"
+AFTER_RESULT = "after.json"
+RESULT_FILES = {"job": JOB_RESULT, "net": NET_RESULT, "after": AFTER_RESULT}
 REQUEST_FILE = "selftest-request"
 NET_REQUEST_FILE = "selftest-net-request"
 # Service sockets and name-service paths of the host that no sandbox may see.
@@ -65,6 +75,8 @@ HOST_SOCKETS = ("/run/systemd/resolve", "/run/dbus", "/run/systemd/private", "/r
 _LOCAL = (("127.0.0.1", 22), ("10.0.0.1", 80), ("172.16.0.1", 80), ("192.168.1.1", 80), ("169.254.169.254", 80),
           ("::1", 22))
 JOB_WAIT_SEC = 90.0
+# How long the gate waits, after the job probe answered, for its record and the dependent probe.
+CHAIN_WAIT_SEC = 60.0
 CONNECT_TIMEOUT = 3.0
 _PUBLIC = (("1.1.1.1", 443), ("8.8.8.8", 53))
 
@@ -131,9 +143,10 @@ def _status_field(name: str) -> str | None:
 
 def probe(layout: paths.ServerLayout, context: str) -> dict[str, Any]:
     """What this sandbox can and cannot do. ``context`` is where the probe runs."""
-    if context not in ("job", "net", "read", "write", "deploy", "publish"):
+    if context not in ("job", "net", "after", "read", "write", "deploy", "publish"):
         raise ValueError(context)
-    where = {"job": "a job", "net": "a job that lists hosts", "read": "a read request", "write": "a write request",
+    where = {"job": "a job", "net": "a job that lists hosts", "after": "a job that waits for another",
+             "read": "a read request", "write": "a write request",
              "deploy": "the install step", "publish": "the publish step"}[context]
     p = layout.project
     items: list[dict[str, Any]] = []
@@ -178,6 +191,8 @@ def probe(layout: paths.ServerLayout, context: str) -> dict[str, Any]:
                 items.append(_item(pre + f"no-{name}", f"{where} cannot see the {name} folder", ok,
                                    f"{name}/ is not there for it ({what}).", f"It can list {name}/."))
     items.append(_host_sockets(pre, where, context))
+    if context == "after":
+        items.append(_control_socket(pre))
     if context == "deploy":
         items.append(_filtered(pre + "loopback", "the install step cannot reach this computer's own services",
                                "127.0.0.1", 22))
@@ -202,13 +217,15 @@ def probe(layout: paths.ServerLayout, context: str) -> dict[str, Any]:
 # The one host socket the install step sees on purpose (its units bind it for name lookups), and
 # the folders systemd makes on the way to it. Nothing else may be under /run there.
 INSTALL_SOCKETS = (units.RESOLVE_SOCKET,)
+# A job that waits for another sees exactly systemd's control socket, for root's check before the
+# run (only root may connect to it).
+AFTER_SOCKETS = (units.CONTROL_SOCKET, units.SYSTEMD_BOOTED)
+_SEEN_ON_PURPOSE = {"deploy": INSTALL_SOCKETS, "after": AFTER_SOCKETS}
 
 
 def _allowed_run_paths(context: str) -> set[str]:
-    if context != "deploy":
-        return set()
     out: set[str] = set()
-    for path in INSTALL_SOCKETS:
+    for path in _SEEN_ON_PURPOSE.get(context, ()):
         parts = Path(path).parts
         out |= {str(Path(*parts[:i])) for i in range(3, len(parts) + 1)}  # /run/x, /run/x/y, ...
     return out
@@ -230,12 +247,29 @@ def _host_sockets(pre: str, where: str, context: str, *, exists=os.path.lexists,
     (its unit binds it on purpose), and nothing else under /run."""
     allowed = _allowed_run_paths(context)
     seen = [p for p in HOST_SOCKETS if exists(p) and p not in allowed]
-    if context == "deploy":
+    if context in _SEEN_ON_PURPOSE:
         seen += [p for p in (under_run or _under_run)() if p not in allowed and p not in seen]
-    note = " Only systemd-resolved's socket is there, for name lookups." if allowed else ""
+    note = {"deploy": " Only systemd-resolved's socket is there, for name lookups.",
+            "after": " Only systemd's control socket is there, for root's check before the run."}.get(context, "")
     return _item(pre + "host-sockets", f"{where} cannot see the server's service sockets", not seen,
                  "None of systemd's, D-Bus's, the name service's, Tailscale's or the container tools' sockets "
                  "is there." + note, "It can see: " + ", ".join(seen[:8]) + ".")
+
+
+def _control_socket(pre: str, connect=None) -> dict[str, Any]:
+    """A job that waits for another sees systemd's control socket (root's check before the run
+    needs it), and its own account cannot connect to it."""
+    e = _errno_of(lambda: (connect or _connect_unix)(units.CONTROL_SOCKET))
+    title = "a job that waits for another cannot use systemd's control socket"
+    if e in _REFUSED:
+        return _item(pre + "control-socket", title, True,
+                     f"It is there for root's check before the run, and this account cannot connect ({e}).", "")
+    if e is None:
+        return _item(pre + "control-socket", title, False, "",
+                     f"This account can connect to {units.CONTROL_SOCKET}, so it could control systemd.")
+    return protocol.item(pre + "control-socket", title, "todo",
+                         f"todo: {units.CONTROL_SOCKET} is not usable here ({e}), so root's check before the run "
+                         "could not have asked systemd how the job before it ended.")
 
 
 def _filtered(id: str, title: str, host: str, port: int) -> dict[str, Any]:
@@ -413,18 +447,33 @@ def _uv_syscalls(layout: paths.ServerLayout) -> dict[str, Any]:
 
 
 def write_job_result(layout: paths.ServerLayout, context: str = "job") -> dict[str, Any]:
-    """Run by ``mes-<p>.selftest.service`` or ``mes-<p>.selftest-net.service`` (a job's sandbox):
-    leave the answer in gate/selftest/, which those units alone have bound in (no job sees it, so
-    no job can forge the answer)."""
-    if context not in ("job", "net"):
+    """Run by ``mes-<p>.selftest.service``, ``mes-<p>.selftest-net.service`` or
+    ``mes-<p>.selftest-after.service`` (a job's sandbox): leave the answer in gate/selftest/,
+    which those units alone have bound in (no job sees it, so no job can forge the answer). The
+    answer names the run (systemd's invocation id), so the gate can find its record."""
+    if context not in RESULT_FILES:
         raise ValueError(context)
-    result = {**probe(layout, context), "time": time.time()}
-    out = layout.gate / "selftest" / (JOB_RESULT if context == "job" else NET_RESULT)
+    invocation = os.environ.get("INVOCATION_ID", "")
+    result = {**probe(layout, context), "time": time.time(),
+              "invocation": invocation if len(invocation) == 32 and all(c in "0123456789abcdef" for c in invocation)
+              else None}
+    out = layout.gate / "selftest" / RESULT_FILES[context]
     out.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     tmp = out.with_name(f".{context}.{os.getpid()}.tmp")
     tmp.write_text(json.dumps(result), encoding="utf-8")
     os.replace(tmp, out)
     return result
+
+
+def _answer(path: Path, started: float) -> dict[str, Any] | None:
+    """A probe's answer written after ``started``, or None."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and float(data.get("time", 0)) >= started and isinstance(data.get("items"), list):
+            return data
+    except (OSError, ValueError, TypeError):
+        pass
+    return None
 
 
 def _job_probe(layout: paths.ServerLayout, context: str = "job") -> list[dict[str, Any]]:
@@ -437,19 +486,89 @@ def _job_probe(layout: paths.ServerLayout, context: str = "job") -> list[dict[st
         request.write_text(f"{started}\n", encoding="ascii")
     except OSError as e:
         return [_item(context, title, None, "", f"skipped: the gate could not ask for the probe ({e}).")]
-    result = layout.gate / "selftest" / (JOB_RESULT if context == "job" else NET_RESULT)
+    result = layout.gate / "selftest" / RESULT_FILES[context]
     deadline = time.monotonic() + JOB_WAIT_SEC
     while time.monotonic() < deadline:
-        try:
-            data = json.loads(result.read_text(encoding="utf-8"))
-            if isinstance(data, dict) and float(data.get("time", 0)) >= started and isinstance(data.get("items"), list):
-                return [i for i in data["items"] if isinstance(i, dict)]
-        except (OSError, ValueError, TypeError):
-            pass
+        data = _answer(result, started)
+        if data is not None:
+            items = [i for i in data["items"] if isinstance(i, dict)]
+            return items + (_chain_checks(layout, data, started) if context == "job" else [])
         time.sleep(1)
-    return [_item(context, title, None, "",
-                  f"skipped: the probe unit did not answer within {JOB_WAIT_SEC:g} seconds. The person checks: "
-                  f"systemctl status {unit}")]
+    out = [_item(context, title, None, "",
+                 f"skipped: the probe unit did not answer within {JOB_WAIT_SEC:g} seconds. The person checks: "
+                 f"systemctl status {unit}")]
+    if context == "job":
+        why = "skipped: the job probe did not run, so nothing could be recorded or started after it."
+        out += [_item("job-recorded", RECORDED_TITLE, None, "", why), _item("after-started", AFTER_TITLE, None, "", why)]
+    return out
+
+
+RECORDED_TITLE = "root records a job's run in the run log"
+AFTER_TITLE = "a job that waits for another starts after a real success"
+
+
+def _chain_checks(layout: paths.ServerLayout, answer: dict[str, Any], started: float) -> list[dict[str, Any]]:
+    """After the job probe answered: its run must appear in the run log (written by its record
+    unit, as root) and the dependent probe must start (its root check asked systemd how the job
+    probe ended). Read from the gate's side, which can read log/ through its group."""
+    from mes import jobs
+    from mes.errors import MesError
+
+    p = layout.project
+    record_unit, after_unit = units.selftest_record_unit(p), units.selftest_after_unit(p)
+    invocation = answer.get("invocation")
+    recorded: dict[str, Any] | None = None
+    unreadable: str | None = None
+    after: dict[str, Any] | None = None
+    deadline = time.monotonic() + CHAIN_WAIT_SEC
+    while True:
+        if recorded is None and invocation:
+            try:
+                recorded = next((r for r in reversed(jobs.read_log(layout.run_log)[-500:])
+                                 if r.get("invocation") == invocation and r.get("via") == jobs.SELFTEST_VIA), None)
+                unreadable = None
+            except OSError as e:
+                unreadable = errno.errorcode.get(e.errno or 0, type(e).__name__)
+        if after is None:
+            after = _answer(layout.gate / "selftest" / AFTER_RESULT, started)
+        if (recorded is not None or not invocation) and after is not None or time.monotonic() >= deadline:
+            break
+        time.sleep(1)
+    items: list[dict[str, Any]] = []
+    if not invocation:
+        items.append(protocol.item("job-recorded", RECORDED_TITLE, "todo",
+                                   "todo: the job probe did not say which run it was (systemd gave it no INVOCATION_ID), "
+                                   "so its record cannot be found."))
+    elif recorded is None:
+        why = (f"the run log could not be read ({unreadable})" if unreadable else
+               f"no record of the probe's run ({invocation}) appeared in {layout.run_log} within {CHAIN_WAIT_SEC:g} seconds")
+        items.append(protocol.item("job-recorded", RECORDED_TITLE, "todo",
+                                   f"todo: {why}, so the runs of jobs are not recorded either. The person checks: "
+                                   f"systemctl status {record_unit}"))
+    elif recorded.get("result") != "success":
+        items.append(protocol.item("job-recorded", RECORDED_TITLE, "todo",
+                                   f"todo: the probe's run was recorded as {str(recorded.get('result'))[:40]!r}, not as a "
+                                   "success, although it worked."))
+    else:
+        try:
+            chain = jobs.check_head(layout.run_log, jobs.verify_log(layout.run_log))
+            ok, why = True, (f"Its run is in the run log, recorded by {record_unit} as root; the log's chain holds"
+                             + (" and matches its anchor." if chain.get("anchored") else
+                                " (its anchor cannot be read from here)."))
+        except MesError as e:
+            ok, why = False, f"Its run is in the run log, but the log does not hold together: {e.message}"
+        items.append(_item("job-recorded", RECORDED_TITLE, ok, why, why))
+    if after is None:
+        items.append(protocol.item("after-started", AFTER_TITLE, "todo",
+                                   f"todo: {after_unit} did not start within {CHAIN_WAIT_SEC:g} seconds after the job probe "
+                                   "succeeded, so a job that waits for another (and the dashboard refresh) would not run "
+                                   f"either. The person checks: systemctl status {after_unit}"))
+    else:
+        items.append(_item("after-started", AFTER_TITLE, True,
+                           f"{after_unit} started after the job probe succeeded: root's check before it asked systemd "
+                           "how the job probe ended.", ""))
+        items += [i for i in after["items"] if isinstance(i, dict)]
+    return items
 
 
 def _filter_settings(layout: paths.ServerLayout, show=None) -> dict[str, Any]:

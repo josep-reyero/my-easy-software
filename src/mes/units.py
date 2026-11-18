@@ -22,6 +22,8 @@ named by its id, ``<app>.<job>``:
   and no access to the system's name service, so it needs no DNS server at all). It runs as
   root because only root may change another unit's settings; it takes nothing from the
   project's files (the hosts are written into this file) and is sandboxed too.
+- ``mes-<p>.record.<app>.<job>.service``  records each run of the job in the run log, as root, in a
+  unit of its own (see "Root's commands" below).
 - ``mes-<p>.ui-refresh.service`` rebuilds the dashboard data (``easy-ui data build``) after the
   jobs listed in ``[ui] refresh_after`` succeed.
 - ``mes-<p>.webhook.socket`` / ``.service``  the signed webhook receiver (see ``mes.webhook``).
@@ -32,17 +34,41 @@ named by its id, ``<app>.<job>``:
   can see (``InaccessiblePaths=``); each instance also checks that the connecting process is an
   SSH session of the project's account, never a job (see ``mes.gate``).
 - ``mes-<p>.selftest.path`` / ``.service``  ``mes server selftest``: a probe that runs with
-  exactly a job's sandbox and reports what it could and could not reach.
+  exactly a job's sandbox and reports what it could and could not reach. Its run is recorded by
+  ``mes-<p>.record.selftest.service`` and starts ``mes-<p>.selftest-after.service``, a probe with
+  exactly the sandbox of a job that waits for another, so the self-test proves both for real.
 - ``mes-<p>-web.socket`` / ``.service``  the dashboard server (easy-ui), rendered here from mes's
   own template (``render_web``); easy-ui only supplies checked parameters.
 
 A job with ``after = "<upstream>"`` is started by the upstream service through ``OnSuccess=``.
-After every run, ``ExecStopPost=+`` runs ``mes jobs record`` as root, outside the sandbox, with
-only the project and job names as arguments and a clean environment
-(``/usr/bin/env -i PATH=/usr/bin:/bin``, Python in isolated mode ``-I``), so nothing the project
-can write (its ``HOME``, its working folder, ``PYTHON*`` settings) reaches root. It appends the
-run to ``log/runs.jsonl``, a folder that only root can change, so a job cannot rewrite its own
-history. The network helper runs the same way.
+
+Root's commands
+---------------
+Root runs three commands for a project, each with only names as arguments and a clean
+environment (``/usr/bin/env -i PATH=/usr/bin:/bin``, Python in isolated mode ``-I``), so nothing
+the project can write (its ``HOME``, its working folder, ``PYTHON*`` settings) reaches root:
+
+- ``mes jobs record``: in the job's own record unit, started by the job unit's ``OnSuccess=`` and
+  ``OnFailure=`` once a run has ended, whatever its result. It reads how the run ended from systemd
+  (``systemctl show``) and appends it to ``log/runs.jsonl``, a folder only root can change, so a job
+  cannot rewrite its own history. Its result is its own: a failing record shows as a failed record
+  unit and never turns a job that worked into a failed one.
+- ``mes jobs allow-network``: the network helper (``mes-<p>.net.<app>.<job>.service``).
+- ``mes jobs should-run``: ``ExecCondition=+`` of a job that waits for another (and of the dashboard
+  refresh). A condition has to run in the job's unit, so it is the one root command inside a unit
+  that runs project code.
+
+systemd applies a unit's mount namespace (``TemporaryFileSystem=``, ``BindPaths=``,
+``BindReadOnlyPaths=``) to ``+`` commands too: ``+`` lifts only ``User=``, the capability bounds and
+the access-restricting options (``ProtectSystem=``, ``InaccessiblePaths=``, ``ReadWritePaths=``, the
+system call and address family filters). Inside a job's view ``/run`` is empty, so root's
+``systemctl`` there could not reach systemd, and ``log/`` is not there at all. That is why the
+record and the network helper are units of their own, and why the units with ``should-run`` get
+exactly what systemctl needs: systemd's control socket (``CONTROL_SOCKET``), bound in read-only,
+and an empty read-only folder at ``SYSTEMD_BOOTED``, where systemctl looks for the sign that
+systemd runs the computer before it tries the socket. ``ROOT_NEEDS`` lists
+what each of the three needs; ``tests/test_units.py`` checks every rendered root command against
+the view its unit really gives it.
 
 What each unit sees of ``/var/lib/mes``: ``TemporaryFileSystem=/var/lib/mes:ro`` hides every
 project, then only the folders the unit needs are bound back (read-only unless it writes them).
@@ -64,8 +90,11 @@ Public API
 ``MARKER_PROJECT``, ``MARKER_JOB``, ``MARKER_KIND``, ``HEADER``, ``UNIT_NAME_RE``,
 ``JOB_UNIT_RE``, ``RUN_LOG_FILE``, ``DEFAULT_MES_PYTHON``, ``ROOT_ENV``, ``DEPLOY_DENY`` (the address
 filter of the install step and of ``run-as --network any``), ``NETWORK_NOT_COVERED`` (what that
-filter cannot block, in plain words), ``RESOLVE_SOCKET``, ``INSTALL_UV_DIR``.
+filter cannot block, in plain words), ``RESOLVE_SOCKET``, ``CONTROL_SOCKET``, ``SYSTEMD_BOOTED``,
+``INSTALL_UV_DIR``,
+``ROOT_NEEDS``, ``root_needs(argv, layout) -> dict``  what one root command needs from its view.
 ``job_unit(project, job_id, suffix="service")``, ``net_unit(project, job_id)``,
+``record_unit(project, job_id)``, ``selftest_record_unit(project)``, ``selftest_after_unit(project)``,
 ``ui_refresh_unit(project)``, ``webhook_units(project) -> (socket, service)``,
 ``webhook_socket_path(project) -> str``, ``gate_units(project, level) -> (socket, template)``,
 ``gate_socket_dir(project) -> str``, ``gate_socket_path(project, level) -> str``,
@@ -79,6 +108,7 @@ filter cannot block, in plain words), ``RESOLVE_SOCKET``, ``INSTALL_UV_DIR``.
 ``render_job_service(project, job, *, layout, mes, mes_python) -> str``
 ``render_job_timer(project, job) -> str``, ``render_job_path(project, job, *, layout) -> str``
 ``render_net_service(project, job, *, mes_python) -> str``
+``render_record(project, job, *, layout, mes_python) -> str``  (``job=None``: the self-test probe's)
 ``render_ui_refresh(project, *, layout, easy_ui) -> str``
 ``render_webhook(project, *, layout, mes) -> dict[str, str]``
 ``render_gate(project, *, layout, mes, allow_builds=False) -> dict[str, str]``  the gate's per-request
@@ -121,8 +151,9 @@ HEADER = ("# Made by my-easy-software (mes). Do not edit: run 'mes server plan' 
           "writes instead.")
 _JOB_ID = r"[a-z][a-z0-9-]{1,30}\.[a-z][a-z0-9-]{0,30}"
 UNIT_NAME_RE = re.compile(rf"^mes-[a-z][a-z0-9-]{{1,30}}\.(?:job\.{_JOB_ID}\.(?:service|timer|path)|"
-                          rf"net\.(?:{_JOB_ID}|selftest)\.service|ui-refresh\.service|webhook\.(?:socket|service)|"
-                          r"selftest(?:-net)?\.(?:path|service)|gate-(?:read|write|deploy|publish)(?:\.socket|@\.service))\Z")
+                          rf"(?:net|record)\.(?:{_JOB_ID}|selftest)\.service|ui-refresh\.service|"
+                          r"webhook\.(?:socket|service)|selftest(?:-net)?\.(?:path|service)|selftest-after\.service|"
+                          r"gate-(?:read|write|deploy|publish)(?:\.socket|@\.service))\Z")
 # The levels an SSH key can have.
 GATE_LEVELS = ("read", "write", "deploy")
 # The request sandboxes the gate hands work to: the three key levels, plus "publish", which only
@@ -162,6 +193,13 @@ NETWORK_NOTE_LINES = (
 # The one socket of the host the install step (and 'mes server run-as' with network) may see:
 # systemd-resolved's, for name lookups.
 RESOLVE_SOCKET = "/run/systemd/resolve/io.systemd.Resolve"
+# systemd's own control socket: how root's systemctl reaches systemd (without D-Bus). It belongs
+# to root and only root may connect (owner-only permissions), so a unit's account that can see it
+# gains nothing.
+CONTROL_SOCKET = "/run/systemd/private"
+# Before it tries that socket, systemctl checks that systemd runs this computer by looking for
+# this folder (sd_booted()); without it, it stops with "System has not been booted with systemd".
+SYSTEMD_BOOTED = "/run/systemd/system"
 # With server builds, uv's cache and Python of the install step live in this folder of the release.
 INSTALL_UV_DIR = ".uv"
 WEB_SOCKET_DIR = "/run/mes"
@@ -320,6 +358,20 @@ def job_unit(project: str, job: str, suffix: str = "service") -> str:
 
 def net_unit(project: str, job: str) -> str:
     return f"{UNIT_PREFIX}-{_check_project(project)}.net.{_check_job(job)}.service"
+
+
+def record_unit(project: str, job: str) -> str:
+    """The unit that records each run of a job (as root, after the run, in a unit of its own)."""
+    return f"{UNIT_PREFIX}-{_check_project(project)}.record.{_check_job(job)}.service"
+
+
+def selftest_record_unit(project: str) -> str:
+    return f"{UNIT_PREFIX}-{_check_project(project)}.record.selftest.service"
+
+
+def selftest_after_unit(project: str) -> str:
+    """The self-test probe with the sandbox of a job that waits for another."""
+    return f"{UNIT_PREFIX}-{_check_project(project)}.selftest-after.service"
 
 
 def ui_refresh_unit(project: str) -> str:
@@ -592,23 +644,77 @@ def selftest_hosts_file(project: str) -> str:
     return f"{net_run_dir(project)}/selftest/hosts"
 
 
-def should_run_line(project: str, layout, mes_python: str, upstream: Sequence[str]) -> str:
+def should_run_line(project: str, layout, mes_python: str, upstream: Sequence[str] = (), *,
+                    selftest: bool = False) -> str:
     """``ExecCondition=+``: root asks systemd how the job that started this one ended, and skips
-    this run when that one only stopped for a temporary problem (exit 75, recorded as skipped)."""
+    this run when that one only stopped for a temporary problem (exit 75, recorded as skipped).
+    ``selftest``: the self-test's dependent probe, which waits for the job probe."""
     p = _check_project(project)
+    base = ["jobs", "should-run", "--project", p, "--server-root", sandbox_path(layout.root)]
+    if selftest:
+        return exec_line(root_command(mes_python, *base, "--selftest"))
     ids = [_check_job(u) for u in upstream]
-    return exec_line(root_command(mes_python, "jobs", "should-run", "--project", p, "--server-root",
-                                  sandbox_path(layout.root), "--", *ids))
+    return exec_line(root_command(mes_python, *base, "--", *ids))
+
+
+def control_socket_lines() -> list[str]:
+    """What a unit with ``ExecCondition=+ ... should-run`` adds to its view, for root's systemctl:
+    systemd's control socket (read-only) and an empty read-only folder where systemctl looks for
+    the sign that systemd runs this computer (``SYSTEMD_BOOTED``). The unit's own account cannot
+    use the socket (only root may connect) and the folder is empty, so it gains nothing."""
+    return ["# Root's check before the run asks systemd (systemctl) through its control socket, which the",
+            f"# empty /run would hide; systemctl first looks for {SYSTEMD_BOOTED}, for which an empty",
+            "# read-only folder stands in. Only root may connect to the socket, so this unit's account gains",
+            "# nothing from either.",
+            f"BindReadOnlyPaths={CONTROL_SOCKET}",
+            f"TemporaryFileSystem={SYSTEMD_BOOTED}:ro"]
+
+
+# What each command root runs for a project needs from the view systemd gives it (see "Root's
+# commands" above): systemd's control socket, the folders it reads and writes, the capabilities it
+# keeps in a root unit with a bounded set, and whether it needs the network. The Python of mes is
+# always read as well. tests/test_units.py checks every rendered root command against this.
+# systemctl needs both: the sign that systemd runs this computer, and the control socket.
+_SYSTEMCTL = {"exists": (SYSTEMD_BOOTED,), "sockets": (CONTROL_SOCKET,)}
+ROOT_NEEDS: dict[str, dict[str, tuple[str, ...] | bool]] = {
+    # How the run ended (systemctl show), which release ran (the link code/current, in the project's
+    # folder), the run log and its anchor (log/, root's; the anchor gets the log's group).
+    "record": {**_SYSTEMCTL, "read": ("{current}",), "write": ("{log}",),
+               "caps": ("CAP_DAC_READ_SEARCH", "CAP_CHOWN"), "network": False},
+    # How the job before it ended (systemctl show); nothing else.
+    "should-run": {**_SYSTEMCTL, "read": (), "write": (), "caps": (), "network": False},
+    # Name lookups, the job's own hosts file and the job unit's address list (systemctl set-property).
+    "allow-network": {**_SYSTEMCTL, "read": ("/etc/resolv.conf", "/etc/nsswitch.conf"),
+                      "write": ("{hosts_dir}",), "caps": ("CAP_SYS_ADMIN",), "network": True},
+}
+
+
+def root_needs(argv: Sequence[str], layout) -> dict[str, Any]:
+    """What one root command (a whole ``root_command`` argv) needs from its unit's view."""
+    words = list(argv)
+    i = words.index("-m")
+    if words[i - 1] != "-I" or words[i + 1:i + 3] != ["mes", "jobs"] or words[i + 3] not in ROOT_NEEDS:
+        raise ValueError(f"not a root command of mes: {words[i + 1:i + 4]}")
+    need = ROOT_NEEDS[words[i + 3]]
+    hosts = words[words.index("--hosts-file") + 1] if "--hosts-file" in words else ""
+    fill = {"current": str(layout.current), "log": str(layout.log),
+            "hosts_dir": str(PurePosixPath(hosts).parent) if hosts else ""}
+    return {"command": words[i + 3], "python": words[i - 2],
+            **{k: tuple(v.format(**fill) for v in need[k]) for k in ("exists", "sockets", "read", "write")},
+            "caps": tuple(need["caps"]), "network": need["network"]}
 
 
 def render_job_service(project: Project, job: Job, *, layout, mes: str,
                        mes_python: str = DEFAULT_MES_PYTHON, selftest: str | bool | None = None) -> str:
+    """A job's unit. ``selftest``: one of the self-test probes, rendered with exactly the sandbox
+    of a job (``job``), of a job that lists hosts (``net``) or of a job that waits for another
+    (``after``, started by the ``job`` probe)."""
     p = _check_project(project.name)
     name = _check_job(job.id)
     if selftest is True:
         selftest = "job"
-    if selftest not in (None, False, "job", "net"):
-        raise ValueError("selftest must be 'job' or 'net'")
+    if selftest not in (None, False, "job", "net", "after"):
+        raise ValueError("selftest must be 'job', 'net' or 'after'")
     hosts = check_hosts(job.network)
     local = check_hosts(getattr(job, "local_network", ()))
     all_hosts = list(dict.fromkeys(hosts + local))
@@ -619,29 +725,38 @@ def render_job_service(project: Project, job: Job, *, layout, mes: str,
     current = sandbox_path(layout.current_project)
     pre = None
     condition = None
+    upstream: list[str] = []
+    record = None
+    after_success: list[str] = []
     if selftest:
         start = exec_line([mes, "server", "selftest-probe", p, "--context", selftest, "--server-root", root])
-        record = None
         kind = "selftest"
         helper = selftest_net_unit(p)
         hosts_file = selftest_hosts_file(p)
+        if selftest == "job":
+            record = selftest_record_unit(p)
+            after_success = [record, selftest_after_unit(p)]
+        elif selftest == "after":
+            condition = should_run_line(p, layout, mes_python, selftest=True)
+            upstream = [selftest_units(p)[1]]
     else:
         start = exec_line([_program(project, layout, job.app), "--json", *job.argv])
-        record = exec_line(root_command(mes_python, "jobs", "record", "--project", p, "--server-root", root, name))
+        record = record_unit(p, name)
         kind = "job"
         helper = net_unit(p, name)
         hosts_file = net_hosts_file(p, name)
         if job.after:
             condition = should_run_line(p, layout, mes_python, [job.after])
+            upstream = [job_unit(p, job.after)]
         if "data" in writes:
             pre = exec_line(account_command(mes_python, [
                 ("MES_PROJECT", p), ("MES_DATA_DIR", sandbox_path(layout.data)),
                 ("MES_STATE_DIR", sandbox_path(layout.state)), ("MES_STORE_DIR", sandbox_path(layout.store)),
                 ("MES_PROJECT_DIR", current), ("MES_ALLOW", JOB_ALLOW_LEVEL),
             ], "db", "sync", "--quiet", "--project-dir", current))
-    after_success = [] if selftest else [job_unit(p, d.id) for d in project.dependents(job.id)]
-    if not selftest and project.ui is not None and job.id in project.ui.refresh_after:
-        after_success.append(ui_refresh_unit(p))
+        after_success = [record] + [job_unit(p, d.id) for d in project.dependents(job.id)]
+        if project.ui is not None and job.id in project.ui.refresh_after:
+            after_success.append(ui_refresh_unit(p))
 
     if all_hosts:
         net_comment = (f"network: only {', '.join(all_hosts)} (their addresses are looked up again before each run"
@@ -649,13 +764,24 @@ def render_job_service(project: Project, job: Job, *, layout, mes: str,
     else:
         net_comment = "network: none"
     description = {"job": f"mes self-test probe of project {p} (a job's sandbox)",
-                   "net": f"mes self-test probe of project {p} (the sandbox of a job that lists hosts)"}
+                   "net": f"mes self-test probe of project {p} (the sandbox of a job that lists hosts)",
+                   "after": f"mes self-test probe of project {p} (the sandbox of a job that waits for another)"}
     lines = _header(p, kind, None if selftest else name, [net_comment])
     lines += ["", "[Unit]", "Description=" + (description[selftest] if selftest else f"mes job {name} of project {p}")]
     if all_hosts:
         lines += [f"Requires={helper}", f"After={helper}"]
+    if upstream:
+        lines += ["# Ordering only: the job before it stays loaded, with how its run ended, until root's check",
+                  "# below has read it.",
+                  f"After={' '.join(upstream)}"]
+    if record:
+        lines += ["# Once a run has ended, whatever its result, root records it in a unit of its own: a failing",
+                  "# record shows there and never changes this job's result. What waits for this job starts",
+                  "# after a success."]
     if after_success:
         lines.append("OnSuccess=" + " ".join(after_success))
+    if record:
+        lines.append(f"OnFailure={record}")
     lines += [
         "",
         "[Service]",
@@ -676,12 +802,6 @@ def render_job_service(project: Project, job: Job, *, layout, mes: str,
                   f"ExecStartPre={pre}"]
     lines += [
         f"ExecStart={start}",
-    ]
-    if record:
-        lines += ["# Root records the run with an empty environment and Python's isolated mode: nothing the",
-                  "# job can write reaches it.",
-                  f"ExecStopPost=+{record}"]
-    lines += [
         f"WorkingDirectory={line_path(layout.current_project)}",
         *_project_env(project, layout),
         f"Environment={env_assignment('MES_PROJECT_DIR', current)}",
@@ -701,6 +821,8 @@ def render_job_service(project: Project, job: Job, *, layout, mes: str,
         # Its answer goes to gate/selftest/, which no job can see, so no job can forge a pass.
         answer = sandbox_path(f"{sandbox_path(layout.gate)}/selftest")
         lines += [f"BindPaths=-{line_path(answer)}"]
+    if condition:
+        lines += control_socket_lines()
     lines.append(_hidden(project, layout))
     if all_hosts:
         lines += [
@@ -834,6 +956,68 @@ def render_selftest_net(project: Project, *, layout, mes_python: str = DEFAULT_M
                                 before=probe, runtime=f"mes-{p}-net/selftest", start=start, layout=layout))
 
 
+def render_record(project: Project, job: Job | None, *, layout, mes_python: str = DEFAULT_MES_PYTHON) -> str:
+    """The unit that records each run of a job in the run log (``job=None``: of the self-test's
+    job probe). The job unit starts it through ``OnSuccess=`` and ``OnFailure=`` once a run has
+    ended, so it runs as root outside the job's view, and its result never changes the job's."""
+    p = _check_project(project.name)
+    if job is None:
+        target, args, marker = selftest_units(p)[1], ["--selftest"], None
+        what = f"the self-test probe of project {p}"
+    else:
+        name = _check_job(job.id)
+        target, args, marker = job_unit(p, name), ["--", name], name
+        what = f"mes job {name} of project {p}"
+    start = exec_line(root_command(mes_python, "jobs", "record", "--project", p, "--server-root",
+                                   sandbox_path(layout.root), *args))
+    others = [layout.data, layout.state, layout.store, layout.ui, layout.auth, layout.gate, layout.webhook,
+              layout.etc, layout.home, f"{sandbox_path(layout.base)}/backups"]
+    lines = _header(p, "record", marker, [
+        "Runs as root after each run of the job, with an empty environment: it reads how the run ended",
+        "from systemd and appends it to the run log in log/, which only root can change. It is a unit of",
+        "its own, so a failing record shows here and never changes the job's result.",
+    ]) + [
+        "",
+        "[Unit]",
+        f"Description=Record each run of {what} in its run log",
+        "# Ordering only: the job's unit stays loaded, with how its run ended, until this has read it.",
+        f"After={target}",
+        "",
+        "[Service]",
+        "Type=oneshot",
+        f"ExecStart={start}",
+        "WorkingDirectory=/",
+        "TimeoutStartSec=60",
+        "UMask=0027",
+        "NoNewPrivileges=yes",
+        "# Only the rights to look into code/ (the project's account owns it) for the release that ran,",
+        "# and to give the log's anchor the log's group, so the project's account can check the log.",
+        "CapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_CHOWN",
+        "ProtectSystem=strict",
+        f"ReadWritePaths={line_path(layout.log)}",
+        "ProtectHome=yes",
+        "PrivateTmp=yes",
+        "PrivateDevices=yes",
+        "ProtectKernelTunables=yes",
+        "ProtectKernelModules=yes",
+        "ProtectKernelLogs=yes",
+        "ProtectControlGroups=yes",
+        "RestrictSUIDSGID=yes",
+        "LockPersonality=yes",
+        "RestrictRealtime=yes",
+        "RestrictNamespaces=yes",
+        "# Of the project's folders it needs only log/ and the link code/current.",
+        "InaccessiblePaths=" + " ".join(f"-{line_path(x)}" for x in others),
+        "# systemd's control socket is a unix socket in /run; it needs no network.",
+        "PrivateNetwork=yes",
+        "RestrictAddressFamilies=AF_UNIX",
+        "SystemCallArchitectures=native",
+        "SystemCallFilter=@system-service",
+        "",
+    ]
+    return "\n".join(lines)
+
+
 def render_ui_refresh(project: Project, *, layout, easy_ui: str, mes_python: str = DEFAULT_MES_PYTHON) -> str:
     p = _check_project(project.name)
     easy_ui = check_tool_path(easy_ui, "the path of easy-ui")
@@ -850,6 +1034,9 @@ def render_ui_refresh(project: Project, *, layout, easy_ui: str, mes_python: str
         "",
         "[Unit]",
         f"Description=Rebuild the dashboard data of project {p}",
+        *(["# Ordering only: the jobs it waits for stay loaded, with how their runs ended, until root's",
+           "# check below has read them.",
+           "After=" + " ".join(job_unit(p, u) for u in upstream)] if upstream else []),
         "",
         "[Service]",
         "Type=oneshot",
@@ -875,6 +1062,7 @@ def render_ui_refresh(project: Project, *, layout, easy_ui: str, mes_python: str
         "# The dashboard server's account reads ui/ through its group, so new files are group-readable.",
         *hardening(umask="0027"),
         *_view(layout, ro=[layout.code, layout.data, layout.state], rw=[layout.ui]),
+        *(control_socket_lines() if upstream else []),
         _hidden(project, layout),
         "PrivateNetwork=yes",
         "RestrictAddressFamilies=AF_UNIX",
@@ -1086,7 +1274,9 @@ def render_selftest(project: Project, *, layout, mes: str, mes_python: str = DEF
     with a job's exact sandbox and leaves its answer in ``gate/selftest/``, the only part of gate/
     it sees. One probe is a job without network; the other is a job that lists one host
     (SELFTEST_HOST, mapped to a documentation address that leads nowhere), like real jobs with
-    ``network = [...]``."""
+    ``network = [...]``. After the first probe, root records its run (``record.selftest``) and
+    starts a third probe with the sandbox of a job that waits for another (``selftest-after``),
+    whose root check asks systemd how the first one ended, exactly like a real ``after`` job."""
     p = _check_project(project.name)
     path_name, service_name = selftest_units(p)
     net_path, net_service = selftest_net_units(p)
@@ -1095,6 +1285,9 @@ def render_selftest(project: Project, *, layout, mes: str, mes_python: str = DEF
                 trigger="manual", memory="128M", timeout="2m", network=(), writes=("data", "state"))
     net_probe = Job(id=f"{app}.selftest", name="selftest", app=app, run="selftest", argv=("selftest",),
                     trigger="manual", memory="128M", timeout="2m", network=(SELFTEST_HOST,), writes=("data", "state"))
+    after_probe = Job(id=f"{app}.selftest", name="selftest", app=app, run="selftest", argv=("selftest",),
+                      trigger="after", after=f"{app}.selftest", memory="128M", timeout="2m", network=(),
+                      writes=("data", "state"))
     gate = sandbox_path(layout.gate)
     return {
         path_name: _selftest_path(p, path_name, service_name, sandbox_path(f"{gate}/selftest-request"), "a job"),
@@ -1104,6 +1297,9 @@ def render_selftest(project: Project, *, layout, mes: str, mes_python: str = DEF
         net_service: render_job_service(project, net_probe, layout=layout, mes=mes, mes_python=mes_python,
                                         selftest="net"),
         selftest_net_unit(p): render_selftest_net(project, layout=layout, mes_python=mes_python),
+        selftest_after_unit(p): render_job_service(project, after_probe, layout=layout, mes=mes, mes_python=mes_python,
+                                                   selftest="after"),
+        selftest_record_unit(p): render_record(project, None, layout=layout, mes_python=mes_python),
     }
 
 
@@ -1317,6 +1513,7 @@ def render_project(project: Project, *, layout, mes: str, mes_python: str = DEFA
     for job in project.jobs.values():
         files[job_unit(project.name, job.id)] = render_job_service(project, job, layout=layout, mes=mes,
                                                                    mes_python=mes_python)
+        files[record_unit(project.name, job.id)] = render_record(project, job, layout=layout, mes_python=mes_python)
         if job.trigger == "schedule":
             files[job_unit(project.name, job.id, "timer")] = render_job_timer(project, job)
         if job.trigger == "webhook":

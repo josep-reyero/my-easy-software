@@ -113,7 +113,12 @@ and removed.
 Job units are named after the job id: `mes-<project>.job.<app>.<job>.service` (and `.timer`,
 `.path`, and `mes-<project>.net.<app>.<job>.service` for a job with hosts). A job that may write
 data first runs `mes db sync` (`ExecStartPre`, as the project's account, with an empty environment
-and Python's isolated mode). The plan lists, for each app, where it comes from, which hosts its
+and Python's isolated mode). Each job also has a record unit,
+`mes-<project>.record.<app>.<job>.service`: when a run ends, whatever its result, systemd starts it
+and root, outside the job's sandbox, adds the run to the run log in `log/` (see `mes guide jobs`).
+Its result is its own, so a failing record never turns a job that worked into a failed one. Root
+runs nothing inside a unit that runs project code, except the check before a job that waits for
+another (and before the dashboard refresh): it asks systemd how the job before it ended. The plan lists, for each app, where it comes from, which hosts its
 jobs may reach (`network`, and `local_network` for devices on your own network) and their memory
 and time limits, so you can see what each app is allowed before you run the script. Installing
 an app gives its code the right to run as the project's account inside these sandboxes.
@@ -127,7 +132,10 @@ there. So no service socket of the server (systemd, D-Bus, systemd-resolved, use
 Tailscale, Docker, containerd, Podman, nscd, CUPS, Avahi) can be reached. A job without network
 has a private network, with its own abstract unix sockets. A job that lists hosts shares the
 server's network, where other programs' abstract unix sockets live, so it may not open unix
-sockets at all (socket pairs inside the job still work).
+sockets at all (socket pairs inside the job still work). A job that waits for another, and the
+dashboard refresh, also see systemd's control socket and an empty `/run/systemd/system`: root's
+check before the run runs in the job's unit and needs both to ask systemd; only root can use the
+socket, so the job gains nothing from it.
 
 The install step of a deploy (and `mes server run-as --network any`) has the internet, but not
 this computer, link-local, multicast, private, Tailscale (`100.64.0.0/10`) or IPv6 unique-local
@@ -146,9 +154,13 @@ network. The plan's header says the same.
 - After the first deploy, from your computer: `mes server selftest <project> --host <server>
   --login-key ~/.ssh/mes-login` (and on the server, as your account, `/usr/local/bin/mes server
   selftest <project>` for the checks from outside). It asks the real sandboxes (read, write,
-  install, publish, a job's and a job's that lists hosts) what they can reach and reports pass,
-  fail or skipped per claim; only passes count. When it cannot tell whether systemd's address
-  filter is attached, it says so (todo) instead of passing.
+  install, publish, a job's, a job's that lists hosts and a job's that waits for another) what
+  they can reach and reports pass, fail or skipped per claim; only passes count. When it cannot
+  tell whether systemd's address filter is attached, it says so (todo) instead of passing. It
+  also proves the steps around a run: the job probe's run must appear in the run log (written by
+  `mes-<project>.record.selftest.service`) and the probe that waits for it
+  (`mes-<project>.selftest-after.service`) must start; when either does not happen it reports
+  todo and names the unit to look at.
 
 Dashboard password (always `cd /` first and full paths after `sudo -u`):
 `cd / && sudo -u mes-<project>-web /usr/local/bin/easy-ui set-password --ui-dir

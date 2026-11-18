@@ -75,9 +75,20 @@ Commands:
   `timeout`, ...). `--verify` checks the chain of records; on
   a personal computer that shows mistakes, not a determined edit. On a server root also keeps an
   anchor (record count and newest hash) after every run, so `--verify --server-root /var/lib/mes`
-  also catches a log that was cut, emptied or replaced.
+  also catches a log that was cut, emptied or replaced. On a server the log also holds the runs
+  of `mes server selftest`'s probe (job `selftest`, started "by the server self-test").
 
 Schedules run on a server: `mes server plan` turns every job into a sandboxed system unit
 (`mes-<project>.job.<app>.<job>.service`, run as the project's own account, no access to other projects or home folders, memory and time limits), and
 `mes deploy` installs new versions. On a laptop, run jobs by hand. Tell the user in plain words
 what a job does and when, before adding it.
+
+How runs are recorded on a server: when a run ends, whatever its result, systemd starts the job's
+record unit (`mes-<project>.record.<app>.<job>.service`). It runs as root, outside the job's
+sandbox, reads how the run ended from systemd and appends it to the run log in `log/`, which no
+job can change; a run that is already in the log is not added again. The record is a unit of its
+own: if it fails, that unit shows it, and the job's own result stays what the job did. A job with
+`after` (and the dashboard refresh) starts only after a real success: just before it runs, root
+asks systemd how the job before it ended and skips the run (recorded as `skipped`) when that one
+stopped with exit code 75 or was skipped itself. When root cannot tell, the waiting job fails
+(exit 255) instead of being skipped quietly.

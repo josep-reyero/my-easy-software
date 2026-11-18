@@ -300,6 +300,12 @@ def test_script_really_runs_and_is_idempotent(proj, keys, tmp_path):
     stale.write_text(units.HEADER + "\n# mes-project: demo\n")
     foreign = tmp_path / "units" / "mes-demo.job.keep.service"
     foreign.write_text("# not made by mes\n")
+    # The record unit of a job that is gone goes with it; the plan's own record units stay.
+    stale_record = tmp_path / "units" / "mes-demo.record.old-app.x.service"
+    stale_record.write_text(units.HEADER + "\n# mes-project: demo\n")
+    records = [n for n in plan.units if n.startswith("mes-demo.record.")]
+    assert "mes-demo.record.selftest.service" in records and len(records) >= 2
+    assert "mes-demo.selftest-after.service" in plan.units
     first = _run_script(script, tmp_path / "fake")
     assert first.returncode == 0, first.stderr
     assert "Done. The project demo is set up." in first.stdout
@@ -330,10 +336,12 @@ def test_script_really_runs_and_is_idempotent(proj, keys, tmp_path):
     assert stat.S_IMODE((base / "etc/webhook.key").stat().st_mode) == 0o640
     for name, text in plan.units.items():
         assert (tmp_path / "units" / name).read_text() == text.rstrip("\n") + "\n"
-    assert not stale.exists() and foreign.exists()
+    assert not stale.exists() and foreign.exists() and not stale_record.exists()
     log = (tmp_path / "fake" / "log").read_text()
     assert log.count("useradd") == 2 and "systemctl daemon-reload" in log
     assert "systemctl disable --now -- mes-demo.job.old.service" in log
+    assert not any(f"disable --now -- {n}" in log for n in records)
+    assert not any(n in line for n in records for line in log.splitlines() if "enable --now" in line)
     # Second run: same files, the accounts are not created again, the secret is kept.
     second = _run_script(script, tmp_path / "fake")
     assert second.returncode == 0, second.stderr

@@ -1421,7 +1421,7 @@ def _cmd_rebuild_accepted(args: argparse.Namespace) -> Any:
 def _cmd_selftest_probe(args: argparse.Namespace) -> Any:
     from mes import selftest
 
-    if args.context not in ("job", "net"):
+    if args.context not in ("job", "net", "after"):
         raise UsageError("Only the job probes run this way.", hint="Use: mes server selftest <project>")
     layout = paths.server_layout(check_server_name(args.project), args.server_root)
     return selftest.write_job_result(layout, args.context)
@@ -1619,7 +1619,7 @@ def register(subparsers: Any) -> None:
 
     pr = sub.add_parser("selftest-probe", help="(Run by the server's self-test unit.) Probe a job's sandbox.")
     pr.add_argument("project")
-    pr.add_argument("--context", required=True, choices=("job", "net"))
+    pr.add_argument("--context", required=True, choices=("job", "net", "after"))
     pr.add_argument("--server-root", required=True, metavar="DIR")
     pr.set_defaults(func=_cmd_selftest_probe)
 

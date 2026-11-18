@@ -463,9 +463,10 @@ def server_root(tmp_path):
     return root
 
 
-def _systemd_env(monkeypatch, *, status="2", result="exit-code", code="1", state="deactivating"):
-    """What systemd shows for the unit while its ExecStopPost runs. The record step gets an empty
-    environment (env -i), so everything comes from these properties."""
+def _systemd_env(monkeypatch, *, status="2", result="exit-code", code="1", state="failed"):
+    """What systemd shows for the job's unit once a run has ended, when the job's record unit
+    runs. The record step gets an empty environment (env -i), so everything comes from these
+    properties."""
     monkeypatch.setattr(jobs, "_is_linux", lambda: True)
     for k in ("INVOCATION_ID", "SERVICE_RESULT", "EXIT_CODE", "EXIT_STATUS"):
         monkeypatch.delenv(k, raising=False)
@@ -475,7 +476,7 @@ def _systemd_env(monkeypatch, *, status="2", result="exit-code", code="1", state
         asked.append(unit)
         return {"InvocationID": INVOCATION, "ExecMainStartTimestampMonotonic": "1000000",
                 "ExecMainExitTimestampMonotonic": "3500000", "Result": result, "ExecMainCode": code,
-                "ExecMainStatus": status, "ActiveState": state,
+                "ExecMainStatus": status, "ActiveState": state, "LoadState": "loaded",
                 "ExecStart": '{ path=/x/.venv/bin/demo ; argv[]=/x/.venv/bin/demo --json sync ; ignore_errors=no }'}
 
     monkeypatch.setattr(jobs, "_show", show)
@@ -503,19 +504,24 @@ def test_record_from_systemd(server_root, capsys, monkeypatch):
 
 def test_record_counts_exit_75_and_a_skipped_condition_as_skipped(server_root, capsys, monkeypatch):
     """Finding H: with SuccessExitStatus=75 systemd says "success" for exit 75; the log says skipped."""
-    _systemd_env(monkeypatch, status="75", result="success", code="1")
+    _systemd_env(monkeypatch, status="75", result="success", code="1", state="inactive")
     code, data = mes(capsys, "jobs", "record", "--project", "demo", "--server-root", str(server_root), "demo-app.sync")
     assert code == 0, data
     log = paths.server_layout("demo", server_root).run_log
     assert jobs.read_log(log)[-1]["result"] == "skipped"
+    # A job that waits for a skipped one is not run (its condition said no): skipped as well.
+    monkeypatch.setattr(jobs, "_show", lambda unit, *p: {
+        "InvocationID": "c" * 32, "Result": "exec-condition", "ActiveState": "inactive", "LoadState": "loaded"})
+    code, data = mes(capsys, "jobs", "record", "--project", "demo", "--server-root", str(server_root), "demo-tool.report")
+    assert code == 0 and data["result"] == "skipped" and data["exit_code"] is None
 
 
 def test_should_run_follows_the_job_that_finished_last():
     def show_with(states):
         return lambda unit, *props: states[unit]
 
-    ok = {"Result": "success", "ExecMainCode": "1", "ExecMainStatus": "0"}
-    temp = {"Result": "success", "ExecMainCode": "1", "ExecMainStatus": "75"}
+    ok = {"Result": "success", "ExecMainCode": "1", "ExecMainStatus": "0", "InvocationID": "a" * 32}
+    temp = {"Result": "success", "ExecMainCode": "1", "ExecMainStatus": "75", "InvocationID": "b" * 32}
     unit = units.job_unit
     states = {unit("demo", "app-a.one"): {**ok, "InactiveEnterTimestampMonotonic": "100"},
               unit("demo", "app-a.two"): {**temp, "InactiveEnterTimestampMonotonic": "200"}}
@@ -530,13 +536,36 @@ def test_should_run_follows_the_job_that_finished_last():
         jobs.should_run("demo", ["app-a.one", "app-a.two"], server_root="/var/lib/mes", show=show_with(states))
     with pytest.raises(jobs.ShouldRunBroken):
         jobs.should_run("demo", ["../x"], server_root="/var/lib/mes", show=show_with(states))
+    # A unit systemd knows of no run of (never run, or forgotten) cannot say it succeeded.
+    states[unit("demo", "app-a.one")] = {**ok, "Result": "success", "InvocationID": "",
+                                         "InactiveEnterTimestampMonotonic": "400"}
+    with pytest.raises(jobs.ShouldRunBroken):
+        jobs.should_run("demo", ["app-a.one", "app-a.two"], server_root="/var/lib/mes", show=show_with(states))
+
+
+def test_should_run_for_the_selftest_asks_about_the_job_probe():
+    asked = []
+
+    def show(unit, *props):
+        asked.append(unit)
+        return {"Result": "success", "ExecMainCode": "1", "ExecMainStatus": "0", "InvocationID": "a" * 32,
+                "InactiveEnterTimestampMonotonic": "5"}
+
+    assert jobs.should_run("demo", [], server_root="/var/lib/mes", show=show, selftest=True) == \
+        {"run": True, "after": "selftest"}
+    assert asked == ["mes-demo.selftest.service"]
+    with pytest.raises(jobs.ShouldRunBroken):
+        jobs.should_run("demo", ["demo-app.sync"], server_root="/var/lib/mes", show=show, selftest=True)
+    with pytest.raises(jobs.ShouldRunBroken):
+        jobs.should_run("demo", [], server_root="/var/lib/mes", show=show)
 
 
 def test_should_run_exits_0_to_run_1_to_skip_and_255_when_it_cannot_tell(capsys, monkeypatch):
     """In ExecCondition= systemd skips the run on exit 1 to 254, so a broken check (exit 1 to 5)
     quietly skipped every dashboard refresh. Now: 0 run, 1 upstream did not succeed, 255 broken
     (systemd fails the unit), with a message of its own."""
-    ok = {"Result": "success", "ExecMainCode": "1", "ExecMainStatus": "0", "InactiveEnterTimestampMonotonic": "5"}
+    ok = {"Result": "success", "ExecMainCode": "1", "ExecMainStatus": "0", "InactiveEnterTimestampMonotonic": "5",
+          "InvocationID": "a" * 32}
     state = {"props": ok}
     monkeypatch.setattr(jobs, "_is_linux", lambda: True)
     monkeypatch.setattr(jobs, "_show", lambda unit, *props: state["props"])
@@ -595,7 +624,7 @@ def test_allow_network_for_the_selftest_allows_only_its_test_address(tmp_path):
 def test_record_ignores_a_project_writable_environment(server_root, capsys, monkeypatch):
     """Finding 4: root used to read SERVICE_RESULT and friends from its environment, which came
     with the job's settings. Now only systemd's properties count."""
-    _systemd_env(monkeypatch, status="0", result="success")
+    _systemd_env(monkeypatch, status="0", result="success", state="inactive")
     monkeypatch.setenv("SERVICE_RESULT", "exit-code")
     monkeypatch.setenv("EXIT_STATUS", "99")
     code, data = mes(capsys, "jobs", "record", "--project", "demo", "--server-root", str(server_root), "demo-app.sync")
@@ -609,7 +638,7 @@ def test_cut_or_emptied_server_log_is_caught_by_its_anchor(server_root, capsys, 
     for inv in ("a" * 32, "b" * 32):
         monkeypatch.setattr(jobs, "_show", lambda unit, *p, inv=inv: {
             "InvocationID": inv, "Result": "success", "ExecMainCode": "1", "ExecMainStatus": "0",
-            "ActiveState": "deactivating"})
+            "ActiveState": "inactive", "LoadState": "loaded"})
         assert mes(capsys, "jobs", "record", "--project", "demo", "--server-root", str(server_root), "demo-app.sync")[0] == 0
     lines = log.read_bytes().splitlines(keepends=True)
     log.write_bytes(lines[0])  # cut the newest record off: the chain alone still verifies
@@ -632,13 +661,66 @@ def test_forged_systemd_record_is_refused(server_root, capsys, monkeypatch):
     monkeypatch.setattr(jobs, "_is_linux", lambda: False)
     code, data = mes(capsys, *argv)
     assert code == 5 and data["error"]["code"] == "not_from_systemd"
-    _systemd_env(monkeypatch, state="inactive")  # nobody is just finishing a run
+    for state in ("activating", "active", "deactivating", ""):  # its newest run has not ended
+        _systemd_env(monkeypatch, state=state)
+        code, data = mes(capsys, *argv)
+        assert code == 5 and data["error"]["code"] == "not_from_systemd", state
+    monkeypatch.setattr(jobs, "_show", lambda unit, *p: {"InvocationID": "not-hex", "ActiveState": "inactive"})
     code, data = mes(capsys, *argv)
     assert code == 5
-    monkeypatch.setattr(jobs, "_show", lambda unit, *p: {"InvocationID": "not-hex", "ActiveState": "deactivating"})
+    monkeypatch.setattr(jobs, "_show", lambda unit, *p: {})  # systemd could not be asked
+    code, data = mes(capsys, *argv)
+    assert code == 5 and "knows of no finished run" in data["error"]["message"]
+    monkeypatch.setattr(jobs, "_show", lambda unit, *p: {"InvocationID": INVOCATION, "ActiveState": "inactive",
+                                                          "LoadState": "not-found"})  # no such job
     code, data = mes(capsys, *argv)
     assert code == 5
     assert not paths.server_layout("demo", server_root).run_log.exists()
+
+
+def test_record_of_the_selftest_probe(server_root, capsys, monkeypatch):
+    """The self-test's job probe is recorded like a job, so the self-test proves recording."""
+    asked = _systemd_env(monkeypatch, status="0", result="success", state="inactive")
+    argv = ("jobs", "record", "--project", "demo", "--server-root", str(server_root))
+    code, data = mes(capsys, *argv, "--selftest")
+    assert code == 0, data
+    assert asked == ["mes-demo.selftest.service"] and data["invocation"] == INVOCATION
+    rec = jobs.read_log(paths.server_layout("demo", server_root).run_log)[-1]
+    assert rec["job"] == "selftest" and rec["app"] is None and rec["via"] == "mes server selftest"
+    code, data = mes(capsys, *argv, "--selftest", "demo-app.sync")
+    assert code == 2
+    code, data = mes(capsys, "jobs", "log", "--project", "demo", "--server-root", str(server_root))
+    assert code == 0
+    assert cli.run(["jobs", "log", "--project", "demo", "--server-root", str(server_root)]) == 0
+    assert "by the server self-test" in capsys.readouterr().out
+
+
+def test_the_anchor_gets_the_logs_group(tmp_path, monkeypatch):
+    """Root writes the anchor; the project's account reads the log through its group, so the
+    anchor gets the log's group too (else 'mes jobs log --verify' as that account has no anchor)."""
+    log = tmp_path / "runs.jsonl"
+    jobs.append_record(log, {"time": "t"})
+    want = os.stat(log).st_gid
+    calls = []
+    real_fstat = os.fstat
+
+    class Other:  # the new file got another group (root's, on a server)
+        def __init__(self, st):
+            self._st, self.st_gid = st, st.st_gid + 1
+
+        def __getattr__(self, name):
+            return getattr(self._st, name)
+
+    monkeypatch.setattr(jobs.os, "fstat", lambda fd: Other(real_fstat(fd)))
+    monkeypatch.setattr(jobs.os, "fchown", lambda fd, uid, gid: calls.append((uid, gid)))
+    jobs.write_head(log)
+    assert calls == [(-1, want)]
+
+    def refuse(fd, uid, gid):
+        raise PermissionError("not root")
+
+    monkeypatch.setattr(jobs.os, "fchown", refuse)
+    assert jobs.write_head(log)["records"] == 1  # the anchor is written all the same
 
 
 @pytest.mark.parametrize("project,job", [

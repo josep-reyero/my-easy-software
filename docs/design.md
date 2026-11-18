@@ -162,6 +162,10 @@ hidden, and so are secret files in `/etc` (shadow passwords, SSH host keys, sudo
 and VPN credentials, private TLS keys). Other projects' folders, the sign-in folder, the gate's
 folder and its sockets are not there at all. Units without network get a private network (and
 with it their own abstract-socket namespace); a job with a host list cannot open unix sockets.
+The one exception under `/run`: a job that waits for another (and the dashboard refresh) sees
+systemd's control socket, which only root can use, and an empty `/run/systemd/system`, because
+root's check before the run runs in the job's unit and systemd gives commands marked `+` the
+unit's mounts too.
 
 **Remote access** is only SSH to `mes-<project>` with keys whose `authorized_keys` line forces
 `mes gate --project <project> --allow read|write|deploy` and disables forwarding, pty and agent.
@@ -176,8 +180,12 @@ denies all IP traffic, and a root helper unit resolves the hosts just before eac
 internet addresses (local-network ones only for `local_network` hosts), writes the job's own hosts
 file (its only name lookup) and allows only those addresses. A job that may write data first
 brings the shared database in line with `project.toml` (`mes db sync`, as the project's account,
-with an empty environment). After every run, root records it in the tamper-evident run log in
-`log/`, which no job can change. On a personal computer (`mes jobs run`) host lists cannot be
+with an empty environment). After every run, whatever its result, the job's record unit (root,
+a unit of its own) reads how the run ended from systemd and appends it to the tamper-evident run
+log in `log/`, which no job can change; a failing record shows in its own unit and never turns a
+job that worked into a failed one. A job that waits for another, and the dashboard refresh, start
+only after a real success: root checks how the job before it ended (not exit code 75, not
+skipped) just before the run. On a personal computer (`mes jobs run`) host lists cannot be
 enforced, and mes says so.
 
 ## Deploys
@@ -324,4 +332,6 @@ fake-command harness, and deploys run end to end against a temporary "server" fo
 gate. What systemd and the kernel enforce can only be shown on a real Linux server, which is what
 `mes server selftest` and `mes server analyze` are for: the per-request socket sandboxes and their
 peer check, the hidden paths and sockets, the job network allow list and its timing, the deploy
-steps' sandboxes, the gate's login shell under sshd, and `tailscale serve` to a unix socket.
+steps' sandboxes, the record of each run and the check before a job that waits for another (the
+self-test runs both for real), the gate's login shell under sshd, and `tailscale serve` to a unix
+socket.

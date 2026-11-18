@@ -17,10 +17,12 @@ Commands (``--project-dir DIR``; default: the project in the current folder)
 Used by the system units on a server (admin; they run as root, take only names as arguments
 and read nothing from the project's files):
 
-``mes jobs record --project P --server-root R <job id>``
-    after each run (``ExecStopPost=+``, with an empty environment and ``python -I``): reads the
-    run's result from systemd's own properties (``systemctl show``), appends it to
-    ``<R>/<P>/log/runs.jsonl`` (with the invocation, the release and the command line) and
+``mes jobs record --project P --server-root R -- <job id>``  (``--selftest``: the self-test's probe)
+    after each run, in the job's own record unit (``mes-<P>.record.<app>.<job>.service``, started
+    by the job unit's ``OnSuccess=`` and ``OnFailure=``, as root with an empty environment and
+    ``python -I``): reads the run's result from systemd's own properties (``systemctl show``) of
+    the job unit's newest run, which must have ended and must not be in the log yet, appends it
+    to ``<R>/<P>/log/runs.jsonl`` (with the invocation, the release and the command line) and
     rewrites the anchor ``runs.jsonl.head`` (record count and newest hash).
 ``mes jobs allow-network --unit U [--hosts-file F] [--local H]... -- <host>...``
     before each run of a job that lists hosts: looks the hosts up, keeps only internet
@@ -30,7 +32,7 @@ and read nothing from the project's files):
     opened to the job. ``--selftest`` is the helper of the host-list self-test probe: its one host
     (``units.SELFTEST_HOST``) gets the documentation address ``units.SELFTEST_ADDRESS`` without a
     lookup.
-``mes jobs should-run --project P --server-root R -- <job id>...``
+``mes jobs should-run --project P --server-root R -- <job id>...``  (``--selftest``: the self-test's)
     before a job that waits for another (``ExecCondition=+``): asks systemd how the job that
     finished last of those ended; exit 0 lets this run start, exit 1 skips it (that job failed,
     was itself skipped, or stopped with exit code 75, "a temporary problem"). Any other problem
@@ -43,7 +45,9 @@ One JSON object per line, per run::
 
     {"time", "project", "app", "job", "via", "argv", "exit_code", "result", "duration_s", "prev"}
 
-``app`` is the app's name and ``job`` the job id.
+``app`` is the app's name and ``job`` the job id. Runs of the server self-test's probe are
+recorded too (``"job": "selftest"``, ``"app": null``, ``"via": "mes server selftest"``): they
+prove that recording works on the real server.
 
 ``result`` uses systemd's words: ``success``, ``exit-code``, ``timeout``, ``signal``,
 ``start-failed`` (and whatever else systemd reports), plus ``skipped``: the job stopped with exit
@@ -681,11 +685,11 @@ def _show(unit: str, *props: str) -> dict[str, str]:
     return out
 
 
-def _not_from_systemd() -> Refused:
+def _not_from_systemd(job: str) -> Refused:
     return Refused(
-        "This command only records a run that systemd itself has just finished, and this one was "
-        "not started by systemd, so nothing was added to the run log. (Otherwise anyone could add "
-        "made-up runs to the history.)",
+        f'This command records a run of "{job}" that systemd itself has finished, and systemd knows of no '
+        "finished run of it (it is still running, or it has not run since the server started), so nothing "
+        "was added to the run log. Everything in a record comes from systemd, so nobody can add made-up runs.",
         hint="To run a job yourself, use: mes jobs run <job>",
         code="not_from_systemd",
     )
@@ -696,21 +700,35 @@ def _exec_text(props: dict[str, str]) -> str | None:
     return m.group(1)[:2000] if m else None
 
 
-def record_systemd_run(project_name: str, job_name: str, server_root: str | Path) -> dict[str, Any]:
-    """Called as root by systemd (ExecStopPost=+) after each run, with an empty environment: only
-    names come in, and everything about the run is read from systemd's own properties."""
+SELFTEST_JOB = "selftest"
+SELFTEST_VIA = "mes server selftest"
+
+
+def record_systemd_run(project_name: str, job_name: str | None, server_root: str | Path, *,
+                       selftest: bool = False) -> dict[str, Any]:
+    """Run as root by the job's record unit after each run, with an empty environment: only names
+    come in, and everything about the run is read from systemd's own properties of the job unit.
+    Its newest run must have ended (the unit is inactive or failed) and must not be in the log
+    yet (a replay is refused by its invocation id). ``selftest``: the self-test's job probe."""
     layout = paths.server_layout(project_name, server_root)
-    if not manifest_mod.JOB_ID_RE.fullmatch(job_name or ""):
-        raise UsageError(f"{str(job_name)[:70]!r} is not a job id.", hint="Use the job's id: <app>.<job>.")
-    unit = units.job_unit(project_name, job_name)
+    if selftest:
+        if job_name:
+            raise UsageError("--selftest takes no job id.", hint="Use: mes jobs record --project P --server-root R --selftest")
+        unit, job_name = units.selftest_units(project_name)[1], SELFTEST_JOB
+    else:
+        if not manifest_mod.JOB_ID_RE.fullmatch(job_name or ""):
+            raise UsageError(f"{str(job_name)[:70]!r} is not a job id.", hint="Use the job's id: <app>.<job>.")
+        unit = units.job_unit(project_name, job_name)
     if not _is_linux():
-        raise _not_from_systemd()
-    props = _show(unit, "InvocationID", "Result", "ExecMainCode", "ExecMainStatus", "ActiveState",
+        raise _not_from_systemd(job_name)
+    props = _show(unit, "InvocationID", "Result", "ExecMainCode", "ExecMainStatus", "ActiveState", "LoadState",
                   "ExecMainStartTimestampMonotonic", "ExecMainExitTimestampMonotonic", "ExecStart")
     invocation = props.get("InvocationID", "")
-    # While ExecStopPost runs, the unit is "deactivating"; any other time, nobody just finished a run.
-    if not _INVOCATION_RE.match(invocation) or props.get("ActiveState") != "deactivating":
-        raise _not_from_systemd()
+    # The record unit starts once the run has ended, so the job's unit is inactive (or failed);
+    # while it is starting or running, its newest invocation has not finished.
+    if props.get("LoadState", "loaded") != "loaded" or not _INVOCATION_RE.match(invocation) \
+            or props.get("ActiveState") not in ("inactive", "failed"):
+        raise _not_from_systemd(job_name)
     result = props.get("Result") or "unknown"
     if not re.fullmatch(r"[a-z-]{1,40}", result):
         result = "unknown"
@@ -746,9 +764,9 @@ def record_systemd_run(project_name: str, job_name: str, server_root: str | Path
     rec = append_record(log, {
         "time": _now(),
         "project": project_name,
-        "app": job_name.split(".", 1)[0],
+        "app": None if selftest else job_name.split(".", 1)[0],
         "job": job_name,
-        "via": "systemd",
+        "via": SELFTEST_VIA if selftest else "systemd",
         "unit": unit,
         "invocation": invocation,
         "release": int(m.group(1)) if m else None,
@@ -758,7 +776,7 @@ def record_systemd_run(project_name: str, job_name: str, server_root: str | Path
         "duration_s": duration,
     })
     write_head(log)
-    return {k: rec[k] for k in ("time", "job", "result", "exit_code", "duration_s")}
+    return {k: rec[k] for k in ("time", "job", "result", "exit_code", "duration_s", "invocation")}
 
 
 SHOULD_RUN_BROKEN = 255
@@ -781,10 +799,11 @@ def _should_run_broken(why: str) -> ShouldRunBroken:
 
 
 def should_run(project_name: str, upstream: Sequence[str], *, server_root: str | Path,
-               show: Callable[..., dict[str, str]] | None = None) -> dict[str, Any]:
+               show: Callable[..., dict[str, str]] | None = None, selftest: bool = False) -> dict[str, Any]:
     """Called as root by systemd (``ExecCondition=+``) before a job that waits for another, or
     before the dashboard refresh. Of the listed jobs, the one that finished last started this
     run; it may go ahead only if that one really succeeded (not exit code 75, not skipped).
+    ``selftest``: before the self-test's dependent probe, about the job probe.
 
     Returns when it may run (exit 0); raises ``MesError`` with code ``upstream_skipped`` (exit 1,
     systemd skips the run) when that job did not succeed; anything else is ``ShouldRunBroken``
@@ -793,7 +812,9 @@ def should_run(project_name: str, upstream: Sequence[str], *, server_root: str |
         paths.server_layout(project_name, server_root)  # checks the project name
     except MesError:
         raise _should_run_broken(f"{str(project_name)[:40]!r} is not a project name") from None
-    if not upstream:
+    if selftest and upstream:
+        raise _should_run_broken("--selftest takes no job ids")
+    if not upstream and not selftest:
         raise _should_run_broken("no job was named")
     for job in upstream:
         if not manifest_mod.JOB_ID_RE.fullmatch(job or ""):
@@ -801,10 +822,12 @@ def should_run(project_name: str, upstream: Sequence[str], *, server_root: str |
     if show is None and not _is_linux():
         raise _should_run_broken("this is not a Linux server with systemd")
     look = show or _show
+    targets = [(SELFTEST_JOB, units.selftest_units(project_name)[1])] if selftest else \
+        [(job, units.job_unit(project_name, job)) for job in upstream]
     latest: tuple[int, str, dict[str, str]] | None = None
-    for job in upstream:
-        props = look(units.job_unit(project_name, job), "Result", "ExecMainCode", "ExecMainStatus",
-                     "InactiveEnterTimestampMonotonic")
+    for job, unit in targets:
+        props = look(unit, "Result", "ExecMainCode", "ExecMainStatus", "InactiveEnterTimestampMonotonic",
+                     "InvocationID")
         if not props.get("Result"):
             raise _should_run_broken(f'systemd did not say how the job "{job}" ended')
         try:
@@ -815,6 +838,8 @@ def should_run(project_name: str, upstream: Sequence[str], *, server_root: str |
             latest = (when, job, props)
     assert latest is not None
     _, job, props = latest
+    if not _INVOCATION_RE.match(props.get("InvocationID", "")):
+        raise _should_run_broken(f'systemd knows of no run of the job "{job}"')
     temporary = props.get("ExecMainCode") == "1" and props.get("ExecMainStatus") == str(TEMPORARY_EXIT)
     if props.get("Result") != "success" or temporary:
         raise MesError(
@@ -836,6 +861,12 @@ def write_head(log_path: Path) -> dict[str, Any]:
     head = {"records": len(lines), "head": _line_hash(lines[-1]) if lines else None}
     tmp = log_path.with_name(log_path.name + HEAD_SUFFIX + ".tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o640)
+    # The anchor gets the log's group (on a server the project's account), so that account can
+    # check the log against it. If that is not allowed here, the anchor is still written.
+    with contextlib.suppress(OSError):
+        group = os.stat(log_path).st_gid
+        if os.fstat(fd).st_gid != group:
+            os.fchown(fd, -1, group)
     with os.fdopen(fd, "w", encoding="ascii") as f:
         json.dump(head, f)
     os.replace(tmp, log_path.with_name(log_path.name + HEAD_SUFFIX))
@@ -1108,7 +1139,8 @@ _RESULT_WORDS = {
     "watchdog": "stopped: stuck",
     "resources": "could not start: not enough resources",
 }
-_VIA_WORDS = {"mes jobs run": "by hand", "systemd": "on the server", "mes db rebuild": "by hand (mes db rebuild)"}
+_VIA_WORDS = {"mes jobs run": "by hand", "systemd": "on the server", "mes db rebuild": "by hand (mes db rebuild)",
+              SELFTEST_VIA: "by the server self-test"}
 
 
 def _cmd_status(args: argparse.Namespace) -> Any:
@@ -1137,7 +1169,7 @@ def _cmd_status(args: argparse.Namespace) -> Any:
 
 def _cmd_record(args: argparse.Namespace) -> Any:
     check_allowed("write")
-    return record_systemd_run(args.project, args.job, args.server_root)
+    return record_systemd_run(args.project, args.job, args.server_root, selftest=args.selftest)
 
 
 def _cmd_allow_network(args: argparse.Namespace) -> Any:
@@ -1148,7 +1180,7 @@ def _cmd_allow_network(args: argparse.Namespace) -> Any:
 def _cmd_should_run(args: argparse.Namespace) -> Any:
     try:
         check_allowed("read")
-        return should_run(args.project, args.jobs, server_root=args.server_root)
+        return should_run(args.project, args.jobs, server_root=args.server_root, selftest=args.selftest)
     except ShouldRunBroken:
         raise
     except MesError as e:
@@ -1202,10 +1234,11 @@ def register(subparsers: Any) -> None:
     _project_dir_arg(p)
     p.set_defaults(func=_cmd_status)
 
-    p = sub.add_parser("record", help="(Used by the server's system units after each run.) Add the run to the log.")
+    p = sub.add_parser("record", help="(Used by the server's record units after each run.) Add the run to the log.")
     p.add_argument("--project", required=True, help="the project's name")
     p.add_argument("--server-root", required=True, metavar="DIR", help="the server folder, /var/lib/mes")
-    p.add_argument("job", help="the job's id (<app>.<job>)")
+    p.add_argument("--selftest", action="store_true", help="record the run of the self-test's probe")
+    p.add_argument("job", nargs="?", default=None, help="the job's id (<app>.<job>)")
     p.set_defaults(func=_cmd_record)
 
     p = sub.add_parser("allow-network", help="(Used by the server's system units before a run.) Let a job reach "
@@ -1224,5 +1257,6 @@ def register(subparsers: Any) -> None:
                        "Skip this run when that job did not really succeed.")
     p.add_argument("--project", required=True, help="the project's name")
     p.add_argument("--server-root", required=True, metavar="DIR", help="the server folder, /var/lib/mes")
-    p.add_argument("jobs", nargs="+", help="the ids of the jobs this one waits for")
+    p.add_argument("--selftest", action="store_true", help="before the self-test's dependent probe")
+    p.add_argument("jobs", nargs="*", help="the ids of the jobs this one waits for")
     p.set_defaults(func=_cmd_should_run)

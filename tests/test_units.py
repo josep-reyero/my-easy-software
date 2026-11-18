@@ -98,11 +98,15 @@ EXPECTED_FILES = sorted([
     "mes-demo.webhook.socket", "mes-demo.webhook.service",
     "mes-demo.selftest.path", "mes-demo.selftest.service",
     "mes-demo.selftest-net.path", "mes-demo.selftest-net.service", "mes-demo.net.selftest.service",
+    "mes-demo.selftest-after.service", "mes-demo.record.selftest.service",
+    "mes-demo.record.demo-app.sync.service", "mes-demo.record.demo-app.build.service",
+    "mes-demo.record.demo-app.hook.service", "mes-demo.record.demo-app.export.service",
+    "mes-demo.record.demo-tool.report.service",
 ])
 
 SANDBOX_KEYS = {line.split("=", 1)[0] for line in units.SANDBOX_LINES + units.FS_LINES}
 DIRECTIVES = {
-    "Unit": {"Description", "Requires", "After", "Before", "OnSuccess"},
+    "Unit": {"Description", "Requires", "After", "Before", "OnSuccess", "OnFailure"},
     "Service": SANDBOX_KEYS | {
         "Type", "User", "Group", "ExecCondition", "ExecStartPre", "ExecStart", "ExecStartPost", "ExecStopPost",
         "SuccessExitStatus", "WorkingDirectory", "Environment", "Slice",
@@ -177,11 +181,18 @@ def split_exec(value: str) -> list[str]:
 
 
 def _is_project_code(name: str) -> bool:
-    if name.startswith("mes-demo.net."):
-        return False  # the network helpers run as root and read nothing of the project
+    if name.startswith(("mes-demo.net.", "mes-demo.record.")):
+        return False  # the network helpers and the run records run as root and run no project code
     return ".job." in name and name.endswith(".service") or name.endswith("@.service") \
         or name.endswith(".ui-refresh.service") or name.endswith(".webhook.service") \
-        or name.endswith(".selftest.service") or name.endswith(".selftest-net.service")
+        or name.endswith((".selftest.service", ".selftest-net.service", ".selftest-after.service"))
+
+
+PROBES = (".selftest.service", ".selftest-net.service", ".selftest-after.service")
+
+
+def _has_condition(text: str) -> bool:
+    return bool(values(text, "ExecCondition"))
 
 
 # =========================================================================== golden files
@@ -226,7 +237,7 @@ def test_every_file_parses_into_known_directives_and_markers(files):
         directives(text)
         assert text.startswith(units.HEADER + "\n"), name
         assert units.read_markers(text)[0] == "demo", name
-        if (".job." in name or ".net." in name) and ".net.selftest." not in name:
+        if (".job." in name or ".net." in name or ".record." in name) and not name.endswith(".selftest.service"):
             assert units.read_markers(text)[1] == ".".join(name.split(".")[2:4]), name
 
 
@@ -250,13 +261,15 @@ def test_project_code_runs_sandboxed_as_the_project_account(files, layout, name)
     allowed = {str(layout.data), str(layout.state), str(layout.store), str(layout.ui), str(layout.webhook)}
     if "gate-deploy" in name:
         allowed = {str(layout.uv_cache), str(layout.uv_python), str(layout.installing)}
-    if name.endswith((".selftest.service", ".selftest-net.service")):
+    if name.endswith(PROBES):
         allowed.add(f"{layout.gate}/selftest")  # the probe's answer: no job sees it
     for p in _writable(text):
         assert p in allowed, (name, p)
     # /var (so every other project and service), /run (every socket), /opt and /usr/local are
-    # empty; only this project's folders come back.
-    assert values(text, "TemporaryFileSystem") == ["/var:ro /run:ro /opt:ro /usr/local:ro"]
+    # empty; only this project's folders come back. A unit with root's check before the run also
+    # gets an empty folder where systemctl looks for the sign that systemd runs the computer.
+    extra = [f"{units.SYSTEMD_BOOTED}:ro"] if _has_condition(text) else []
+    assert values(text, "TemporaryFileSystem") == ["/var:ro /run:ro /opt:ro /usr/local:ro", *extra]
     shown = " ".join(values(text, "BindPaths") + values(text, "BindReadOnlyPaths")).split()
     for p in shown:
         src = p.split(":")[0].lstrip("-")
@@ -264,9 +277,12 @@ def test_project_code_runs_sandboxed_as_the_project_account(files, layout, name)
                    "/run/systemd/resolve/io.systemd.Resolve"):
             assert "gate-deploy" in name or src != "/run/systemd/resolve/io.systemd.Resolve", (name, p)
             continue
+        if src == units.CONTROL_SOCKET:
+            assert _has_condition(text) and not p.startswith("-"), (name, p)  # only for root's check
+            continue
         assert src.startswith(str(layout.base) + "/") or src.startswith("/run/mes-demo-net/"), (name, p)
         assert not src.startswith(str(layout.auth)), (name, p)
-        assert not src.startswith(str(layout.gate)) or (name.endswith(("selftest.service", "selftest-net.service"))
+        assert not src.startswith(str(layout.gate)) or (name.endswith(PROBES)
                                                          and src == f"{layout.gate}/selftest"), (name, p)
     # The webhook key, incoming archives and uv's cache are hidden from everything that runs
     # project code (the webhook receiver checks signatures with the key, so only it may read it).
@@ -324,12 +340,15 @@ def test_secrets_and_service_sockets_are_hidden(files):
             assert f"-{p}" in hidden, (name, p)
         # /run is an empty folder: systemd's private socket, D-Bus, resolved, userdb, the journal,
         # Tailscale, Docker, containerd, Podman, nscd, CUPS, Avahi and the gate's sockets are gone.
-        assert "/run:ro" in one(text, "TemporaryFileSystem").split(), name
-        assert "/var:ro" in one(text, "TemporaryFileSystem").split(), name
+        tmpfs = " ".join(values(text, "TemporaryFileSystem")).split()
+        assert "/run:ro" in tmpfs and "/var:ro" in tmpfs, name
         binds = " ".join(values(text, "BindPaths") + values(text, "BindReadOnlyPaths")).split()
         under_run = [b for b in binds if b.lstrip("-").split(":")[-1].startswith("/run/")]
         if "gate-deploy" in name:
             assert under_run == ["-/run/systemd/resolve/io.systemd.Resolve"], name  # name lookups for uv
+        elif _has_condition(text):
+            # Root's check before the run: systemd's control socket, which only root may use.
+            assert under_run == [units.CONTROL_SOCKET], (name, under_run)
         else:
             assert under_run == [], (name, under_run)
         assert "/run/user" not in " ".join(binds)
@@ -388,17 +407,32 @@ def test_job_with_hosts_reaches_only_what_the_helper_allows(files):
     assert values(net, "ReadWritePaths") == [] and values(net, "WorkingDirectory") == ["/"]
 
 
-def test_job_service_runs_the_app_and_records_as_root(files, layout):
+def test_job_service_runs_the_app_and_root_records_it_in_a_unit_of_its_own(files, layout):
     sync = files["mes-demo.job.demo-app.sync.service"]
     assert one(sync, "Type") == "oneshot"
     assert split_exec(one(sync, "ExecStart")) == [
         f"{layout.current_project}/.venv/bin/demo-app", "--json", "sync", "--days", "3"]
-    post = one(sync, "ExecStopPost")
-    assert post.startswith("+")
+    # The record is not a step of the job: the job unit starts its record unit once a run has
+    # ended, whatever the result.
+    assert values(sync, "ExecStopPost") == []
+    assert one(sync, "OnSuccess").split()[0] == "mes-demo.record.demo-app.sync.service"
+    assert one(sync, "OnFailure") == "mes-demo.record.demo-app.sync.service"
+    rec = files["mes-demo.record.demo-app.sync.service"]
+    assert values(rec, "User") == [] and one(rec, "Type") == "oneshot"
     # Root gets only names and the fixed server folder, never anything from the project's files,
     # and starts from an empty environment with Python in isolated mode.
-    assert split_exec(post) == [*units.ROOT_ENV, units.DEFAULT_MES_PYTHON, "-I", "-m", "mes", "jobs", "record",
-                                "--project", "demo", "--server-root", ROOT, "demo-app.sync"]
+    assert split_exec(one(rec, "ExecStart")) == [
+        *units.ROOT_ENV, units.DEFAULT_MES_PYTHON, "-I", "-m", "mes", "jobs", "record", "--project", "demo",
+        "--server-root", ROOT, "--", "demo-app.sync"]
+    # Ordering only, which keeps the job's unit (and how its run ended) loaded until it is read.
+    assert one(rec, "After") == "mes-demo.job.demo-app.sync.service"
+    assert one(rec, "ReadWritePaths") == str(layout.log) and one(rec, "ProtectSystem") == "strict"
+    assert one(rec, "CapabilityBoundingSet") == "CAP_DAC_READ_SEARCH CAP_CHOWN"
+    assert one(rec, "PrivateNetwork") == "yes" and one(rec, "RestrictAddressFamilies") == "AF_UNIX"
+    hidden = one(rec, "InaccessiblePaths").split()
+    for folder in (layout.data, layout.state, layout.store, layout.auth, layout.gate, layout.etc):
+        assert f"-{folder}" in hidden, folder
+    assert "[Install]" not in rec  # only the job unit starts it
     # A job that may write data first brings the shared database in line with project.toml: mes
     # itself, as the project's account, with the same empty environment and isolated Python, and
     # a HOME the project cannot write.
@@ -434,9 +468,9 @@ def test_root_helpers_get_an_empty_environment_and_isolated_python(files):
     The same holds for the db sync step a job runs first (as the project's account)."""
     seen_pre = 0
     for name, text in files.items():
-        for key in ("ExecStopPost", "ExecStart", "ExecStartPre"):
+        for key in ("ExecCondition", "ExecStart", "ExecStartPre"):
             for v in values(text, key):
-                if v.startswith("+") or name.startswith("mes-demo.net.") or key == "ExecStartPre":
+                if v.startswith("+") or not values(text, "User") or key == "ExecStartPre":
                     argv = split_exec(v.lstrip("+"))
                     assert argv[:4] == list(units.ROOT_ENV), (name, v)
                     i = argv.index(units.DEFAULT_MES_PYTHON)
@@ -444,6 +478,188 @@ def test_root_helpers_get_an_empty_environment_and_isolated_python(files):
                     assert all("=" in w for w in argv[4:i]), (name, v)  # only variables before Python
                     seen_pre += key == "ExecStartPre"
     assert seen_pre >= 2  # sync and build write data
+
+
+# =========================================================================== root's commands
+
+# Prefixes systemd allows in front of an Exec*= command, in any order ("-+", "+-", "@-+", ...).
+_EXEC_PREFIX = re.compile(r"[-+@!:|]*")
+# What makes a unit's result: these steps fail the unit when they fail (unless "-" is in front).
+_FAILS_THE_UNIT = ("ExecCondition", "ExecStartPre", "ExecStart", "ExecStartPost", "ExecStop", "ExecStopPost",
+                   "ExecReload")
+
+
+def _exec_lines(text: str):
+    """(directive, prefixes, argv) of every command line of a unit."""
+    for _, key, value in directives(text):
+        if key.startswith("Exec"):
+            prefix = _EXEC_PREFIX.match(value).group(0)
+            yield key, prefix, split_exec(value[len(prefix):])
+
+
+def _runs_as_root(text: str, prefix: str) -> bool:
+    return "+" in prefix or values(text, "User") in ([], ["root"])
+
+
+def _all_units(files, layout, tmp_path):
+    web = units.render_web(_demo_project(tmp_path), layout=layout, params={
+        "exec": EASY_UI, "ui_dir": str(layout.ui), "auth_dir": str(layout.auth), "socket": units.web_socket_path("demo"),
+        "memory_max": "256M", "origins": ["https://my-server.example.ts.net"]})
+    return {**files, **web}
+
+
+def test_no_root_helper_can_fail_a_job(files, layout, tmp_path):
+    """A job's own success decides its unit's result. Root's record ran as ExecStopPost=+ in the
+    job's unit and, when it failed (exit 5 on the first real server), the job that had worked
+    failed with it. Now no unit that runs project code has a root step that runs after the job,
+    and the only root step in one is the check before an 'after' job (whose exit 255, when it
+    cannot tell, is meant to fail that job). The record units only follow the jobs."""
+    every = _all_units(files, layout, tmp_path)
+    for name, text in every.items():
+        if not values(text, "User") or values(text, "User") == ["root"]:
+            continue  # a root unit of its own: its result is its own
+        for key, prefix, argv in _exec_lines(text):
+            if not _runs_as_root(text, prefix):
+                continue
+            assert key == "ExecCondition", (name, key)
+            assert argv[argv.index("-m") + 1:argv.index("-m") + 4] == ["mes", "jobs", "should-run"], (name, argv)
+        assert values(text, "ExecStopPost") == [] and values(text, "ExecStop") == [], name
+    records = {n: t for n, t in every.items() if n.startswith("mes-demo.record.")}
+    assert len(records) == 6
+    for name, text in records.items():
+        # Ordering only: nothing a record does can stop, fail or restart the job it follows.
+        for key in ("Requires", "BindsTo", "PartOf", "Requisite", "Upholds", "OnSuccess", "OnFailure", "Wants",
+                    "Conflicts", "PropagatesStopTo", "StopPropagatedFrom"):
+            assert key not in {k for _, k, _ in directives(text)}, (name, key)
+        assert values(text, "After") and "[Install]" not in text, name
+    # A job names its record only as what follows it, never as something it needs.
+    for name, text in every.items():
+        deps = " ".join(values(text, "Requires") + values(text, "After") + values(text, "Before"))
+        assert ".record." not in deps, name
+        record = [w for v in values(text, "OnSuccess") + values(text, "OnFailure") for w in v.split() if ".record." in w]
+        if name.startswith("mes-demo.job.") and name.endswith(".service") or name == "mes-demo.selftest.service":
+            assert sorted(set(record)) == [record[0]] and len(record) == 2, name  # in OnSuccess= and OnFailure=
+        else:
+            assert record == [], name
+
+
+def _under(path: str, top: str) -> bool:
+    return path == top or path.startswith(top.rstrip("/") + "/")
+
+
+def _seen(text: str, *, plus: bool):
+    """How a command of this unit sees a path, the way systemd sets up the unit's view: None (not
+    there), "ro" or "rw". The mounts (TemporaryFileSystem=, BindPaths=, BindReadOnlyPaths=) apply
+    to every command, also '+' ones; ProtectSystem=, ProtectHome=, InaccessiblePaths= and
+    ReadWritePaths= do not apply to '+' commands."""
+    def words(key):
+        return [w for v in values(text, key) for w in v.split()]
+
+    tmpfs = [(w.partition(":")[0], "ro" if "ro" in w.partition(":")[2].split(",") else "rw")
+             for w in words("TemporaryFileSystem")]
+    binds = []
+    for key, mode in (("BindPaths", "rw"), ("BindReadOnlyPaths", "ro")):
+        for w in words(key):
+            parts = w.lstrip("-").split(":")
+            binds.append((parts[1] if len(parts) > 1 and parts[1] else parts[0], mode))
+    hidden = [w.lstrip("-") for w in words("InaccessiblePaths")]
+    writable = [w.lstrip("-") for w in words("ReadWritePaths")] + [f"/run/{w}" for w in words("RuntimeDirectory")]
+    strict = values(text, "ProtectSystem") == ["strict"]
+    home = values(text, "ProtectHome") == ["yes"]
+
+    def look(path: str) -> str | None:
+        mounts = [(len(t), 0, "tmpfs", m, t) for t, m in tmpfs if _under(path, t)] + \
+                 [(len(d), 1, "bind", m, d) for d, m in binds if _under(path, d)]
+        mode, kind = "rw", None
+        if mounts:
+            _, _, kind, mode, top = max(mounts)
+            if kind == "tmpfs" and path != top:
+                return None  # an empty folder: nothing of the server below it
+        if not plus:
+            if any(_under(path, h) for h in hidden):
+                return None
+            if home and any(_under(path, h) for h in ("/home", "/root", "/run/user")):
+                return None
+            if strict and mode == "rw" and kind != "bind" and not any(_under(path, w) for w in writable):
+                mode = "ro"
+        return mode
+
+    return look
+
+
+def _unmet(text: str, prefix: str, argv: list[str], layout) -> list[str]:
+    """What a root command needs (units.ROOT_NEEDS) that its unit's view does not give it."""
+    need = units.root_needs(argv, layout)
+    plus = "+" in prefix
+    look = _seen(text, plus=plus)
+    families = " ".join(values(text, "RestrictAddressFamilies")).split()
+    caps = " ".join(values(text, "CapabilityBoundingSet")).split()
+    out = []
+    for path in (need["python"], *need["read"], *need["exists"]):
+        if look(path) is None:
+            out.append(f"read {path}")
+    for path in need["sockets"]:
+        if look(path) is None:
+            out.append(f"socket {path}")
+        elif not plus and families and "AF_UNIX" not in families:
+            out.append(f"socket {path} (no AF_UNIX)")
+    for path in need["write"]:
+        if look(path) != "rw":
+            out.append(f"write {path}")
+    if not plus and values(text, "CapabilityBoundingSet"):
+        out += [f"capability {c}" for c in need["caps"] if c not in caps]
+    if need["network"] and (values(text, "PrivateNetwork") == ["yes"]
+                            or not plus and families and not {"AF_INET", "AF_INET6"} <= set(families)):
+        out.append("network")
+    return out
+
+
+def _root_commands(every):
+    for name, text in every.items():
+        for key, prefix, argv in _exec_lines(text):
+            if _runs_as_root(text, prefix):
+                yield name, text, key, prefix, argv
+
+
+def test_every_root_command_gets_what_it_needs_from_its_view(files, layout, tmp_path):
+    """The first real server: root's 'mes jobs record' ran as ExecStopPost=+ inside the job's view,
+    where /run is empty (no systemd socket) and log/ is not there, so it could not even ask
+    systemd. Every command root runs is checked here against what its unit's view really gives
+    it: systemd's control socket and the sign that systemd runs, what it reads and writes, its
+    capabilities and network. A new root command must be added to units.ROOT_NEEDS first."""
+    every = _all_units(files, layout, tmp_path)
+    seen = set()
+    for name, text, key, prefix, argv in _root_commands(every):
+        need = units.root_needs(argv, layout)  # raises for a root command the table does not know
+        seen.add((need["command"], key))
+        assert _unmet(text, prefix, argv, layout) == [], (name, key)
+    assert seen == {("record", "ExecStart"), ("should-run", "ExecCondition"), ("allow-network", "ExecStart")}
+
+
+def test_the_view_check_catches_the_old_shapes(files, layout):
+    """The check above would have caught the bug: the record as ExecStopPost=+ of the job, and a
+    check before the run without systemd's socket and the sign that systemd runs."""
+    rec = split_exec(one(files["mes-demo.record.demo-app.sync.service"], "ExecStart"))
+    old = files["mes-demo.job.demo-app.sync.service"].replace(
+        "\nWorkingDirectory=", f"\nExecStopPost=+{units.exec_line(rec)}\nWorkingDirectory=", 1)
+    assert _unmet(old, "+", rec, layout) == [
+        f"read {units.SYSTEMD_BOOTED}", f"socket {units.CONTROL_SOCKET}", f"write {layout.log}"]
+    build = files["mes-demo.job.demo-app.build.service"]
+    bare = "\n".join(ln for ln in build.split("\n") if ln not in units.control_socket_lines())
+    cond = split_exec(one(build, "ExecCondition").lstrip("+"))
+    assert _unmet(bare, "+", cond, layout) == [f"read {units.SYSTEMD_BOOTED}", f"socket {units.CONTROL_SOCKET}"]
+    assert _unmet(build, "+", cond, layout) == []
+    # The same command without '+' in a job's unit would also lose the socket to the filters.
+    assert "socket" in " ".join(_unmet(files["mes-demo.job.demo-app.sync.service"].replace(
+        "\nWorkingDirectory=", "\n" + "\n".join(units.control_socket_lines()) + "\nWorkingDirectory=", 1), "", cond,
+        layout))
+
+
+def test_root_needs_knows_only_mes_jobs_commands(layout):
+    with pytest.raises(ValueError):
+        units.root_needs([*units.ROOT_ENV, units.DEFAULT_MES_PYTHON, "-I", "-m", "mes", "server", "plan"], layout)
+    with pytest.raises(ValueError):
+        units.root_needs([*units.ROOT_ENV, units.DEFAULT_MES_PYTHON, "-m", "mes", "jobs", "record"], layout)
 
 
 def test_job_with_local_network_hosts(layout, tmp_path):
@@ -458,12 +674,17 @@ def test_job_with_local_network_hosts(layout, tmp_path):
 
 
 def test_after_chain_and_dashboard_refresh(files):
-    assert one(files["mes-demo.job.demo-app.sync.service"], "OnSuccess") == "mes-demo.job.demo-app.build.service"
+    assert one(files["mes-demo.job.demo-app.sync.service"], "OnSuccess") == \
+        "mes-demo.record.demo-app.sync.service mes-demo.job.demo-app.build.service"
     # A job of another app waits for build (after = "demo-app.build").
     assert one(files["mes-demo.job.demo-app.build.service"], "OnSuccess") == \
-        "mes-demo.job.demo-tool.report.service mes-demo.ui-refresh.service"
-    assert values(files["mes-demo.job.demo-tool.report.service"], "OnSuccess") == []
+        "mes-demo.record.demo-app.build.service mes-demo.job.demo-tool.report.service mes-demo.ui-refresh.service"
+    assert one(files["mes-demo.job.demo-tool.report.service"], "OnSuccess") == "mes-demo.record.demo-tool.report.service"
+    # Ordering only: the upstream unit stays loaded, with how its run ended, for root's check.
+    assert one(files["mes-demo.job.demo-app.build.service"], "After") == "mes-demo.job.demo-app.sync.service"
+    assert one(files["mes-demo.job.demo-tool.report.service"], "After") == "mes-demo.job.demo-app.build.service"
     ui = files["mes-demo.ui-refresh.service"]
+    assert one(ui, "After") == "mes-demo.job.demo-app.build.service"
     assert split_exec(one(ui, "ExecStart")) == [
         EASY_UI, "--json", "--project-dir", f"{ROOT}/demo/code/current/project", "data", "build"]
     assert one(ui, "UMask") == "0027" and one(ui, "ReadWritePaths") == f"{ROOT}/demo/ui"
@@ -750,6 +971,22 @@ def test_selftest_probe_has_a_jobs_sandbox(files, layout):
     assert split_exec(one(svc, "ExecStart")) == [MES, "server", "selftest-probe", "demo", "--context", "job",
                                                  "--server-root", ROOT]
     assert values(svc, "ExecStopPost") == [] and values(svc, "ExecStartPre") == []
+    # Its run is recorded like a job's, and it starts the probe of a job that waits for another.
+    assert one(svc, "OnSuccess") == "mes-demo.record.selftest.service mes-demo.selftest-after.service"
+    assert one(svc, "OnFailure") == "mes-demo.record.selftest.service"
+    rec = files["mes-demo.record.selftest.service"]
+    assert split_exec(one(rec, "ExecStart"))[-6:] == ["record", "--project", "demo", "--server-root", ROOT, "--selftest"]
+    assert one(rec, "After") == "mes-demo.selftest.service"
+    after = files["mes-demo.selftest-after.service"]
+    report = files["mes-demo.job.demo-tool.report.service"]  # a real job that waits for another
+    for key in ("TemporaryFileSystem", "InaccessiblePaths", "PrivateNetwork", "RestrictAddressFamilies",
+                "IPAddressDeny", "User"):
+        assert values(after, key) == values(report, key), key
+    assert units.CONTROL_SOCKET in values(after, "BindReadOnlyPaths")
+    assert split_exec(one(after, "ExecCondition"))[-6:] == [
+        "should-run", "--project", "demo", "--server-root", ROOT, "--selftest"]
+    assert split_exec(one(after, "ExecStart"))[-4:] == ["--context", "after", "--server-root", ROOT]
+    assert one(after, "After") == "mes-demo.selftest.service"
     path = files["mes-demo.selftest.path"]
     assert one(path, "PathModified") == f"{layout.gate}/selftest-request"
     assert one(path, "Unit") == "mes-demo.selftest.service"

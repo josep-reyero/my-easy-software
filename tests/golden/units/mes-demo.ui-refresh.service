@@ -4,6 +4,9 @@
 
 [Unit]
 Description=Rebuild the dashboard data of project demo
+# Ordering only: the jobs it waits for stay loaded, with how their runs ended, until root's
+# check below has read them.
+After=mes-demo.job.demo-app.build.service
 
 [Service]
 Type=oneshot
@@ -68,6 +71,12 @@ InaccessiblePaths=-/etc/shadow -/etc/shadow- -/etc/gshadow -/etc/gshadow- -/etc/
 BindReadOnlyPaths=/var/lib/mes/demo/code /var/lib/mes/demo/data /var/lib/mes/demo/state
 BindPaths=/var/lib/mes/demo/ui
 ReadWritePaths=/var/lib/mes/demo/ui
+# Root's check before the run asks systemd (systemctl) through its control socket, which the
+# empty /run would hide; systemctl first looks for /run/systemd/system, for which an empty
+# read-only folder stands in. Only root may connect to the socket, so this unit's account gains
+# nothing from either.
+BindReadOnlyPaths=/run/systemd/private
+TemporaryFileSystem=/run/systemd/system:ro
 InaccessiblePaths=-/var/lib/mes/demo/etc/webhook.key -/var/lib/mes/demo/code/incoming -/var/lib/mes/demo/code/uv-cache
 PrivateNetwork=yes
 RestrictAddressFamilies=AF_UNIX

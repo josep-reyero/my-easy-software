@@ -329,7 +329,8 @@ A damaged lock (not JSON, a link, other keys, bad paths) is always refused.
   `mes jobs run` and `mes db rebuild` on a personal computer also set `MES_PROJECT`,
   `MES_DATA_DIR` and `MES_STATE_DIR` to the project's folders, exactly as the units and the gate
   do, so an app that does not import mes finds `<data folder>/<project>.sqlite`.
-- Run log: `"app"` is the app name, `"job"` the job id. Webhooks: `POST /hooks/<job id>`, trigger
+- Run log: `"app"` is the app name, `"job"` the job id (runs of the server self-test's probe:
+  `"job": "selftest"`, `"app": null`). Webhooks: `POST /hooks/<job id>`, trigger
   file `state/triggers/<job id>`.
 - `mes server plan` lists network hosts, memory and time limits per app.
 

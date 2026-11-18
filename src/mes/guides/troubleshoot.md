@@ -22,6 +22,15 @@ On a server:
 - `mes deploy my-server --releases`: what is installed and which release runs.
 - `systemctl status 'mes-<project>.*'` and `journalctl -u 'mes-<project>.*'` (the person runs
   these): what the jobs and gate sandboxes did.
+- A run missing from `mes jobs log --project <project> --server-root /var/lib/mes`: each run is
+  added by the job's record unit; the person checks `systemctl status
+  mes-<project>.record.<app>.<job>.service`. A failed record unit never changes the job's own
+  result. `not_from_systemd`: systemd knows of no finished run of that job that is not in the log
+  yet; `already_recorded`: that run is in the log already (nothing to do).
+- A job with `after` (or the dashboard refresh) fails at once with exit 255
+  (`should_run_broken`): root's check before it could not ask systemd how the job before it
+  ended. Run `mes server plan` and its script again, so the units match the installed mes, then
+  `mes server selftest`.
 - "differ from what the server was set up for": run `mes server plan` and its script again.
 - `bad_signature`: the server does not know the signing key; plan again with `--signer`.
 - `sandbox_unavailable` (exit 75): the gate's sandbox socket is missing or not answering; the

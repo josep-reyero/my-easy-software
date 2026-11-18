@@ -1,0 +1,43 @@
+# Made by my-easy-software (mes). Do not edit: run 'mes server plan' again and the script it writes instead.
+# mes-project: demo
+# mes-unit: record
+# mes-job: demo-tool.report
+# Runs as root after each run of the job, with an empty environment: it reads how the run ended
+# from systemd and appends it to the run log in log/, which only root can change. It is a unit of
+# its own, so a failing record shows here and never changes the job's result.
+
+[Unit]
+Description=Record each run of mes job demo-tool.report of project demo in its run log
+# Ordering only: the job's unit stays loaded, with how its run ended, until this has read it.
+After=mes-demo.job.demo-tool.report.service
+
+[Service]
+Type=oneshot
+ExecStart="/usr/bin/env" "-i" "PATH=/usr/bin:/bin" "LANG=C.UTF-8" "/opt/mes/my-easy-software/.venv/bin/python" "-I" "-m" "mes" "jobs" "record" "--project" "demo" "--server-root" "/var/lib/mes" "--" "demo-tool.report"
+WorkingDirectory=/
+TimeoutStartSec=60
+UMask=0027
+NoNewPrivileges=yes
+# Only the rights to look into code/ (the project's account owns it) for the release that ran,
+# and to give the log's anchor the log's group, so the project's account can check the log.
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_CHOWN
+ProtectSystem=strict
+ReadWritePaths=/var/lib/mes/demo/log
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+# Of the project's folders it needs only log/ and the link code/current.
+InaccessiblePaths=-/var/lib/mes/demo/data -/var/lib/mes/demo/state -/var/lib/mes/demo/store -/var/lib/mes/demo/ui -/var/lib/mes/demo/auth -/var/lib/mes/demo/gate -/var/lib/mes/demo/webhook -/var/lib/mes/demo/etc -/var/lib/mes/demo/home -/var/lib/mes/demo/backups
+# systemd's control socket is a unix socket in /run; it needs no network.
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
