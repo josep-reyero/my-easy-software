@@ -22,14 +22,16 @@ sudo git clone <my-easy-software repository address> /opt/mes/my-easy-software
 sudo git -C /opt/mes/my-easy-software checkout --detach <commit>
 cd / && sudo env -i PATH=/usr/bin:/bin HOME=/root UV_CACHE_DIR=/opt/mes/uv-cache \
     UV_PYTHON_INSTALL_DIR=/opt/mes/python /usr/bin/uv sync --locked --no-dev --no-editable \
-    --python /usr/bin/python3 --project /opt/mes/my-easy-software
+    --python /usr/bin/python3 --project /opt/mes/my-easy-software \
+    --reinstall-package my-easy-software
 sudo ln -sfn /opt/mes/my-easy-software/.venv/bin/mes /usr/local/bin/mes
 # the dashboards, the same way:
 sudo git clone <my-easy-ui repository address> /opt/mes/my-easy-ui
 sudo git -C /opt/mes/my-easy-ui checkout --detach <commit>
 cd / && sudo env -i PATH=/usr/bin:/bin HOME=/root UV_CACHE_DIR=/opt/mes/uv-cache \
     UV_PYTHON_INSTALL_DIR=/opt/mes/python /usr/bin/uv sync --locked --no-dev --no-editable \
-    --python /usr/bin/python3 --project /opt/mes/my-easy-ui
+    --python /usr/bin/python3 --project /opt/mes/my-easy-ui \
+    --reinstall-package my-easy-ui
 sudo ln -sfn /opt/mes/my-easy-ui/.venv/bin/easy-ui /usr/local/bin/easy-ui
 ```
 
@@ -47,7 +49,9 @@ This gives `/usr/local/bin/mes` (its Python: `/opt/mes/my-easy-software/.venv/bi
 `/usr/bin/uv` (pass `--uv /usr/bin/uv` to the plan). The plan's header names the mes version
 and its build (a hash of the installed mes package's files), and the script stops if the mes on
 the server is another build. To update: `git fetch`, `checkout --detach` the new commit, the same
-`uv sync` line, then make and run the plan again.
+`uv sync` line (`--reinstall-package` matters: without it uv keeps the copy it installed before
+while the version number is the same), then make the plan again under a new file name (`--out`
+never overwrites a file) and run it.
 
 ## 2. Let SSH reach only the gate
 
