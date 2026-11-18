@@ -94,6 +94,7 @@ def test_net_probe_never_passes_the_filter_when_it_cannot_tell(layout, monkeypat
         raise OSError(101, "Network is unreachable")  # ENETUNREACH for everything: cannot tell
 
     monkeypatch.setattr(selftest, "_connect", refuse)
+    monkeypatch.setattr(selftest, "_send_packet", refuse)
     items = _by_id(selftest.probe(layout, "net"))
     assert items["net-filter"]["status"] == "todo" and "cannot tell" in items["net-filter"]["why"]
     assert items["net-names"]["status"] == "todo"  # this computer's /etc/hosts is not the probe's own
@@ -102,10 +103,12 @@ def test_net_probe_never_passes_the_filter_when_it_cannot_tell(layout, monkeypat
         raise OSError(1 if host != units.SELFTEST_ADDRESS else 110, "x")  # EPERM unless listed
 
     monkeypatch.setattr(selftest, "_connect", filtered)
+    monkeypatch.setattr(selftest, "_send_packet", filtered)
     items = _by_id(selftest.probe(layout, "net"))
     assert items["net-filter"]["status"] == "done" and items["net-public"]["status"] == "done"
     assert items["net-local"]["status"] == "done"
     monkeypatch.setattr(selftest, "_connect", lambda host, port: None)  # everything connects
+    monkeypatch.setattr(selftest, "_send_packet", lambda host, port: None)  # everything connects
     items = _by_id(selftest.probe(layout, "net"))
     assert items["net-filter"]["status"] == "todo" and items["net-public"]["status"] == "todo"
 
@@ -276,11 +279,33 @@ def test_install_step_blocks_count_only_the_filters_own_refusal(layout, monkeypa
             raise OSError(err, "x")
 
     monkeypatch.setattr(selftest, "_connect", connect)
+    monkeypatch.setattr(selftest, "_send_packet", connect)
     items = _by_id(selftest.probe(layout, "deploy"))
     for claim in ("deploy-loopback", "deploy-lan"):
         assert items[claim]["status"] == status, (claim, items[claim])
     if err in (111, 110):
         assert "cannot tell" in items["deploy-loopback"]["why"]
+
+
+def test_a_packet_that_goes_out_means_the_filter_does_not_block(layout, monkeypatch):
+    """A connection that only times out proves nothing, but a packet that can be sent does: the
+    filter refuses packets at once (EPERM), so one that leaves means the address is not blocked."""
+    def timeout(host, port):
+        raise OSError(110, "x")
+
+    monkeypatch.setattr(selftest, "_connect", timeout)
+    monkeypatch.setattr(selftest, "_send_packet", lambda host, port: None)
+    items = _by_id(selftest.probe(layout, "deploy"))
+    assert items["deploy-loopback"]["status"] == "todo" and "was sent" in items["deploy-loopback"]["why"]
+    assert _by_id(selftest.probe(layout, "net"))["net-filter"]["status"] == "todo"
+
+    def packet_refused(host, port):
+        if host != units.SELFTEST_ADDRESS:
+            raise OSError(1, "x")
+
+    monkeypatch.setattr(selftest, "_send_packet", packet_refused)  # connections still only time out
+    assert _by_id(selftest.probe(layout, "deploy"))["deploy-lan"]["status"] == "done"
+    assert _by_id(selftest.probe(layout, "net"))["net-filter"]["status"] == "done"
 
 
 def test_privileges_are_not_passed_when_proc_cannot_be_read():

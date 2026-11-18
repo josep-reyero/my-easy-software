@@ -20,7 +20,8 @@ plain pass or fail per claim:
   D-Bus, resolved, Tailscale, Docker, ...; the install step sees exactly systemd-resolved's socket
   and nothing else under /run), the gate's deploy socket, privileges, other accounts' processes,
   and the system calls uv needs in the deploy sandbox. A blocked address passes only when the
-  filter itself refused it (EPERM or EACCES); any other failure is reported as ``todo``.
+  filter itself refused a packet (EPERM or EACCES); a packet that goes out is a failure, and
+  anything else is reported as ``todo``.
 - From the gate's side: that it refuses to run anything without the request sandboxes
   (``REQUIRE_SANDBOX_ON_SERVER`` is on), and what systemd says the host-list probe's address
   filter is (``IPAddressAllow``/``IPAddressDeny``).
@@ -88,6 +89,21 @@ def _connect(host: str, port: int) -> None:
     with socket.socket(family, socket.SOCK_STREAM) as s:
         s.settimeout(CONNECT_TIMEOUT)
         s.connect((host, port))
+
+
+def _send_packet(host: str, port: int) -> None:
+    """Send one small UDP packet. systemd's address filter refuses a packet where it leaves the
+    service, so sending fails at once with EPERM. (A TCP connection is no proof either way: the
+    kernel keeps retrying a refused first packet, so connecting just times out.) Without the filter
+    the packet simply goes out, whether or not anything is listening."""
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    with socket.socket(family, socket.SOCK_DGRAM) as s:
+        s.settimeout(CONNECT_TIMEOUT)
+        s.sendto(b"mes-selftest", (host, port))
+
+
+_REFUSED = ("EPERM", "EACCES")
+_NO_ROUTE = ("ENETUNREACH", "EHOSTUNREACH", "EADDRNOTAVAIL")
 
 
 def _connect_unix(path: str) -> None:
@@ -223,16 +239,21 @@ def _host_sockets(pre: str, where: str, context: str, *, exists=os.path.lexists,
 
 
 def _filtered(id: str, title: str, host: str, port: int) -> dict[str, Any]:
-    """Blocked by systemd's address filter: only its own refusal at connect (EPERM or EACCES)
-    proves that. A timeout or a refused connection can happen without the filter."""
+    """Blocked by systemd's address filter: a packet to the address is refused with the filter's own
+    error (EPERM or EACCES). A packet that goes out, or a connection that opens, means it is not."""
+    sent = _errno_of(lambda: _send_packet(host, port))
+    if sent in _REFUSED:
+        return _item(id, title, True, f"{host} is refused by the address filter ({sent}).", "")
+    if sent is None:
+        return _item(id, title, False, "", f"A packet to {host} was sent: the address filter does not block it.")
     e = _errno_of(lambda: _connect(host, port))
     if e is None:
         return _item(id, title, False, "", f"It can connect to {host}.")
-    if e in ("EPERM", "EACCES"):
+    if e in _REFUSED:
         return _item(id, title, True, f"{host} is refused by the address filter ({e}).", "")
     return protocol.item(id, title, "todo",
-                         f"todo: mes cannot tell whether the address filter blocks {host}: connecting failed with {e}, "
-                         "not with the filter's own refusal (EPERM or EACCES), and that can happen without the filter. "
+                         f"todo: mes cannot tell whether the address filter blocks {host}: sending failed with {sent} "
+                         f"and connecting with {e}, not with the filter's own refusal (EPERM or EACCES). "
                          "Check the journal for 'BPF firewalling not supported' and that the kernel has cgroup BPF.")
 
 
@@ -317,19 +338,25 @@ def _net_checks(pre: str) -> list[dict[str, Any]]:
     items.append(_item(pre + "local", "a job that lists hosts cannot reach this computer or the local network",
                        not open_, "This computer, private ranges and the cloud metadata address are refused.",
                        "It can reach " + ", ".join(open_) + "."))
-    listed = _errno_of(lambda: _connect(units.SELFTEST_ADDRESS, 443))
-    if reached:
+    # The proof that the filter is attached: a packet to an unlisted address is refused with the
+    # filter's own error, while one to the listed address goes out. (Connections only time out.)
+    sent = [(h, _errno_of(lambda h=h, port=port: _send_packet(h, port))) for h, port in _PUBLIC]
+    listed = _errno_of(lambda: _send_packet(units.SELFTEST_ADDRESS, 443))
+    out = [h for h, e in sent if e is None]
+    refused = [h for h, e in sent if e in _REFUSED]
+    other = [(h, e) for h, e in sent if e is not None and e not in _REFUSED and e not in _NO_ROUTE]
+    if reached or out:
         attached: bool | None = False
-        why = "Unlisted addresses can be reached, so the address filter is not working."
-    elif denied and listed != "EPERM":
+        why = ("Unlisted addresses can be reached (" + ", ".join(reached + out) + "), so the address filter is not working.")
+    elif refused and not other and listed not in _REFUSED:
         attached = True
-        why = (f"Unlisted addresses are refused by the filter (EPERM) while its one listed address is let through "
-               f"(it leads nowhere: {listed}).")
+        why = ("Packets to unlisted addresses are refused by the filter (EPERM) while its one listed address is let "
+               f"through ({'sent' if listed is None else listed}).")
     else:
         attached = None
-        why = ("todo: mes cannot tell whether systemd's address filter is attached: unlisted addresses failed with "
-               + ", ".join(sorted({str(e) for _, _, e in public})) + f" and the listed one with {listed}. Only a "
-               "refusal with EPERM proves the filter (a server without internet fails the same way without it). "
+        why = ("todo: mes cannot tell whether systemd's address filter is attached: packets to unlisted addresses gave "
+               + ", ".join(sorted({str(e) for _, e in sent})) + f" and to the listed one {listed}. Only a refusal "
+               "with EPERM for the unlisted ones, and not for the listed one, proves the filter. "
                "Check the journal for 'BPF firewalling not supported' and that the kernel has cgroup BPF.")
     items.append(protocol.item(pre + "filter", "systemd's address filter is attached to a job that lists hosts",
                                "done" if attached else "todo", why))
