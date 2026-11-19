@@ -196,7 +196,8 @@ class ServerLayout:
     to ``mes-<project>`` but no job or sandboxed request has them writable. ``etc``, ``home`` and
     ``log`` belong to root (``etc`` and ``home`` with the group ``mes-<project>``, mode 0750, so
     only root and the project's account can look inside): ``etc`` holds the signer list, the
-    gate's login shell, the paths of the tools and the webhook job list;
+    gate's login shell, the paths of the tools, the webhook job list and the name service of the
+    jobs (``nsswitch.conf`` and ``resolv.conf``, bound over the ones in ``/etc`` in every job);
     ``home/.ssh/authorized_keys`` the keys that may connect; ``log`` the tamper-evident run log
     that only root writes.
     """
@@ -235,6 +236,9 @@ class ServerLayout:
     gate_shell = property(lambda self: self.etc / "gate-shell")
     webhook_key = property(lambda self: self.etc / "webhook.key")
     webhook_jobs = property(lambda self: self.etc / "webhook-jobs")
+    # The jobs' name service: names only from the job's own /etc/hosts, no name server.
+    nsswitch = property(lambda self: self.etc / "nsswitch.conf")
+    resolv_conf = property(lambda self: self.etc / "resolv.conf")
     run_log = property(lambda self: self.log / "runs.jsonl")
     triggers = property(lambda self: self.webhook / "triggers")
     release_records = property(lambda self: self.gate / "releases")

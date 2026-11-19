@@ -50,8 +50,16 @@ Rules:
   on the local network or link-local (cloud metadata) is dropped, unless the host is listed in
   `local_network` (then local-network addresses are allowed; this computer never). Host names
   must be names: numbers in any spelling (`0x7f.1`, `2130706433`) are refused.
-- Honest limits: an allowed address is allowed on every port, and a shared address (a CDN) also
-  serves other sites; addresses that change during a run are not followed. On this computer
+- Names in a job that lists hosts: only the listed hosts (and `localhost`) exist, read from the
+  job's own hosts file, and there is no DNS. This also holds for libraries with a resolver of
+  their own (curl and curl_cffi with c-ares, Go programs): the job's `/etc/nsswitch.conf` says
+  `hosts: files` and its `/etc/resolv.conf` names no server. A host that is not listed fails at
+  once with "Could not resolve host" (in Python "Name or service not known"); add it to
+  `network` and run the plan again.
+- Honest limits: an allowed address is allowed on every port and protocol (TCP and UDP, so also
+  HTTP/3), and a shared address (a CDN) also serves other sites; addresses that change during a
+  run are not followed. A host's IPv6 addresses are allowed too; on a server without an IPv6
+  route a connection to one fails at once and clients go on to the IPv4 address. On this computer
   (`mes jobs run`) mes cannot limit the network (`mes jobs list` says so), but the job gets only
   a small environment (no SSH agent, no hosting tokens).
 - Exit code 75 means "a temporary problem, try again later" (for example the service was down):
@@ -62,6 +70,8 @@ Rules:
   programs' sockets live); socket pairs inside the job still work. A job without network has a
   private network. Neither sees the server's service sockets or anything outside the project's
   own folders (`mes guide server`).
+- On a server `HOME` is the project's state folder, so it is writable only when the job writes
+  `state`; `/tmp` and `/var/tmp` are writable and private to each run (put caches there).
 - Unknown settings are errors, so a typo cannot switch off a limit.
 
 Commands:

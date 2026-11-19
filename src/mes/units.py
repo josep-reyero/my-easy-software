@@ -19,7 +19,10 @@ named by its id, ``<app>.<job>``:
   start of the job, as root, looks the hosts up again, writes the job's own ``/etc/hosts``
   (``/run/mes-<p>-net/<app>.<job>/hosts``, bound over ``/etc/hosts`` in the job's view) and sets the
   job's ``IPAddressAllow=`` to exactly those addresses (the job itself has ``IPAddressDeny=any``
-  and no access to the system's name service, so it needs no DNS server at all). It runs as
+  and no access to the system's name service, so it needs no DNS server at all). Every job also
+  gets the project's ``etc/nsswitch.conf`` and ``etc/resolv.conf`` over the system's (names only
+  from ``/etc/hosts``, no name server), so programs with a resolver of their own (c-ares, Go)
+  read the hosts file too instead of trying DNS. It runs as
   root because only root may change another unit's settings; it takes nothing from the
   project's files (the hosts are written into this file) and is sandboxed too.
 - ``mes-<p>.record.<app>.<job>.service``  records each run of the job in the run log, as root, in a
@@ -98,7 +101,9 @@ filter cannot block, in plain words), ``RESOLVE_SOCKET``, ``CONTROL_SOCKET``, ``
 ``ui_refresh_unit(project)``, ``webhook_units(project) -> (socket, service)``,
 ``webhook_socket_path(project) -> str``, ``gate_units(project, level) -> (socket, template)``,
 ``gate_socket_dir(project) -> str``, ``gate_socket_path(project, level) -> str``,
-``net_run_dir(project)``, ``net_hosts_file(project, job_id)``, ``selftest_units(project)``,
+``net_run_dir(project)``, ``net_hosts_file(project, job_id)``, ``run_as_hosts_file(project)``,
+``selftest_units(project)``, ``JOB_NSSWITCH``, ``JOB_RESOLV_CONF`` (the jobs' name service),
+``name_service_files(layout) -> dict``, ``name_service_binds(layout) -> str``,
 ``web_unit_names(project)``, ``web_socket_path(project)``.
 ``quote_exec_word(value)``, ``exec_line(argv)``, ``env_assignment(key, value)``,
 ``sandbox_path(path)``, ``line_path(path)``, ``check_tool_path(path, what)``,
@@ -279,6 +284,36 @@ FS_LINES = (
     "InaccessiblePaths=-/srv -/mnt -/media -/boot -/efi",
     "InaccessiblePaths=" + " ".join(f"-{p}" for p in HIDDEN_ETC),
 )
+# The name service of every job (and of 'mes server run-as' unless it has the whole internet): the
+# plan writes these two files into the project's etc/ (root's; the project's group may read them)
+# and the units bind them over /etc/nsswitch.conf and /etc/resolv.conf. Names come only from the
+# job's /etc/hosts and accounts only from /etc/passwd and /etc/group, never from DNS or a system
+# service. This also holds for programs with a resolver of their own: c-ares (curl, curl_cffi,
+# grpc) and Go read both files themselves, and the server's own nsswitch.conf ("... resolve files
+# ... dns") makes c-ares ask DNS first and give up on a timeout instead of reading the hosts file.
+# glibc and c-ares skip lines that start with '#' in both files (resolv.conf(5); c-ares'
+# ares_sysconfig_files.c); with no "nameserver" line both would use 127.0.0.1, which every job's
+# address filter refuses at once. The account databases list "files" only, so no lookup needs a
+# socket; /etc/shadow and /etc/gshadow stay hidden.
+JOB_NSSWITCH = "\n".join([
+    "# The name service of the jobs of this mes project, written by mes server plan. Names come only",
+    "# from the job's own /etc/hosts and accounts only from /etc/passwd and /etc/group, never from",
+    "# DNS or a system service.",
+    "passwd: files",
+    "group: files",
+    "shadow: files",
+    "gshadow: files",
+    "hosts: files",
+    "networks: files",
+    "protocols: files",
+    "services: files",
+    "ethers: files",
+    "rpc: files",
+    "netgroup: files",
+    "",
+])
+JOB_RESOLV_CONF = ("# No name servers: a mes job looks names up only in its own /etc/hosts (see "
+                   "/etc/nsswitch.conf).\n")
 # Where the tools (mes, its Python, uv, easy-ui) may be: everything else is hidden from the units.
 TOOL_ROOTS = ("/usr", "/bin", "/sbin", "/lib", "/lib64", "/opt/mes")
 HARDENING_OVERRIDABLE = ("UMask=", "SystemCallFilter=", "TasksMax=")
@@ -416,6 +451,12 @@ def net_run_dir(project: str) -> str:
 
 def net_hosts_file(project: str, job: str) -> str:
     return f"{net_run_dir(project)}/{_check_job(job)}/hosts"
+
+
+def run_as_hosts_file(project: str, token: int | None = None) -> str:
+    """The hosts file of one ``mes server run-as --network HOST`` command (``token``: the process
+    id of the mes that printed it, also in the unit's name)."""
+    return f"{net_run_dir(project)}/run-as-{int(os.getpid() if token is None else token)}/hosts"
 
 
 def web_unit_names(project: str) -> tuple[str, str]:
@@ -612,6 +653,25 @@ def _hidden(project: Project, layout, *extra: Any, webhook_key: bool = True, uv_
     paths_ = ([layout.webhook_key] if webhook_key else []) + [layout.incoming] + \
         ([layout.uv_cache] if uv_cache else []) + list(extra)
     return "InaccessiblePaths=" + " ".join(f"-{line_path(p)}" for p in paths_)
+
+
+def name_service_files(layout) -> dict[str, str]:
+    """The two files of the jobs' name service (path in the project's etc/ -> text)."""
+    return {sandbox_path(layout.nsswitch): JOB_NSSWITCH, sandbox_path(layout.resolv_conf): JOB_RESOLV_CONF}
+
+
+def name_service_binds(layout) -> str:
+    """``BindReadOnlyPaths=`` of the jobs' name service. Without ``-``: a unit whose files are
+    missing does not start, so no job runs with the server's own name service."""
+    return (f"BindReadOnlyPaths={line_path(layout.nsswitch)}:/etc/nsswitch.conf "
+            f"{line_path(layout.resolv_conf)}:/etc/resolv.conf")
+
+
+def name_service_lines(layout) -> list[str]:
+    return ["# Its own name service (also for programs with a resolver of their own, which read these",
+            "# files): names only from /etc/hosts, accounts from /etc/passwd and /etc/group, no name",
+            "# server. Without these files the unit does not start.",
+            name_service_binds(layout)]
 
 
 def install_uv_folders(layout, *, allow_builds: bool) -> tuple[str, str]:
@@ -824,6 +884,7 @@ def render_job_service(project: Project, job: Job, *, layout, mes: str,
     if condition:
         lines += control_socket_lines()
     lines.append(_hidden(project, layout))
+    lines += name_service_lines(layout)
     if all_hosts:
         lines += [
             "# The job's own /etc/hosts, written just before the run: the only names it can look up. It has",
@@ -1311,9 +1372,12 @@ def interactive_command(project: Project, layout, argv: Sequence[str], *, networ
     code read-only, nothing else of the server. mes only prints it; it never runs sudo.
 
     ``network``: ``"none"`` (the default) no network at all and no name lookups; ``"hosts"`` only
-    ``addresses`` (internet addresses the caller looked up for the hosts it was given), names
-    through systemd-resolved's socket; ``"any"`` the internet except what ``DEPLOY_DENY`` blocks
-    (see ``NETWORK_NOT_COVERED`` for what that does not cover)."""
+    ``addresses`` (internet addresses the caller looked up for the hosts it was given), names only
+    from its own hosts file (``run_as_hosts_file``, which the printed command writes first, see
+    ``mes.server.run_as``), like a job that lists hosts; ``"any"`` the internet except what
+    ``DEPLOY_DENY`` blocks (see ``NETWORK_NOT_COVERED`` for what that does not cover), names
+    through systemd-resolved's socket. Except with ``"any"``, it has a job's name service
+    (``name_service_binds``)."""
     import ipaddress
 
     p = _check_project(project.name)
@@ -1348,12 +1412,16 @@ def interactive_command(project: Project, layout, argv: Sequence[str], *, networ
         props += [f"BindReadOnlyPaths=-{RESOLVE_SOCKET}",
                   "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6", "IPAddressDeny=" + " ".join(DEPLOY_DENY)]
     elif network == "hosts":
-        props += [f"BindReadOnlyPaths=-{RESOLVE_SOCKET}", "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
+        # Like a job that lists hosts: its own hosts file is its only name lookup, and it shares the
+        # server's network, so it opens no unix sockets.
+        props += [name_service_binds(layout), f"BindReadOnlyPaths={line_path(run_as_hosts_file(p))}:/etc/hosts",
+                  "RestrictAddressFamilies=AF_INET AF_INET6",
                   "IPAddressDeny=any", "IPAddressAllow=" + " ".join(dict.fromkeys(allowed))]
     else:
         # No network and no resolver socket, so not even names on the local network or the tailnet
         # can be looked up.
-        props += ["PrivateNetwork=yes", "RestrictAddressFamilies=AF_UNIX", "IPAddressDeny=any"]
+        props += [name_service_binds(layout), "PrivateNetwork=yes", "RestrictAddressFamilies=AF_UNIX",
+                  "IPAddressDeny=any"]
     out = ["systemd-run", "--pty", "--wait", "--collect", "--quiet", f"--slice={SLICE}",
            f"--unit=mes-{p}.run-as-{os.getpid()}"]
     for prop in props:

@@ -43,6 +43,12 @@ On a server:
 - A job with hosts cannot connect: the host list of the job (in its app's `app.toml`, plus
   `add_network` in `project.toml`) must include every host it uses (redirects to other hosts are
   blocked too); a device on your own network belongs in `local_network`.
+- A job on a server says "Could not resolve host", "Timeout while contacting DNS servers" or
+  "Name or service not known": the job uses a host it does not list. A job knows only the names
+  in its `network` list (it has no DNS), so add the host there (or with `add_network`), then run
+  `mes server plan` and its script again. When the host is listed and it still happens, the
+  units or their name-service files are older than the installed mes: run the plan and its
+  script again, then `mes server selftest` (its `net-name-service` line).
 
 Never fix a refusal by loosening permissions, switching off a check or copying data into the
 repo. Explain the problem to the user in plain words and ask.

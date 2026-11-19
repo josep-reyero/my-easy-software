@@ -445,3 +445,123 @@ def test_probe_answers_name_their_run(layout, monkeypatch, capsys):
     assert code == 0
     assert json.loads((layout.gate / "selftest" / selftest.AFTER_RESULT).read_text())["context"] == "after"
     capsys.readouterr()
+
+
+# --------------------------------------------------------------------------- the jobs' name service
+
+SERVER_NSSWITCH = ("passwd: files systemd\ngroup: files [SUCCESS=merge] systemd\nshadow: files systemd\n"
+                   "hosts: mymachines mdns_minimal [NOTFOUND=return] resolve files myhostname dns\n")
+
+
+def test_name_service_passes_only_with_the_jobs_own_files(tmp_path):
+    """A job that lists hosts kept the server's nsswitch.conf, whose hosts line makes c-ares
+    (curl_cffi) ask DNS first and time out instead of reading the job's hosts file. The probe now
+    passes only when /etc/nsswitch.conf says exactly 'hosts: files' (and files for the rest) and
+    /etc/resolv.conf names no server."""
+    ns, rc = tmp_path / "nsswitch.conf", tmp_path / "resolv.conf"
+    ns.write_text(units.JOB_NSSWITCH)
+    rc.write_text(units.JOB_RESOLV_CONF)
+    os.chmod(ns, 0o444)
+    os.chmod(rc, 0o444)
+
+    def check():
+        return selftest._name_service("net-", "a job that lists hosts", nsswitch=str(ns), resolv=str(rc))
+
+    if os.geteuid() != 0:  # root may write a read-only file
+        assert check()["status"] == "done", check()
+    os.chmod(ns, 0o644)
+    ns.write_text(SERVER_NSSWITCH)
+    item = check()
+    assert item["status"] == "todo" and "not exactly 'files'" in item["why"] and "systemd" in item["why"]
+    ns.write_text(units.JOB_NSSWITCH.replace("hosts: files", "hosts: files dns"))
+    assert check()["status"] == "todo"
+    ns.write_text(units.JOB_NSSWITCH)
+    os.chmod(ns, 0o444)
+    os.chmod(rc, 0o644)
+    rc.write_text("nameserver 127.0.0.53\n")
+    item = check()
+    assert item["status"] == "todo" and "127.0.0.53" in item["why"]
+    rc.unlink()
+    assert "cannot be read" in check()["why"]
+
+
+def test_job_probes_check_their_name_service(layout):
+    """Every job probe reports it; outside the sandbox (this computer's files) it never passes."""
+    for context in ("job", "net", "after"):
+        items = _by_id(selftest.probe(layout, context))
+        assert items[f"{context}-name-service"]["status"] == "todo", context
+    assert "deploy-name-service" not in _by_id(selftest.probe(layout, "deploy"))
+
+
+def test_job_probes_check_that_tmp_is_writable(layout, monkeypatch):
+    """Third-party code commonly needs a writable /tmp: every job probe says whether it has one."""
+    assert _by_id(selftest.probe(layout, "job"))["job-tmp"]["status"] == "done"
+
+    def no_write(folder):
+        raise OSError(30, "Read-only file system")
+
+    monkeypatch.setattr(selftest, "_try_write", no_write)
+    item = _by_id(selftest.probe(layout, "net"))["net-tmp"]
+    assert item["status"] == "todo" and "/var/tmp (EROFS)" in item["why"]
+
+
+class _Res:
+    def __init__(self, code=0, out="", err=""):
+        self.returncode, self.stdout, self.stderr = code, out, err
+
+
+def test_curl_check_runs_only_with_c_ares_and_never_passes_otherwise(tmp_path):
+    curl = tmp_path / "curl"
+    curl.write_text("#!/bin/sh\n")
+    os.chmod(curl, 0o755)
+    item = selftest._curl_names("net-", paths_=(str(tmp_path / "missing"),))
+    assert item["status"] == "skipped" and "not installed" in item["why"]
+    threaded = "curl 8.5.0 (x86_64-pc-linux-gnu) libcurl/8.5.0 OpenSSL/3.0.13 zlib/1.3\nFeatures: AsynchDNS IPv6\n"
+    item = selftest._curl_names("net-", paths_=(str(curl),), run=lambda argv: _Res(0, threaded))
+    assert item["status"] == "skipped" and "does not use c-ares" in item["why"]
+    cares = "curl 8.5.0 (x86_64-pc-linux-gnu) libcurl/8.5.0 OpenSSL/3.0.13 c-ares/1.27.0\nFeatures: AsynchDNS\n"
+    calls = []
+
+    def run(argv, found=True, unlisted_code=6):
+        calls.append(argv)
+        if argv[1:] == ["--version"]:
+            return _Res(0, cares)
+        assert argv[1] == "-q" and "--noproxy" in argv  # no .curlrc from the job's HOME, no proxy
+        if units.SELFTEST_HOST in argv[-1]:
+            if found:
+                return _Res(28, "", f"*   Trying {units.SELFTEST_ADDRESS}:443...\ncurl: (28) Connection timed out")
+            return _Res(6, "", "curl: (6) Could not resolve host: selftest.invalid (Timeout while contacting DNS servers)")
+        return _Res(unlisted_code, "", "curl: (6) Could not resolve host: example.com")
+
+    item = selftest._curl_names("net-", paths_=(str(curl),), run=run)
+    assert item["status"] == "done", item
+    item = selftest._curl_names("net-", paths_=(str(curl),), run=lambda a: run(a, found=False))
+    assert item["status"] == "todo" and "not found (exit 6)" in item["why"]
+    item = selftest._curl_names("net-", paths_=(str(curl),), run=lambda a: run(a, unlisted_code=0))
+    assert item["status"] == "todo"
+    ticks = iter([0.0, 0.1, 0.0, 11.0])  # an unlisted name that takes 11 s (a name server tried) fails
+    item = selftest._curl_names("net-", paths_=(str(curl),), run=run, clock=lambda: next(ticks))
+    assert item["status"] == "todo" and "11.0 s" in item["why"]
+
+
+def test_a_jobs_resolv_conf_where_the_servers_link_points_is_allowed(layout):
+    """When the server's /etc/resolv.conf links into /run (resolved's stub file), systemd binds the
+    job's own file there; that path is not a service socket. Resolved's socket still fails."""
+    stub = "/run/systemd/resolve/stub-resolv.conf"
+    shown = {"/run/systemd", "/run/systemd/resolve", stub}
+    link = lambda: shown  # noqa: E731
+    item = selftest._host_sockets("net-", "a job that lists hosts", "net", exists=shown.__contains__, resolv_link=link)
+    assert item["status"] == "done", item
+    after = selftest._host_sockets("after-", "a job that waits for another", "after",
+                                   exists=(shown | set(selftest.AFTER_SOCKETS)).__contains__,
+                                   under_run=lambda: sorted(shown | {"/run/systemd/private", "/run/systemd/system"}),
+                                   resolv_link=link)
+    assert after["status"] == "done", after
+    more = shown | {units.RESOLVE_SOCKET}
+    item = selftest._host_sockets("net-", "a job that lists hosts", "net", exists=more.__contains__, resolv_link=link)
+    assert item["status"] == "todo" and units.RESOLVE_SOCKET in item["why"]
+    # Without the link, the same folder is a failure as before.
+    item = selftest._host_sockets("net-", "a job that lists hosts", "net", exists=shown.__contains__,
+                                  resolv_link=lambda: set())
+    assert item["status"] == "todo"
+    assert selftest._resolv_link_paths(str(layout.root / "no-such-link")) == set()

@@ -69,6 +69,10 @@ BindPaths=/var/lib/mes/demo/data /var/lib/mes/demo/store /var/lib/mes/demo/state
 ReadWritePaths=/var/lib/mes/demo/data /var/lib/mes/demo/store /var/lib/mes/demo/state
 BindPaths=-/var/lib/mes/demo/gate/selftest
 InaccessiblePaths=-/var/lib/mes/demo/etc/webhook.key -/var/lib/mes/demo/code/incoming -/var/lib/mes/demo/code/uv-cache
+# Its own name service (also for programs with a resolver of their own, which read these
+# files): names only from /etc/hosts, accounts from /etc/passwd and /etc/group, no name
+# server. Without these files the unit does not start.
+BindReadOnlyPaths=/var/lib/mes/demo/etc/nsswitch.conf:/etc/nsswitch.conf /var/lib/mes/demo/etc/resolv.conf:/etc/resolv.conf
 # The job's own /etc/hosts, written just before the run: the only names it can look up. It has
 # no DNS server and no access to the system's name service.
 BindReadOnlyPaths=/run/mes-demo-net/selftest/hosts:/etc/hosts

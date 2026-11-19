@@ -114,6 +114,16 @@ Pieces:
 - **[fitdata](https://github.com/josep-reyero/fitdata)**: the first app, a personal
   archive of Garmin fitness data.
 
+## Roadmap
+
+Not built yet:
+
+- **A dashboard for the owner.** Setting a project up on a server takes steps only the owner can
+  do: reading and running the root script, unlocking a signing key, choosing a sign-in password.
+  Today each one happens in a terminal. The aim is one page where a person who is not a developer
+  sees what is waiting for them, sees that their agent is working in the background, and answers
+  its questions there, without watching terminals or typing passwords into them.
+
 ## Principles
 
 - **Secure by default.** Private-network access unless you open it, sign-in always on, each app

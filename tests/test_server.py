@@ -131,6 +131,14 @@ def test_script_text_golden(proj, keys, tmp_path):
     for rel in ("etc/server.toml", "etc/allowed_signers", "etc/webhook-jobs", "home/.ssh/authorized_keys"):
         assert f"put_file {q(f'{base}/{rel}')} 0640 root:mes-demo <<'MES_END_" in script, rel
     assert f"put_file {q(f'{base}/etc/gate-shell')} 0750 root:mes-demo <<'MES_END_" in script
+    # The jobs' name service: written (root's, readable by the project's group) before any unit
+    # that binds it, with exactly mes's text.
+    first_unit = min(script.index("put_file " + q(f"{tmp_path}/units/{n}")) for n in plan.units)
+    for rel, text in (("etc/nsswitch.conf", units.JOB_NSSWITCH), ("etc/resolv.conf", units.JOB_RESOLV_CONF)):
+        at = script.index(f"put_file {q(f'{base}/{rel}')} 0640 root:mes-demo <<'MES_END_")
+        assert at < first_unit, rel
+        body = script[at:].split("\n", 1)[1]
+        assert body.startswith(text.rstrip("\n") + "\nMES_END_"), rel
     # The gate's login shell is written before the account that uses it.
     assert script.index(f"put_file {q(f'{base}/etc/gate-shell')}") < script.index("ensure_account mes-demo ")
     assert "mes-demo.job.demo-app.sync.timer" in script and "systemctl enable --now -- " in script
@@ -732,6 +740,7 @@ def test_check_passes_on_a_server_that_matches_the_plan(proj, keys, tmp_path):
         f"{base}/auth": _st(d | 0o700, 1002, 1002), f"{base}/log": _st(d | 0o750, 0, 1001),
         f"{base}/etc/allowed_signers": _st(f | 0o640, 0, 1001), f"{base}/etc/gate-shell": _st(f | 0o750, 0, 1001),
         f"{base}/etc/server.toml": _st(f | 0o640, 0, 1001),
+        f"{base}/etc/nsswitch.conf": _st(f | 0o640, 0, 1001), f"{base}/etc/resolv.conf": _st(f | 0o640, 0, 1001),
         f"{base}/home/.ssh/authorized_keys": _st(f | 0o640, 0, 1001),
         "/bin/sh": _st(f | 0o755), "/opt": _st(d | 0o755), "/opt/mes": _st(d | 0o755),
         "/opt/mes/my-easy-software": _st(d | 0o755), "/opt/mes/my-easy-software/.venv": _st(d | 0o755),
@@ -742,11 +751,23 @@ def test_check_passes_on_a_server_that_matches_the_plan(proj, keys, tmp_path):
     texts[f"{base}/home/.ssh/authorized_keys"] = server._authorized_keys(plan)
     texts[f"{base}/etc/allowed_signers"] = server._allowed_signers(plan)
     texts[f"{base}/etc/server.toml"] = server._server_toml(plan)
+    texts.update(units.name_service_files(plan.layout))
     for name, text in plan.units.items():
         texts[f"/etc/systemd/system/{name}"] = text
     result = server.run_check("demo", project_dir=str(proj), probe=probe)
     bad = [i for i in result["items"] if i["status"] not in ("done", "skipped")]
     assert not bad, bad
+    ids = {i["id"]: i for i in result["items"]}
+    assert ids["name-service-nsswitch"]["status"] == ids["name-service-resolv"]["status"] == "done"
+    # The jobs' name service: a missing file, or one that names a server, is reported.
+    texts[f"{base}/etc/resolv.conf"] = "nameserver 127.0.0.53\n"
+    result = server.run_check("demo", project_dir=str(proj), probe=probe)
+    assert next(i for i in result["items"] if i["id"] == "name-service-resolv")["status"] == "todo"
+    texts.update(units.name_service_files(plan.layout))
+    del files[f"{base}/etc/nsswitch.conf"]
+    result = server.run_check("demo", project_dir=str(proj), probe=probe)
+    assert next(i for i in result["items"] if i["id"] == "file-etc-nsswitchconf")["status"] == "todo"
+    files[f"{base}/etc/nsswitch.conf"] = _st(f | 0o640, 0, 1001)
     # A changed unit (for example after editing project.toml) is reported.
     first = sorted(plan.units)[0]
     texts[f"/etc/systemd/system/{first}"] += "# changed\n"
@@ -895,6 +916,9 @@ def test_run_as_only_prints_the_command(proj, capsys):
     assert code == 0, data
     assert data["command"].startswith("sudo systemd-run --pty ") and "-p User=mes-demo" in data["command"]
     assert data["command"].endswith("/var/lib/mes/demo/code/current/project/.venv/bin/demo-app login")
+    # A job's name service, which the plan wrote into etc/ (the unit does not start without it).
+    assert ("-p 'BindReadOnlyPaths=/var/lib/mes/demo/etc/nsswitch.conf:/etc/nsswitch.conf "
+            "/var/lib/mes/demo/etc/resolv.conf:/etc/resolv.conf'") in data["command"]
     code = main(["--json", "server", "run-as", "demo", "--project-dir", str(proj), "--", "rm", "-rf"])
     assert code != 0
 
@@ -922,6 +946,18 @@ def test_run_as_has_no_network_unless_asked(proj, capsys, monkeypatch):
     assert code == 0, data
     assert "-p IPAddressAllow=93.184.216.34" in data["command"] and "192.168.1.9" not in data["command"]
     assert "-p IPAddressDeny=any" in data["command"]
+    # Names only from its own hosts file (as in a job that lists hosts), which root writes first,
+    # where the project's account cannot change it: no resolver socket, so programs with their own
+    # resolver (c-ares) find the host too, and no unix sockets (it shares the server's network).
+    hosts_file = units.run_as_hosts_file("demo")
+    first, _, rest = data["command"].partition(" && ")
+    assert first == ("printf '%s\\n' '# Written for one mes server run-as command: the only names it can look up.' "
+                     "'127.0.0.1 localhost' '::1 localhost' '93.184.216.34 login.example.com' "
+                     f"| sudo install -D -m 0644 /dev/stdin {hosts_file}")
+    assert rest.startswith("sudo systemd-run --pty ")
+    assert f"-p BindReadOnlyPaths={hosts_file}:/etc/hosts" in rest and "resolve" not in rest
+    assert "/etc/nsswitch.conf" in rest and "-p 'RestrictAddressFamilies=AF_INET AF_INET6'" in rest
+    assert "names only from its own hosts file" in data["message"]
     code = main([*base, "--network", "nas.home.arpa", "--", "demo-app", "login"])
     assert code == 75 and json.loads(capsys.readouterr().out)["error"]["code"] == "dns_failed"
     code = main([*base, "--network", "any", "--", "demo-app", "login"])

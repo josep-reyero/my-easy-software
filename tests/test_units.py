@@ -917,6 +917,31 @@ def test_dashboard_refresh_publishes_the_first_time(files, layout):
                         "--server-root", ROOT, "--easy-ui", EASY_UI]
 
 
+def test_every_job_has_its_own_name_service(files, layout):
+    """A job that listed hosts got its own /etc/hosts but the server's nsswitch.conf and
+    resolv.conf: glibc read the hosts file, but c-ares (curl_cffi) read those two files itself,
+    asked DNS first and gave up with a timeout. Every job unit (and every probe) now binds the
+    project's etc/nsswitch.conf ('hosts: files') and etc/resolv.conf (no server), required (no '-'),
+    so a unit without them does not start."""
+    jobs_ = {n: t for n, t in files.items() if _is_project_code(n) and (".job." in n or n.endswith(PROBES))}
+    assert len(jobs_) == 8
+    want = [f"{layout.nsswitch}:/etc/nsswitch.conf", f"{layout.resolv_conf}:/etc/resolv.conf"]
+    for name, text in jobs_.items():
+        binds = " ".join(values(text, "BindReadOnlyPaths")).split()
+        assert all(w in binds for w in want), name
+    # Units that are not jobs keep the system's (the install step needs resolved's socket).
+    for name in ("mes-demo.gate-deploy@.service", "mes-demo.webhook.service", "mes-demo.ui-refresh.service"):
+        assert str(layout.nsswitch) not in files[name], name
+    lines = units.JOB_NSSWITCH.splitlines()
+    entries = {ln.split(":")[0]: ln.split(":", 1)[1].split() for ln in lines if ln and not ln.startswith("#")}
+    assert entries["hosts"] == ["files"] and entries["passwd"] == entries["group"] == ["files"]
+    assert all(v == ["files"] for v in entries.values())  # no systemd, resolve, mymachines, dns, ...
+    assert not any(":" in ln for ln in lines if ln.startswith("#"))
+    assert all(ln.startswith("#") for ln in units.JOB_RESOLV_CONF.splitlines())  # no "nameserver"
+    assert units.name_service_files(layout) == {str(layout.nsswitch): units.JOB_NSSWITCH,
+                                                str(layout.resolv_conf): units.JOB_RESOLV_CONF}
+
+
 def test_selftest_net_probe_is_rendered_like_a_job_with_hosts(files, layout):
     """Finding G: the self-test never probed the sandbox real jobs with network = [...] get."""
     net = files["mes-demo.selftest-net.service"]
@@ -958,7 +983,13 @@ def test_run_as_prints_a_sandboxed_systemd_run(tmp_path, layout):
     hosts = units.interactive_command(p, layout, ["demo-app", "login"], network="hosts", addresses=["93.184.216.34"])
     hprops = [hosts[i + 1] for i, w in enumerate(hosts) if w == "-p"]
     assert "IPAddressDeny=any" in hprops and "IPAddressAllow=93.184.216.34" in hprops
-    assert f"BindReadOnlyPaths=-{units.RESOLVE_SOCKET}" in hprops
+    # Like a job that lists hosts: its own hosts file and name service, no resolver socket (c-ares
+    # would ask DNS first there and fail), no unix sockets.
+    assert not any(units.RESOLVE_SOCKET in x for x in hprops)
+    assert f"BindReadOnlyPaths={units.run_as_hosts_file('demo')}:/etc/hosts" in hprops
+    assert units.name_service_binds(layout) in hprops and "RestrictAddressFamilies=AF_INET AF_INET6" in hprops
+    assert units.name_service_binds(layout) in props  # no network: the same name service
+    assert units.name_service_binds(layout) not in aprops  # the whole internet: the system's, through resolved
     with pytest.raises(Refused):
         units.interactive_command(p, layout, ["demo-app", "login"], network="hosts", addresses=["192.168.1.5"])
     with pytest.raises(StopIteration):

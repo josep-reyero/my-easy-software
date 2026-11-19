@@ -78,6 +78,10 @@ BindPaths=-/var/lib/mes/demo/gate/selftest
 BindReadOnlyPaths=/run/systemd/private
 TemporaryFileSystem=/run/systemd/system:ro
 InaccessiblePaths=-/var/lib/mes/demo/etc/webhook.key -/var/lib/mes/demo/code/incoming -/var/lib/mes/demo/code/uv-cache
+# Its own name service (also for programs with a resolver of their own, which read these
+# files): names only from /etc/hosts, accounts from /etc/passwd and /etc/group, no name
+# server. Without these files the unit does not start.
+BindReadOnlyPaths=/var/lib/mes/demo/etc/nsswitch.conf:/etc/nsswitch.conf /var/lib/mes/demo/etc/resolv.conf:/etc/resolv.conf
 PrivateNetwork=yes
 RestrictAddressFamilies=AF_UNIX
 IPAddressDeny=any

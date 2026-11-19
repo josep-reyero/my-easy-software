@@ -75,6 +75,10 @@ BindReadOnlyPaths=/var/lib/mes/demo/code /var/lib/mes/demo/data /var/lib/mes/dem
 BindPaths=/var/lib/mes/demo/state
 ReadWritePaths=/var/lib/mes/demo/state
 InaccessiblePaths=-/var/lib/mes/demo/etc/webhook.key -/var/lib/mes/demo/code/incoming -/var/lib/mes/demo/code/uv-cache
+# Its own name service (also for programs with a resolver of their own, which read these
+# files): names only from /etc/hosts, accounts from /etc/passwd and /etc/group, no name
+# server. Without these files the unit does not start.
+BindReadOnlyPaths=/var/lib/mes/demo/etc/nsswitch.conf:/etc/nsswitch.conf /var/lib/mes/demo/etc/resolv.conf:/etc/resolv.conf
 PrivateNetwork=yes
 RestrictAddressFamilies=AF_UNIX
 IPAddressDeny=any

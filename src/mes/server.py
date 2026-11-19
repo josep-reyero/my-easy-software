@@ -709,6 +709,8 @@ def render_script(plan: PlanInput) -> str:
         (f"{base}/etc/allowed_signers", "0640", group_files, _allowed_signers(plan)),
         (f"{base}/etc/webhook-jobs", "0640", group_files, _webhook_jobs(plan)),
         (f"{base}/home/.ssh/authorized_keys", "0640", group_files, _authorized_keys(plan)),
+        # The jobs' name service, bound over /etc/nsswitch.conf and /etc/resolv.conf in every job.
+        *((path, "0640", group_files, text) for path, text in units.name_service_files(lay).items()),
     ]
     gate_shell = (f"{base}/etc/gate-shell", "0750", group_files, _gate_shell(plan))
     all_units = {**plan.units, **plan.web_units}
@@ -1125,6 +1127,8 @@ def run_check(name: str, *, server_root: str = str(paths.SERVER_ROOT), units_dir
     for rel, title, mode in (("etc/allowed_signers", "Deploy signing keys", 0o640),
                              ("etc/gate-shell", "The gate's login shell", 0o750),
                              ("etc/server.toml", "The server settings", 0o640),
+                             ("etc/nsswitch.conf", "The jobs' name service (nsswitch.conf)", 0o640),
+                             ("etc/resolv.conf", "The jobs' name servers (resolv.conf, none)", 0o640),
                              ("home/.ssh/authorized_keys", "The SSH keys", 0o640)):
         good, what = owner_ok(f"{base}/{rel}", "root", a, mode)
         items.append(_item(f"file-{rel.replace('/', '-').replace('.', '')}", f"{title} belong to root", good,
@@ -1152,6 +1156,17 @@ def run_check(name: str, *, server_root: str = str(paths.SERVER_ROOT), units_dir
         items.append(_item("signers", "At least one key may sign deploys", bool(signers),
                            f"{len(signers)} signing key(s).", "No signing key yet, so every deploy is refused.",
                            f"mes server plan {p} --signer <key.pub> --out plan.sh, then: sudo bash plan.sh"))
+
+    for path, want in units.name_service_files(lay).items():
+        try:
+            got = pr.read(path)
+        except OSError:
+            continue  # missing or hidden: reported with its owner and mode above
+        file_name = path.rsplit("/", 1)[-1]
+        items.append(_item(f"name-service-{file_name.split('.')[0]}", f"The jobs' {file_name} is the one mes writes",
+                           got == want, "Jobs look names up only in their own hosts file, with no name server.",
+                           f"etc/{file_name} differs from what the plan writes, so jobs may look names up elsewhere.",
+                           fix))
 
     try:
         import tomllib
@@ -1478,7 +1493,7 @@ def run_as(project_dir: str | None, name: str, argv: list[str], *, server_root: 
     ``network``: empty (the default) gives no network at all; host names give only the internet
     addresses they have now (looked up here, when the command is printed); ``["any"]`` gives
     the internet except what systemd can block of this computer and the local network."""
-    from mes.jobs import load_project, resolve_hosts
+    from mes.jobs import hosts_file_lines, load_project, resolve_hosts
 
     _, project = load_project(project_dir)
     if project.name != name:
@@ -1521,10 +1536,17 @@ def run_as(project_dir: str | None, name: str, argv: list[str], *, server_root: 
                 hint="Check the host names and the server's internet connection. Hosts on this computer or the local "
                 "network cannot be allowed here.", code="dns_failed")
         mode, what = "hosts", "only " + ", ".join(hosts)
-        said = f"and only {', '.join(hosts)} on the network (their addresses now: {', '.join(addresses)})."
+        said = (f"and only {', '.join(hosts)} on the network (their addresses now: {', '.join(addresses)}), with "
+                "names only from its own hosts file, which the first part of the command writes.")
         notes.append("The addresses were looked up now; if the command cannot connect later, print it again.")
     cmd = units.interactive_command(project, layout, argv, network=mode, addresses=addresses)
     text = "sudo " + " ".join(shlex.quote(w) for w in cmd)
+    if mode == "hosts":
+        # Its own hosts file, written by root where the project's account cannot change it (the
+        # unit binds it over /etc/hosts and does not start without it).
+        lines = hosts_file_lines(found, "Written for one mes server run-as command: the only names it can look up.")
+        text = ("printf '%s\\n' " + " ".join(shlex.quote(ln) for ln in lines) + " | sudo install -D -m 0644 /dev/stdin "
+                + shlex.quote(units.run_as_hosts_file(name)) + " && " + text)
     message = ("Run this on the server, in a terminal, with sudo (mes never runs sudo itself). It runs the command as "
                f"{layout.account} with the same sandbox as a job: the project's data, state and store, its code "
                f"read-only, nothing else of the server, {said}")

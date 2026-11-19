@@ -75,6 +75,7 @@ Public API (besides ``register``)
 ``append_record(log_path, record) -> dict``     adds ``prev`` and writes one line
 ``read_log(log_path) -> list[dict]``, ``verify_log(log_path) -> dict``
 ``resolve_hosts(hosts, *, resolver=None, local=()) -> dict[host, list[str]]``  addresses for ``allow-network``
+``hosts_file_lines(found, comment) -> list[str]``  the lines of a job's own hosts file (also of ``run-as``)
 ``address_allowed(addr, *, local) -> bool``, ``write_head(log_path)``, ``check_head(log_path, result)``
 ``nameservers(path="/etc/resolv.conf") -> list[str]``
 """
@@ -946,6 +947,16 @@ def resolve_hosts(hosts: Sequence[str], *, resolver: Callable[..., Any] | None =
     return found
 
 
+def hosts_file_lines(found: dict[str, list[str]], comment: str) -> list[str]:
+    """The lines of a job's own hosts file: localhost, then every allowed address of each host
+    (IPv4 and IPv6). Host names and addresses are checked here again, so nothing else can get in."""
+    lines = [f"# {comment}", "127.0.0.1 localhost", "::1 localhost"]
+    for host, addrs in found.items():
+        units.check_hosts([host])
+        lines += [f"{ipaddress.ip_address(a)} {host}" for a in addrs]
+    return lines
+
+
 def _write_hosts_file(path: str, unit: str, found: dict[str, list[str]], *, selftest: bool = False) -> None:
     m = _HOSTS_FILE_RE.fullmatch(path or "")
     u = units.JOB_UNIT_RE.fullmatch(unit)
@@ -955,10 +966,7 @@ def _write_hosts_file(path: str, unit: str, found: dict[str, list[str]], *, self
     elif not m or not u or m.group("project", "app", "job") != u.group("project", "app", "job"):
         raise UsageError(f"{str(path)[:80]!r} is not the hosts file of {unit}.",
                          hint="Use /run/mes-<project>-net/<app>.<job>/hosts")
-    lines = ["# Written by mes jobs allow-network before each run: the only names this job can look up.",
-             "127.0.0.1 localhost", "::1 localhost"]
-    for host, addrs in found.items():
-        lines += [f"{a} {host}" for a in addrs]
+    lines = hosts_file_lines(found, "Written by mes jobs allow-network before each run: the only names this job can look up.")
     target = Path(path)
     target.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
     tmp = target.with_name(f".hosts.{os.getpid()}.tmp")

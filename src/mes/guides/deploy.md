@@ -67,7 +67,8 @@ made with `--allow-server-builds`, and then its build code runs in the install s
 internet and the new release writable). Its install step then gets a cache and a Python of the
 release's own (`.uv/` inside the release), and the shared `code/uv-cache` and `code/uv-python`
 are not there for it at all, so nothing build code writes is used by another deploy. The install step finds names through
-systemd-resolved's socket (the default on Arch); a name server on this computer or the local
+systemd-resolved's socket (the default on Arch), which uv reaches through the system's resolver
+(glibc's `getaddrinfo`; uv has no resolver of its own); a name server on this computer or the local
 network is blocked, so such a server cannot reach the index.
 
 Errors: exit 5 `bad_signature` (wrong signing key: add it with `mes server plan --signer`),

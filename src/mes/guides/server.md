@@ -104,8 +104,9 @@ the dashboard server). Folders in `/var/lib/mes/<project>/` (root's, others may 
 (project, group web, 2750), `auth` (the dashboard sign-in: web account only, 0700),
 `etc home home/.ssh log` (root, group project, 0750; files 0640). It writes the keys (each forced
 into `mes gate --allow <level>` with `restrict`), the signers (Ed25519, deploys and rollbacks),
-and every system unit (rendered by mes itself, also the dashboard server's: easy-ui only gives
-checked parameters), and switches on the sockets and (without `--no-start`) the timers and paths.
+the jobs' name service (`etc/nsswitch.conf` and `etc/resolv.conf`, see below) and every system
+unit (rendered by mes itself, also the dashboard server's: easy-ui only gives checked
+parameters), and switches on the sockets and (without `--no-start`) the timers and paths.
 Run the plan and the script again whenever jobs, schedules, dashboards or keys change (`mes
 deploy` says when). Units that carry the project's mark but are not in the plan are switched off
 and removed.
@@ -137,6 +138,14 @@ dashboard refresh, also see systemd's control socket and an empty `/run/systemd/
 check before the run runs in the job's unit and needs both to ask systemd; only root can use the
 socket, so the job gains nothing from it.
 
+Every job (and `mes server run-as` without `--network any`) has its own name service: the
+project's `etc/nsswitch.conf` (`hosts: files`, and `files` for accounts and the other databases)
+and `etc/resolv.conf` (no name server) are bound over the system's. Names come only from the
+job's `/etc/hosts` (its listed hosts and `localhost`; a job without network sees the system's),
+also for programs with a resolver of their own (c-ares, Go), and no lookup needs a socket. A job
+unit does not start without the two files, so run the plan's script before the units it writes
+are used.
+
 The install step of a deploy (and `mes server run-as --network any`) has the internet, but not
 this computer, link-local, multicast, private, Tailscale (`100.64.0.0/10`) or IPv6 unique-local
 addresses. Not covered, because they cannot be known when the units are written and can change
@@ -155,7 +164,10 @@ network. The plan's header says the same.
   --login-key ~/.ssh/mes-login` (and on the server, as your account, `/usr/local/bin/mes server
   selftest <project>` for the checks from outside). It asks the real sandboxes (read, write,
   install, publish, a job's, a job's that lists hosts and a job's that waits for another) what
-  they can reach and reports pass, fail or skipped per claim; only passes count. When it cannot
+  they can reach and reports pass, fail or skipped per claim; only passes count. The job probes
+  also check their name service (`hosts: files`, no name server) and a writable `/tmp`, and the
+  one that lists hosts looks its name up with glibc and, when the server's curl is built with
+  c-ares, with c-ares too (otherwise that line is skipped and says why). When it cannot
   tell whether systemd's address filter is attached, it says so (todo) instead of passing. It
   also proves the steps around a run: the job probe's run must appear in the run log (written by
   `mes-<project>.record.selftest.service`) and the probe that waits for it
@@ -196,13 +208,16 @@ the owner with `systemd-run --pty`. mes prints the exact command (it never runs 
 /usr/local/bin/mes server run-as <project> --project-dir <folder> -- <app program> <command> [options]
 ```
 
-Run the `sudo systemd-run --pty ...` line it prints, on the server, in a terminal. The command
+Run the line it prints (`sudo systemd-run --pty ...`), on the server, in a terminal. The command
 sees the project's data, state and store (writable), its code (read-only) and nothing else of
 the server. It has no network at all unless asked, and then cannot even look names up:
 
 - `--network HOST` (repeatable): only the internet addresses those hosts have now (looked up
-  when the command is printed; print it again if they change), with names through
-  systemd-resolved's socket. A host that has only local-network addresses is refused.
+  when the command is printed; print it again if they change), with names only from its own
+  hosts file, as in a job that lists hosts. The printed line first writes that file as root
+  (`printf ... | sudo install ... /run/mes-<project>-net/run-as-<number>/hosts`), then starts the
+  command; like such a job it cannot open unix sockets. A host that has only local-network
+  addresses is refused.
 - `--network any`: the internet, but not this computer, link-local, multicast, private,
   Tailscale (`100.64.0.0/10`) or IPv6 unique-local addresses. Not covered: this server's own
   public addresses and the global IPv6 addresses of other machines on the local network; the

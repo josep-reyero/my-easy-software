@@ -23,7 +23,10 @@ plain pass or fail per claim:
   the gate's folder, the webhook secret, writing code/ (only the new release, from the deploy
   sandbox), writing data (not from a read request), the network (none, except the package index
   for the install step, never this computer or the local network; for the host-list job only its
-  one address, with names only from its own hosts file), the host's service sockets (systemd,
+  one address, with names only from its own hosts file, looked up with glibc and, when the
+  server's curl is built with c-ares, with c-ares too; every job probe also checks that its
+  ``/etc/nsswitch.conf`` says ``hosts: files`` and its ``/etc/resolv.conf`` names no server, so
+  resolvers of their own read only the hosts file), the host's service sockets (systemd,
   D-Bus, resolved, Tailscale, Docker, ...; the install step sees exactly systemd-resolved's socket
   and nothing else under /run), the gate's deploy socket, privileges, other accounts' processes,
   and the system calls uv needs in the deploy sandbox. A blocked address passes only when the
@@ -54,6 +57,7 @@ import errno
 import json
 import os
 import socket
+import subprocess
 import time
 from pathlib import Path
 from typing import Any
@@ -67,7 +71,7 @@ RESULT_FILES = {"job": JOB_RESULT, "net": NET_RESULT, "after": AFTER_RESULT}
 REQUEST_FILE = "selftest-request"
 NET_REQUEST_FILE = "selftest-net-request"
 # Service sockets and name-service paths of the host that no sandbox may see.
-HOST_SOCKETS = ("/run/systemd/resolve", "/run/dbus", "/run/systemd/private", "/run/systemd/userdb",
+HOST_SOCKETS = ("/run/systemd/resolve", units.RESOLVE_SOCKET, "/run/dbus", "/run/systemd/private", "/run/systemd/userdb",
                 "/run/systemd/journal/stdout", "/run/systemd/journal/socket", "/run/systemd/notify",
                 "/run/tailscale", "/var/run/tailscale", "/run/docker.sock", "/var/run/docker.sock",
                 "/run/containerd", "/run/podman", "/run/user", "/run/nscd", "/var/run/nscd", "/run/cups",
@@ -191,6 +195,12 @@ def probe(layout: paths.ServerLayout, context: str) -> dict[str, Any]:
                 items.append(_item(pre + f"no-{name}", f"{where} cannot see the {name} folder", ok,
                                    f"{name}/ is not there for it ({what}).", f"It can list {name}/."))
     items.append(_host_sockets(pre, where, context))
+    if context in ("job", "net", "after"):
+        items.append(_name_service(pre, where))
+        problems = [f"{d} ({what})" for d in ("/tmp", "/var/tmp")
+                    for ok, what in [_fails(lambda d=d: _try_write(Path(d)))] if ok]
+        items.append(_item(pre + "tmp", f"{where} can write its own /tmp and /var/tmp", not problems,
+                           "Both are writable (private to each run).", "Not writable: " + ", ".join(problems) + "."))
     if context == "after":
         items.append(_control_socket(pre))
     if context == "deploy":
@@ -242,10 +252,30 @@ def _under_run(limit: int = 200) -> list[str]:
     return found
 
 
-def _host_sockets(pre: str, where: str, context: str, *, exists=os.path.lexists, under_run=None) -> dict[str, Any]:
+def _resolv_link_paths(link: str = "/etc/resolv.conf") -> set[str]:
+    """Where a job's resolv.conf really is when the server's /etc/resolv.conf is a link into /run
+    (systemd-resolved's stub file): systemd binds the job's own file where the link points, so that
+    path and the folders it makes on the way are under /run on purpose (the file, not a socket)."""
+    try:
+        if not os.path.islink(link):
+            return set()
+        target = os.path.realpath(link)
+    except OSError:
+        return set()
+    if not target.startswith("/run/"):
+        return set()
+    parts = Path(target).parts
+    return {str(Path(*parts[:i])) for i in range(3, len(parts) + 1)}
+
+
+def _host_sockets(pre: str, where: str, context: str, *, exists=os.path.lexists, under_run=None,
+                  resolv_link=None) -> dict[str, Any]:
     """No service socket of the host is there. The install step sees exactly the resolver's socket
-    (its unit binds it on purpose), and nothing else under /run."""
+    (its unit binds it on purpose), and nothing else under /run. A job's own resolv.conf may be
+    there, where the server's /etc/resolv.conf link points."""
     allowed = _allowed_run_paths(context)
+    if context in ("job", "net", "after"):
+        allowed |= (resolv_link or _resolv_link_paths)()
     seen = [p for p in HOST_SOCKETS if exists(p) and p not in allowed]
     if context in _SEEN_ON_PURPOSE:
         seen += [p for p in (under_run or _under_run)() if p not in allowed and p not in seen]
@@ -270,6 +300,99 @@ def _control_socket(pre: str, connect=None) -> dict[str, Any]:
     return protocol.item(pre + "control-socket", title, "todo",
                          f"todo: {units.CONTROL_SOCKET} is not usable here ({e}), so root's check before the run "
                          "could not have asked systemd how the job before it ended.")
+
+
+def _name_service(pre: str, where: str, *, nsswitch: str = "/etc/nsswitch.conf",
+                  resolv: str = "/etc/resolv.conf") -> dict[str, Any]:
+    """The job's name service is its own: /etc/nsswitch.conf looks hosts up in files only (so
+    resolvers that read it themselves, such as c-ares and Go, never try DNS), every other database
+    in files too (no socket needed), and /etc/resolv.conf names no server. Neither can be changed."""
+    problems = []
+    try:
+        text = Path(nsswitch).read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        text = ""
+        problems.append(f"{nsswitch} cannot be read ({errno.errorcode.get(e.errno or 0, type(e).__name__)})")
+    hosts, other = [], []
+    for raw in text.splitlines()[:200]:
+        line = raw.split("#", 1)[0].strip()
+        db, sep, sources = line.partition(":")
+        if not sep:
+            continue
+        words = sources.split()
+        if db.strip() == "hosts":
+            hosts.append(words)
+        elif any(w != "files" for w in words):
+            other.append(f"{db.strip()}: {' '.join(words)}"[:80])
+    if not problems and hosts != [["files"]]:
+        problems.append(f"its hosts line is {' | '.join(' '.join(h) for h in hosts) or 'missing'}, not exactly 'files'")
+    if other:
+        problems.append("other databases use more than files (" + "; ".join(other[:4]) + ")")
+    try:
+        rtext = Path(resolv).read_text(encoding="utf-8", errors="replace")
+        servers = [ln.split()[1] for ln in rtext.splitlines()[:200]
+                   if len(ln.split()) >= 2 and ln.split()[0] == "nameserver"]
+        if servers:
+            problems.append(f"{resolv} names the name servers {', '.join(servers[:4])}")
+    except OSError as e:
+        problems.append(f"{resolv} cannot be read ({errno.errorcode.get(e.errno or 0, type(e).__name__)})")
+    for path in (nsswitch, resolv):
+        if os.access(path, os.W_OK):
+            problems.append(f"{path} can be changed by the job")
+    return _item(pre + "name-service", f"{where} has its own name service: names only from its hosts file, "
+                 "also for programs with their own resolver", not problems,
+                 f"{nsswitch} says 'hosts: files' (and files for the accounts) and {resolv} names no server, so "
+                 "glibc, c-ares and Go read only /etc/hosts and never try DNS.", "; ".join(problems) + ".")
+
+
+CURL_PATHS = ("/usr/bin/curl", "/bin/curl")
+CURL_ENV = {"PATH": "/usr/bin:/bin", "HOME": "/nonexistent", "LANG": "C"}
+
+
+def _curl_names(pre: str, *, run=None, paths_=CURL_PATHS, clock=time.monotonic) -> dict[str, Any]:
+    """With a curl built with c-ares (a resolver that reads nsswitch.conf and resolv.conf itself,
+    like curl_cffi's), the listed name is looked up from the hosts file and an unlisted one fails at
+    once. Any other curl (the threaded resolver uses glibc, already checked) is skipped, never passed."""
+    title = "a job that lists hosts looks names up in its hosts file with c-ares too (curl)"
+    curl = next((p for p in paths_ if os.access(p, os.X_OK)), None)
+    if curl is None:
+        return _item(pre + "names-curl", title, None, "",
+                     "skipped: curl is not installed, so the c-ares resolver could not be tried. The name-service "
+                     "check above covers it: c-ares reads the same two files.")
+    runner = run or (lambda argv: subprocess.run(argv, capture_output=True, text=True, timeout=15, check=False,
+                                                 stdin=subprocess.DEVNULL, env=CURL_ENV))
+    try:
+        version = runner([curl, "--version"])
+        first = (version.stdout or "").splitlines()[0] if version.stdout else ""
+    except (OSError, subprocess.SubprocessError) as e:
+        return _item(pre + "names-curl", title, None, "", f"skipped: {curl} --version did not run ({e}).")
+    if "c-ares/" not in first:
+        return _item(pre + "names-curl", title, None, "",
+                     f"skipped: this server's curl does not use c-ares ({first[:120] or 'no version line'}), so it "
+                     "would only repeat the glibc check. The name-service check above covers c-ares.")
+
+    def attempt(host: str) -> tuple[int | None, str, float]:
+        # -q: no .curlrc (the job's HOME is writable); no proxy; it never needs to connect.
+        argv = [curl, "-q", "-sS", "-v", "--noproxy", "*", "-o", "/dev/null", "--connect-timeout", "2",
+                "--max-time", "4", f"http://{host}:443/"]
+        start = clock()
+        try:
+            res = runner(argv)
+        except (OSError, subprocess.SubprocessError) as e:
+            return None, str(e), clock() - start
+        return res.returncode, res.stderr or "", clock() - start
+
+    code, err, _ = attempt(units.SELFTEST_HOST)
+    listed = f"Trying {units.SELFTEST_ADDRESS}" in err and code != 6
+    ocode, oerr, took = attempt("example.com")
+    unlisted = ocode == 6 and took < 3.0
+    return _item(pre + "names-curl", title, listed and unlisted,
+                 f"curl with c-ares found {units.SELFTEST_HOST} in the hosts file and gave up on example.com at once "
+                 f"({took:.1f} s).",
+                 f"{units.SELFTEST_HOST}: " + ("found" if listed else f"not found (exit {code})") + "; example.com: "
+                 + (f"exit {ocode} after {took:.1f} s (want exit 6 at once)" if not unlisted else "not found at once")
+                 + ".",
+                 detail=(err.strip().splitlines() or [""])[-1][:200] if not listed else None)
 
 
 def _filtered(id: str, title: str, host: str, port: int) -> dict[str, Any]:
@@ -415,6 +538,7 @@ def _net_checks(pre: str) -> list[dict[str, Any]]:
                        f"/etc/hosts is its own ({units.SELFTEST_HOST} only) and other names cannot be looked up.",
                        f"/etc/hosts holds {own[:6]}, {units.SELFTEST_HOST} gave {got}, other names "
                        + ("can" if other else "cannot") + " be looked up."))
+    items.append(_curl_names(pre))
     ok, what = _fails(lambda: socket.socket(socket.AF_UNIX, socket.SOCK_STREAM).close())
     items.append(_item(pre + "unix", "a job that lists hosts cannot open unix sockets (it shares the server's "
                        "abstract unix socket namespace)", ok, f"Opening one is refused ({what}).",
